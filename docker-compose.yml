@@ -1,0 +1,57 @@
+# Local development stack.
+#
+# Only infrastructure the platform will need from phase 2 onwards is declared here. No
+# exchange connectivity is provisioned, and the application container defaults to
+# validating its configuration rather than trading.
+#
+# LOCAL DEVELOPMENT ONLY: the PostgreSQL credentials below (user "quant", password
+# "quant") are fixed, well-known placeholders meant solely for this Compose stack running
+# on a developer's machine. They are not read from a secret store, are not suitable for
+# any shared, staging or production environment, and must never be reused anywhere real
+# credentials are required. Any non-local deployment must supply its own database
+# credentials through the environment or a secret manager, never through this file.
+
+name: quant-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # Local-development-only placeholders — see the file header. Do not reuse.
+      POSTGRES_USER: quant
+      POSTGRES_PASSWORD: quant
+      POSTGRES_DB: quantplatform
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quant -d quantplatform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      QP_ENVIRONMENT: development
+      QP_EXECUTION_MODE: paper
+      QP_LIVE_TRADING_ENABLED: "false"
+      # Local-development-only DSN, matching the placeholder credentials above.
+      QP_DATABASE__DSN: postgresql+psycopg://quant:quant@postgres:5432/quantplatform
+    # Secrets are never baked into the image or this file. Supply them through a local
+    # .env file, which is git-ignored.
+    env_file:
+      - path: .env
+        required: false
+    command: ["check-config"]
+    restart: "no"
+
+volumes:
+  postgres-data:

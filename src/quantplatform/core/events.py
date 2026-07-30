@@ -8,10 +8,10 @@ to a portfolio change reconstructable after the fact.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Self
 from uuid import UUID
 
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, model_validator
 
 from quantplatform.core.enums import (
     AlertSeverity,
@@ -28,7 +28,7 @@ from quantplatform.core.models.data import DataQualityFinding, IngestionRun
 from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.orders import Fill, Order, OrderIntent
-from quantplatform.core.models.portfolio import PortfolioSnapshot
+from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskDecision
 from quantplatform.core.models.signals import Signal
 from quantplatform.core.numeric import Money
@@ -48,6 +48,7 @@ __all__ = [
     "OrderStatusChanged",
     "OrderSubmitted",
     "PortfolioUpdated",
+    "PositionChanged",
     "ReconciliationCompleted",
     "RiskDecisionMade",
     "SignalGenerated",
@@ -186,6 +187,53 @@ class FillReceived(DomainEvent):
     EVENT_TYPE: ClassVar[EventType] = EventType.FILL_RECEIVED
 
     fill: Fill
+
+
+class PositionChanged(DomainEvent):
+    """A fill changed a position's exposure.
+
+    One generic event covers every lifecycle point — opened, increased, reduced, closed —
+    the same way :class:`OrderStatusChanged` covers every order transition with a single
+    class rather than one per transition. A consumer derives which happened by comparing
+    ``previous_position`` and ``position``: opened when the former is ``None``, closed
+    when the latter's quantity is zero, increased or reduced otherwise by comparing their
+    quantities. There are deliberately no separate ``PositionOpened``, ``PositionReduced``
+    or ``PositionClosed`` event classes.
+    """
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.POSITION_CHANGED
+
+    previous_position: Position | None
+    """The position immediately before ``fill`` was applied; ``None`` only when this fill
+    opened the position from flat (no prior lifecycle to report)."""
+
+    position: Position
+    """The position immediately after ``fill`` was applied."""
+
+    fill: Fill
+    """The fill that triggered this change."""
+
+    @model_validator(mode="after")
+    def _validate_change(self) -> Self:
+        """Check the self-contained consistency rules this event can verify on its own.
+
+        Cross-checking against fill history or portfolio-engine state (for example,
+        confirming ``previous_position`` really was the prior stored state) is out of
+        scope for a single immutable event and belongs to the future portfolio engine.
+        """
+        if self.fill.symbol != self.position.symbol:
+            msg = "fill must be for the same symbol as the resulting position"
+            raise ValueError(msg)
+        if (
+            self.previous_position is not None
+            and self.previous_position.symbol != self.position.symbol
+        ):
+            msg = "previous_position must be for the same symbol as the resulting position"
+            raise ValueError(msg)
+        if self.previous_position is None and not self.position.is_open:
+            msg = "previous_position may only be omitted when the fill opened the position"
+            raise ValueError(msg)
+        return self
 
 
 class PortfolioUpdated(DomainEvent):

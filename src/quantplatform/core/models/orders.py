@@ -159,7 +159,25 @@ class Order(DomainModel):
     limit_price: Price | None = None
     stop_price: Price | None = None
     fees_paid: Fee
+    """Cumulative fees across every fill on this order, denominated in the quote asset.
+
+    A :class:`Fill` may pay its fee in a different asset (see
+    :attr:`Fill.fee_asset`); converting or rejecting such a fee before it is folded into
+    this quote-denominated aggregate is a Phase 3 responsibility, never a silent sum
+    across currencies.
+    """
+
     reject_reason: Text | None = None
+    cancel_reason: Text | None = None
+    """Why the order was canceled. Required exactly when :attr:`status` is ``CANCELED``.
+
+    Kept distinct from :attr:`reject_reason`, which explains a venue or risk-engine
+    refusal that never resulted in a working order: a rejection and a cancellation are
+    different events and must never be recorded interchangeably. Each field is only ever
+    populated on the status it explains, so a single ``Order`` record can never carry
+    both.
+    """
+
     created_at: UtcDatetime
     updated_at: UtcDatetime
 
@@ -192,6 +210,15 @@ class Order(DomainModel):
         if self.status is OrderStatus.REJECTED and self.reject_reason is None:
             msg = "a rejected order requires a reject_reason"
             raise ValueError(msg)
+        if self.status is not OrderStatus.REJECTED and self.reject_reason is not None:
+            msg = "only a rejected order may carry a reject_reason"
+            raise ValueError(msg)
+        if self.status is OrderStatus.CANCELED and self.cancel_reason is None:
+            msg = "a canceled order requires a cancel_reason"
+            raise ValueError(msg)
+        if self.status is not OrderStatus.CANCELED and self.cancel_reason is not None:
+            msg = "only a canceled order may carry a cancel_reason"
+            raise ValueError(msg)
         _validate_price_fields(self.order_type, self.limit_price, self.stop_price)
         return self
 
@@ -222,6 +249,13 @@ class Fill(DomainModel):
     quantity: Quantity
     price: Price
     fee: Fee
+    """The fee charged for this fill, denominated in :attr:`fee_asset` — not necessarily
+    the portfolio's quote asset. This is the only place a non-quote-asset fee is
+    represented; every aggregate fee field downstream (:attr:`Order.fees_paid`,
+    ``Position.fees_paid``, ``PortfolioSnapshot.total_fees``) is quote-asset denominated,
+    so folding this value into one of them requires converting or rejecting it first.
+    """
+
     fee_asset: AssetCode
     execution_mode: ExecutionMode
     is_maker: bool | None = None

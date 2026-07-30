@@ -214,6 +214,29 @@ Two properties are enforced structurally rather than by convention:
 - `PortfolioSnapshot.equity` is derived from cash plus marked position value rather than
   stored, so the accounting identity cannot drift.
 
+### Portfolio accounting model
+
+There is exactly one ledger of truth for what the account owns: `Balance`. Everything else
+is a view derived from it, never a competing record:
+
+- `Balance.free` is available balance; `Balance.locked` is reserved balance; `total` is
+  their sum.
+- `PortfolioSnapshot.cash` is a **projection** of the quote asset's `Balance.total`, not an
+  independently tracked value — enforced whenever that balance entry is present.
+- `Position` is a **cost-basis overlay**, not a second asset ledger: for a spot symbol,
+  `Position.quantity` must equal the corresponding base-asset `Balance.total`. Maintaining
+  that reconciliation after every fill is the future portfolio engine's job, not something
+  a single domain model can enforce on its own.
+- `Position.realized_pnl` is cumulative for the position's current *lifecycle* only. It
+  resets to zero only when a new lifecycle begins after a prior one closed (quantity
+  returned to zero); a closed lifecycle's final snapshot keeps its realized PnL forever,
+  immutable like every other record in this domain.
+- Aggregate fee fields (`Order.fees_paid`, `Position.fees_paid`,
+  `PortfolioSnapshot.total_fees`) are always quote-asset denominated. A `Fill` may pay its
+  fee in a different asset (`Fill.fee_asset`); converting or rejecting that fee before it
+  reaches a quote-denominated aggregate is a future portfolio-engine responsibility — no
+  component may silently sum fees across currencies.
+
 ### Execution modes
 
 | Mode | Market data | Orders |

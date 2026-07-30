@@ -254,6 +254,7 @@ def make_order(
     filled_quantity: Decimal = Decimal(0),
     avg_fill_price: Decimal | None = None,
     reject_reason: str | None = None,
+    cancel_reason: str | None = None,
 ) -> Order:
     intent = make_intent()
     decision = make_decision(intent=intent)
@@ -279,6 +280,7 @@ def make_order(
         stop_price=None,
         fees_paid=Decimal(0),
         reject_reason=reject_reason,
+        cancel_reason=cancel_reason,
         created_at=ANCHOR,
         updated_at=ANCHOR,
     )

@@ -27,8 +27,8 @@ from quantplatform.core.enums import (
 )
 from quantplatform.core.models.health import CircuitBreakerStatus, ComponentHealth, HealthStatus
 from quantplatform.core.models.market import MarketBar
-from quantplatform.core.models.orders import ApprovedOrder, Order, OrderIntent
-from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot
+from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
+from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
 from tests.factories import (
@@ -40,6 +40,7 @@ from tests.factories import (
     make_check,
     make_context,
     make_decision,
+    make_fill,
     make_intent,
     make_order,
     make_position,
@@ -403,6 +404,78 @@ def test_rejected_order_requires_a_reason() -> None:
         make_order(status=OrderStatus.REJECTED)
 
 
+def test_non_rejected_order_forbids_a_reject_reason() -> None:
+    payload = _payload(make_order(status=OrderStatus.OPEN), reject_reason="should not be here")
+    with pytest.raises(ValidationError, match="only a rejected order may carry a reject_reason"):
+        Order.model_validate(payload)
+
+
+def test_canceled_order_requires_a_cancel_reason() -> None:
+    with pytest.raises(ValidationError, match="requires a cancel_reason"):
+        make_order(status=OrderStatus.CANCELED)
+
+
+def test_canceled_order_with_a_reason_is_valid() -> None:
+    order = make_order(status=OrderStatus.CANCELED, cancel_reason="strategy requested exit")
+    assert order.cancel_reason == "strategy requested exit"
+    assert order.reject_reason is None
+
+
+def test_non_canceled_order_forbids_a_cancel_reason() -> None:
+    payload = _payload(make_order(status=OrderStatus.OPEN), cancel_reason="should not be here")
+    with pytest.raises(ValidationError, match="only a canceled order may carry a cancel_reason"):
+        Order.model_validate(payload)
+
+
+def test_reject_and_cancel_reasons_are_not_interchangeable() -> None:
+    # A rejected order cannot carry a cancel_reason, and a canceled order cannot carry a
+    # reject_reason: the two explain different, mutually exclusive events.
+    rejected_payload = _payload(
+        make_order(status=OrderStatus.REJECTED, reject_reason="venue rejected"),
+        cancel_reason="not applicable",
+    )
+    with pytest.raises(ValidationError, match="only a canceled order may carry a cancel_reason"):
+        Order.model_validate(rejected_payload)
+
+    canceled_payload = _payload(
+        make_order(status=OrderStatus.CANCELED, cancel_reason="user requested"),
+        reject_reason="not applicable",
+    )
+    with pytest.raises(ValidationError, match="only a rejected order may carry a reject_reason"):
+        Order.model_validate(canceled_payload)
+
+
+def test_pending_cancel_is_not_terminal() -> None:
+    assert not OrderStatus.PENDING_CANCEL.is_terminal
+
+
+def test_pending_cancel_is_open() -> None:
+    assert OrderStatus.PENDING_CANCEL.is_open
+
+
+def test_pending_cancel_can_still_produce_fills() -> None:
+    # A cancel request in flight must not, by itself, invalidate a fill the venue had
+    # already committed to before the cancel arrived.
+    assert OrderStatus.PENDING_CANCEL.can_produce_fills
+    order = make_order(
+        status=OrderStatus.PENDING_CANCEL,
+        quantity=Decimal("0.1"),
+        filled_quantity=Decimal("0.04"),
+        avg_fill_price=Decimal(50_000),
+    )
+    assert order.filled_quantity == Decimal("0.04")
+    assert order.is_open
+
+
+def test_pending_cancel_forbids_a_cancel_reason_until_confirmed() -> None:
+    # cancel_reason belongs to the confirmed CANCELED state, not the in-flight request.
+    payload = _payload(
+        make_order(status=OrderStatus.PENDING_CANCEL), cancel_reason="user requested"
+    )
+    with pytest.raises(ValidationError, match="only a canceled order may carry a cancel_reason"):
+        Order.model_validate(payload)
+
+
 def test_fills_cannot_exceed_the_order_quantity() -> None:
     with pytest.raises(ValidationError, match="must not exceed quantity"):
         make_order(
@@ -450,6 +523,23 @@ def test_order_timestamps_must_not_go_backwards() -> None:
         Order.model_validate(payload)
 
 
+def test_a_fill_may_pay_its_fee_in_a_non_quote_asset() -> None:
+    # The domain does not reject this: converting or rejecting a non-quote-asset fee
+    # before folding it into a quote-denominated aggregate is a Phase 3 responsibility.
+    fill = make_fill()
+    non_quote_fee_fill = Fill.model_validate(_payload(fill, fee_asset="BNB"))
+    assert non_quote_fee_fill.fee_asset == "BNB"
+
+
+def test_aggregate_fee_fields_carry_no_currency_tag() -> None:
+    # Order.fees_paid, Position.fees_paid and PortfolioSnapshot.total_fees are bare
+    # quote-asset-denominated scalars; only Fill pairs an amount with an asset.
+    assert "fee_asset" not in Order.model_fields
+    assert "fee_asset" not in Position.model_fields
+    assert "fee_asset" not in PortfolioSnapshot.model_fields
+    assert "fee_asset" in Fill.model_fields
+
+
 # --- Portfolio -----------------------------------------------------------------------------------
 
 
@@ -481,6 +571,59 @@ def test_unrealized_pnl_marks_against_entry() -> None:
     assert position.market_value(Decimal(50_000)) == Decimal(25_000)
 
 
+def test_cost_basis_is_zero_when_flat() -> None:
+    position = make_position(quantity=Decimal(0))
+    assert position.cost_basis == Decimal(0)
+
+
+def test_cost_basis_equals_avg_entry_times_quantity_when_open() -> None:
+    position = make_position(quantity=Decimal("0.5"), avg_entry_price=Decimal(40_000))
+    assert position.cost_basis == Decimal(20_000)
+
+
+def test_cost_basis_is_never_negative() -> None:
+    open_position = make_position(quantity=Decimal("0.5"), avg_entry_price=Decimal(40_000))
+    flat_position = make_position(quantity=Decimal(0))
+    assert open_position.cost_basis >= Decimal(0)
+    assert flat_position.cost_basis >= Decimal(0)
+
+
+def test_cost_basis_is_decimal_backed_not_float() -> None:
+    position = make_position(quantity=Decimal("0.123456789"), avg_entry_price=Decimal("40000.5"))
+    assert isinstance(position.cost_basis, Decimal)
+    assert position.cost_basis == Decimal("0.123456789") * Decimal("40000.5")
+
+
+def test_a_closed_position_retains_its_realized_pnl() -> None:
+    # Once flat, a position's final snapshot keeps whatever PnL that lifecycle realized;
+    # nothing forces it back to zero merely because the position closed.
+    closed = Position(
+        symbol=SYMBOL,
+        base_asset="BTC",
+        quote_asset="USDT",
+        quantity=Decimal(0),
+        avg_entry_price=None,
+        realized_pnl=Decimal(1_234),
+        fees_paid=Decimal(10),
+        opened_at=None,
+        updated_at=ANCHOR,
+    )
+    assert closed.realized_pnl == Decimal(1_234)
+    assert not closed.is_open
+    assert closed.cost_basis == Decimal(0)
+
+
+def test_a_freshly_opened_position_starts_its_lifecycle_at_zero_realized_pnl() -> None:
+    # A single Position instance cannot itself verify that some prior lifecycle existed
+    # and was properly closed first -- that sequencing belongs to the future portfolio
+    # engine. What this model does guarantee is that a fresh opening is representable
+    # starting at zero, with its own entry price and opened_at.
+    opened = make_position(quantity=Decimal("0.1"))
+    assert opened.realized_pnl == Decimal(0)
+    assert opened.opened_at is not None
+    assert opened.avg_entry_price is not None
+
+
 def test_equity_equals_cash_plus_marked_positions() -> None:
     position = make_position(quantity=Decimal("0.2"), avg_entry_price=Decimal(40_000))
     snapshot = make_snapshot(
@@ -501,6 +644,18 @@ def test_equity_is_derived_and_cannot_be_overridden() -> None:
     assert snapshot.equity == snapshot.cash
 
 
+def test_gross_exposure_equals_positions_value() -> None:
+    position = make_position(quantity=Decimal("0.2"), avg_entry_price=Decimal(40_000))
+    snapshot = make_snapshot(positions=(position,), mark_prices={SYMBOL: Decimal(50_000)})
+    assert snapshot.gross_exposure == snapshot.positions_value
+    assert snapshot.gross_exposure == Decimal(10_000)
+
+
+def test_gross_exposure_is_zero_when_flat() -> None:
+    snapshot = make_snapshot()
+    assert snapshot.gross_exposure == Decimal(0)
+
+
 def test_open_positions_require_a_mark_price() -> None:
     position = make_position(quantity=Decimal("0.2"))
     with pytest.raises(ValidationError, match="mark price is required"):
@@ -511,6 +666,36 @@ def test_a_symbol_may_appear_only_once() -> None:
     position = make_position(quantity=Decimal("0.2"))
     with pytest.raises(ValidationError, match="at most once in positions"):
         make_snapshot(positions=(position, position))
+
+
+def test_an_asset_may_appear_only_once_in_balances() -> None:
+    snapshot = make_snapshot()
+    duplicated_balance = _payload(snapshot.balances[0])
+    payload = _payload(snapshot, balances=[duplicated_balance, duplicated_balance])
+    with pytest.raises(ValidationError, match="at most once in balances"):
+        PortfolioSnapshot.model_validate(payload)
+
+
+def test_cash_must_equal_the_quote_asset_balance_total() -> None:
+    # cash is a projection of the quote-asset balance, not an independently tracked value.
+    snapshot = make_snapshot(cash=Decimal(1_000))
+    payload = _payload(
+        snapshot,
+        cash=Decimal(999),
+        balances=[_payload(balance) for balance in snapshot.balances],
+    )
+    with pytest.raises(
+        ValidationError, match="cash must equal the total of the quote-asset balance"
+    ):
+        PortfolioSnapshot.model_validate(payload)
+
+
+def test_cash_is_unconstrained_when_no_quote_asset_balance_is_present() -> None:
+    # With no quote-asset entry in balances at all, there is nothing to cross-check cash
+    # against; the model cannot invent a requirement it has no data to enforce.
+    snapshot = make_snapshot(cash=Decimal(1_000))
+    payload = _payload(snapshot, balances=[])
+    PortfolioSnapshot.model_validate(payload)
 
 
 # --- Health --------------------------------------------------------------------------------------

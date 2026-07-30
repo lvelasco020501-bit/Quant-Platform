@@ -259,6 +259,18 @@ class OrderStatus(StrEnum):
 
     OPEN = "open"
     PARTIALLY_FILLED = "partially_filled"
+
+    PENDING_CANCEL = "pending_cancel"
+    """A cancel request has been sent to the venue but not yet confirmed.
+
+    Non-terminal: the venue may still confirm the cancel, but it may equally deliver a fill
+    that was already in flight when the cancel was requested, so this status does not by
+    itself reject new fills. It can transition to :attr:`CANCELED` (the cancel was
+    honoured), :attr:`PARTIALLY_FILLED` or :attr:`FILLED` (a race was lost to a fill that
+    was already in flight), or :attr:`UNKNOWN` (the venue's response could not be
+    determined and reconciliation is required).
+    """
+
     FILLED = "filled"
     CANCELED = "canceled"
     REJECTED = "rejected"
@@ -283,14 +295,20 @@ class OrderStatus(StrEnum):
             OrderStatus.PENDING_NEW,
             OrderStatus.OPEN,
             OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.PENDING_CANCEL,
         )
 
     @property
     def can_produce_fills(self) -> bool:
-        """Return whether the status permits fills to be attributed to the order."""
+        """Return whether the status permits fills to be attributed to the order.
+
+        ``PENDING_CANCEL`` is included deliberately: a cancel request in flight must not,
+        by itself, cause a fill that the venue already executed to be rejected as invalid.
+        """
         return self in (
             OrderStatus.OPEN,
             OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.PENDING_CANCEL,
             OrderStatus.FILLED,
         )
 
@@ -491,6 +509,7 @@ class EventType(StrEnum):
     ORDER_SUBMITTED = "order_submitted"
     ORDER_STATUS_CHANGED = "order_status_changed"
     FILL_RECEIVED = "fill_received"
+    POSITION_CHANGED = "position_changed"
     PORTFOLIO_UPDATED = "portfolio_updated"
     RECONCILIATION_COMPLETED = "reconciliation_completed"
     CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"

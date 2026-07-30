@@ -8,6 +8,7 @@ for structured logging, alerting and persistence, and avoids relying on message 
 from __future__ import annotations
 
 __all__ = [
+    "AccountingInvariantError",
     "CircuitBreakerTrippedError",
     "ClockDesynchronizationError",
     "ConfigurationError",
@@ -20,12 +21,16 @@ __all__ = [
     "DuplicateOrderError",
     "ExchangeUnavailableError",
     "ExecutionError",
+    "InconsistentSeedStateError",
     "InsufficientBalanceError",
+    "InsufficientPositionError",
+    "InvalidFillSideError",
     "LiveTradingNotAuthorizedError",
     "NegativeBalanceError",
     "OrderNotFoundError",
     "OrderSubmissionError",
     "OutOfOrderDataError",
+    "OutOfOrderFillError",
     "PortfolioError",
     "QuantPlatformError",
     "ReconciliationError",
@@ -38,9 +43,12 @@ __all__ = [
     "StrategyError",
     "StrategyNotFoundError",
     "StrategyParameterError",
+    "SymbolMismatchError",
     "SymbolRuleViolationError",
     "SystemHaltedError",
     "UnknownOrderStateError",
+    "UnsupportedFeeAssetError",
+    "UnsupportedMarketTypeError",
 ]
 
 
@@ -268,6 +276,54 @@ class DuplicateFillError(PortfolioError):
     """Raised when a fill that was already applied is presented again."""
 
     code = "duplicate_fill"
+
+
+class InsufficientPositionError(PortfolioError):
+    """Raised when a sell fill would reduce a position below zero exposure."""
+
+    code = "insufficient_position"
+
+
+class UnsupportedFeeAssetError(PortfolioError):
+    """Raised when a fill carries a non-zero fee in an asset other than the quote asset."""
+
+    code = "unsupported_fee_asset"
+
+
+class SymbolMismatchError(PortfolioError):
+    """Raised when a fill's symbol is unknown to the engine or spans an unexpected quote asset."""
+
+    code = "symbol_mismatch"
+
+
+class UnsupportedMarketTypeError(PortfolioError):
+    """Raised when a fill is presented for a market type other than spot."""
+
+    code = "unsupported_market_type"
+
+
+class InvalidFillSideError(PortfolioError):
+    """Raised when a fill carries a side outside the supported buy/sell set."""
+
+    code = "invalid_fill_side"
+
+
+class AccountingInvariantError(PortfolioError):
+    """Raised when applying a fill would leave the ledger in an inconsistent state."""
+
+    code = "accounting_invariant_violation"
+
+
+class InconsistentSeedStateError(PortfolioError):
+    """Raised when an engine would be constructed with an inconsistent starting state."""
+
+    code = "inconsistent_seed_state"
+
+
+class OutOfOrderFillError(PortfolioError):
+    """Raised when a fill's ``executed_at`` precedes the engine's last applied fill."""
+
+    code = "out_of_order_fill"
 
 
 class ReconciliationError(PortfolioError):

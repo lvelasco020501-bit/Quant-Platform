@@ -35,6 +35,7 @@ from quantplatform.core.models.risk import RiskCheckResult, RiskContext, RiskDec
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.timeutils import bar_close_time
+from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.strategies.base import BaseStrategy
 
 ANCHOR: Final[datetime] = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
@@ -50,6 +51,7 @@ def make_symbol_rules(
     symbol: str = SYMBOL,
     base_asset: str = "BTC",
     quote_asset: str = "USDT",
+    market_type: MarketType = MarketType.SPOT,
     price_tick: Decimal = Decimal("0.01"),
     quantity_step: Decimal = Decimal("0.00001"),
     min_quantity: Decimal | None = None,
@@ -60,7 +62,7 @@ def make_symbol_rules(
         symbol=symbol,
         base_asset=base_asset,
         quote_asset=quote_asset,
-        market_type=MarketType.SPOT,
+        market_type=market_type,
         price_tick=price_tick,
         quantity_step=quantity_step,
         min_quantity=min_quantity if min_quantity is not None else quantity_step,
@@ -288,27 +290,47 @@ def make_order(
 
 def make_fill(
     *,
+    symbol: str = SYMBOL,
     quantity: Decimal = Decimal("0.1"),
     price: Decimal = Decimal(50_000),
     fee: Decimal = Decimal(5),
+    fee_asset: str = "USDT",
     side: OrderSide = OrderSide.BUY,
+    executed_at: datetime = ANCHOR,
 ) -> Fill:
     order = make_order()
     return Fill(
-        fill_id=deterministic_uuid("fill", str(order.order_id), str(quantity), str(price)),
+        fill_id=deterministic_uuid(
+            "fill",
+            str(order.order_id),
+            str(quantity),
+            str(price),
+            side.value,
+            executed_at.isoformat(),
+        ),
         order_id=order.order_id,
         client_order_id=order.client_order_id,
         venue_trade_id=None,
-        symbol=order.symbol,
+        symbol=symbol,
         side=side,
         quantity=quantity,
         price=price,
         fee=fee,
-        fee_asset="USDT",
+        fee_asset=fee_asset,
         execution_mode=order.execution_mode,
         is_maker=False,
-        executed_at=ANCHOR,
+        executed_at=executed_at,
     )
+
+
+def make_balance(
+    *,
+    asset: str = "USDT",
+    free: Decimal = Decimal(100_000),
+    locked: Decimal = Decimal(0),
+    updated_at: datetime = ANCHOR,
+) -> Balance:
+    return Balance(asset=asset, free=free, locked=locked, updated_at=updated_at)
 
 
 def make_position(
@@ -348,6 +370,23 @@ def make_snapshot(
         mark_prices=resolved_marks,
         realized_pnl=Decimal(0),
         total_fees=Decimal(0),
+    )
+
+
+def make_portfolio_engine(
+    *,
+    quote_asset: str = "USDT",
+    symbols: Mapping[str, SymbolRules] | None = None,
+    initial_balances: Sequence[Balance] = (),
+    execution_mode: ExecutionMode = ExecutionMode.PAPER,
+) -> SpotPortfolioEngine:
+    resolved_symbols = symbols if symbols is not None else {SYMBOL: make_symbol_rules()}
+    return SpotPortfolioEngine(
+        quote_asset=quote_asset,
+        symbols=resolved_symbols,
+        execution_mode=execution_mode,
+        initial_balances=initial_balances,
+        source="test",
     )
 
 

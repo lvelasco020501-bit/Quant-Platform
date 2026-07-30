@@ -224,18 +224,52 @@ is a view derived from it, never a competing record:
 - `PortfolioSnapshot.cash` is a **projection** of the quote asset's `Balance.total`, not an
   independently tracked value — enforced whenever that balance entry is present.
 - `Position` is a **cost-basis overlay**, not a second asset ledger: for a spot symbol,
-  `Position.quantity` must equal the corresponding base-asset `Balance.total`. Maintaining
-  that reconciliation after every fill is the future portfolio engine's job, not something
-  a single domain model can enforce on its own.
+  `Position.quantity` equals the corresponding base-asset `Balance.total`. Maintaining that
+  reconciliation after every fill is `SpotPortfolioEngine`'s job (see below); a single
+  domain model cannot enforce it on its own.
 - `Position.realized_pnl` is cumulative for the position's current *lifecycle* only. It
   resets to zero only when a new lifecycle begins after a prior one closed (quantity
   returned to zero); a closed lifecycle's final snapshot keeps its realized PnL forever,
   immutable like every other record in this domain.
 - Aggregate fee fields (`Order.fees_paid`, `Position.fees_paid`,
   `PortfolioSnapshot.total_fees`) are always quote-asset denominated. A `Fill` may pay its
-  fee in a different asset (`Fill.fee_asset`); converting or rejecting that fee before it
-  reaches a quote-denominated aggregate is a future portfolio-engine responsibility — no
-  component may silently sum fees across currencies.
+  fee in a different asset (`Fill.fee_asset`); folding a non-quote fee into a
+  quote-denominated aggregate requires conversion, which this phase does not implement — see
+  fee handling below.
+
+#### Phase 3A: `SpotPortfolioEngine`
+
+`quantplatform.portfolio.engine.SpotPortfolioEngine` implements the `PortfolioEngine` port
+and applies fills that already exist — it never creates or matches orders. Scope is
+deliberately narrow: spot markets, one base and one quote asset per symbol, long-only
+exposure, average-cost accounting, fees denominated in the account's single quote asset.
+
+- **Average-cost method.** Buying computes a new weighted average entry price from prior
+  cost basis plus the executed notional; selling releases cost at the *existing* average
+  entry price and leaves it unchanged on a partial reduction.
+- **Buy-fee cost-basis treatment.** A quote-asset buy fee is folded into cost basis, so
+  average entry price is `(prior cost basis + notional + fee) / new quantity` — a buy fee
+  always makes the average entry price higher, never a separate expense line.
+- **Sell-fee realized-PnL treatment.** A quote-asset sell fee reduces realized PnL directly:
+  `realized = (notional − cost released) − fee`.
+- **Idempotent fill application.** Applying a `fill_id` that was already applied is a no-op:
+  every field of engine state is left unchanged and no events are emitted, rather than
+  raising — the engine returns the unchanged current snapshot.
+- **Unsupported fee assets.** A non-zero fee must be denominated in the portfolio's quote
+  asset; any other asset is rejected. A *zero* fee in any asset is accepted (the `Fill`
+  contract requires a `fee_asset` even when nothing is charged), since there is no amount to
+  convert.
+- **Account-level realized PnL and fees are cumulative across every lifecycle a position has
+  ever had**, tracked as engine state rather than summed from currently open positions, so a
+  closed lifecycle's contribution is never lost when a position later reopens.
+- **No market-price reads.** The engine never queries a price source; the snapshot embedded
+  in its `PortfolioUpdated` event marks every open position at its own average entry price
+  (so its `unrealized_pnl` is always zero by construction), while `PortfolioEngine.snapshot()`
+  accepts caller-supplied real mark prices for a genuinely marked view.
+
+Deferred to the Phase 3B simulated broker and beyond: order matching, simulated execution,
+commissions, slippage, fee-currency conversion, order/fill/position/portfolio persistence,
+and order-status transition-sequence enforcement.
 
 ### Execution modes
 
@@ -287,6 +321,9 @@ supports it, and be distinct from paper or testnet credentials.
 - **Gap detection covers only the interior of a dataset.** A file that starts late or ends
   early is not faulted, because the data layer has no way to know the range the caller
   intended to cover.
+- **No order execution yet.** `SpotPortfolioEngine` (Phase 3A) accounts for fills that
+  already exist; nothing in the platform yet creates a fill. Order matching, a simulated
+  broker, commissions and slippage are the Phase 3B simulated broker's responsibility.
 
 ## License
 

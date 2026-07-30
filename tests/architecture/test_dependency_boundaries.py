@@ -44,7 +44,10 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     # data access, no execution, no persistence.
     "strategies": frozenset({"core"}),
     "features": frozenset({"core", "config"}),
-    "data": frozenset({"core", "config", "storage"}),
+    # The data layer reaches persistence only through the repository and unit-of-work
+    # ports declared in core, so it needs no dependency on storage at all. Composition
+    # roots inject the SQLAlchemy implementations.
+    "data": frozenset({"core", "config"}),
     "risk": frozenset({"core", "config"}),
     "portfolio": frozenset({"core", "config"}),
     "execution": frozenset({"core", "config"}),
@@ -179,3 +182,63 @@ def test_execution_and_risk_never_import_strategies() -> None:
 
 def test_the_platform_package_is_typed() -> None:
     assert (PACKAGE_ROOT / "py.typed").is_file()
+
+
+# --- Persistence boundary -------------------------------------------------------------------
+
+_ORM_MODULE: Final[str] = "quantplatform.storage.orm"
+_ORM_ENTITY_NAMES: Final[frozenset[str]] = frozenset(
+    {"MarketBarRow", "IngestionRunRow", "DataQualityFindingRow"}
+)
+"""Mapped classes that must never be named outside the storage package.
+
+Matching is done over the import graph rather than raw text: a substring search would
+collide with unrelated names such as ``BaseModel`` and report false violations.
+"""
+
+
+def test_orm_entities_never_escape_the_storage_package() -> None:
+    offenders: list[str] = []
+    for path in _source_files():
+        if _domain_of(path) == "storage":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module is None:
+                continue
+            imported = {alias.name for alias in node.names}
+            if node.module == _ORM_MODULE or imported & _ORM_ENTITY_NAMES:
+                offenders.append(str(path.relative_to(PACKAGE_ROOT)))
+                break
+    assert not offenders, f"ORM entities leaked outside storage: {offenders}"
+
+
+def test_only_storage_imports_sqlalchemy() -> None:
+    allowed = {"storage"}
+    offenders: list[str] = []
+    for path in _source_files():
+        if _domain_of(path) in allowed:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            imported = _imported_root_modules(node)
+            if "sqlalchemy" in imported:
+                offenders.append(str(path.relative_to(PACKAGE_ROOT)))
+                break
+    assert not offenders, f"sqlalchemy imported outside storage: {offenders}"
+
+
+def test_the_data_layer_does_not_depend_on_storage() -> None:
+    for path in _source_files():
+        if _domain_of(path) != "data":
+            continue
+        assert "storage" not in _imported_domains(path), path
+
+
+def _imported_root_modules(node: ast.AST) -> set[str]:
+    """Return the top-level third-party modules an import node references."""
+    if isinstance(node, ast.Import):
+        return {alias.name.split(".")[0] for alias in node.names}
+    if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+        return {node.module.split(".")[0]}
+    return set()

@@ -16,14 +16,15 @@ from pydantic import Field, computed_field
 from quantplatform.core.enums import (
     AlertSeverity,
     CircuitBreakerReason,
-    DataQualityIssue,
     EventType,
+    MarketType,
     OrderStatus,
     ReconciliationStatus,
     SystemState,
     Timeframe,
 )
 from quantplatform.core.models.base import DomainModel, Symbol, Text, UtcDatetime
+from quantplatform.core.models.data import DataQualityFinding, IngestionRun
 from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.orders import Fill, Order, OrderIntent
@@ -39,6 +40,9 @@ __all__ = [
     "DomainEvent",
     "FeaturesComputed",
     "FillReceived",
+    "IngestionCompleted",
+    "IngestionFailed",
+    "IngestionStarted",
     "MarketBarReceived",
     "OrderIntentCreated",
     "OrderStatusChanged",
@@ -81,14 +85,47 @@ class MarketBarReceived(DomainEvent):
 
 
 class DataQualityIssueDetected(DomainEvent):
-    """An integrity problem was detected on inbound market data."""
+    """An integrity problem was detected on inbound market data.
+
+    Carries the full :class:`~quantplatform.core.models.data.DataQualityFinding` rather
+    than a loose ``symbol``/``timeframe``/``issue``/``detail`` tuple (the shape this event
+    originally had in the phase 1 placeholder). Nothing outside this module consumed the
+    old shape, so folding the finding in directly avoids keeping two parallel
+    representations of the same observation in sync.
+    """
 
     EVENT_TYPE: ClassVar[EventType] = EventType.DATA_QUALITY_ISSUE_DETECTED
 
-    symbol: Symbol
-    timeframe: Timeframe
-    issue: DataQualityIssue
-    detail: Text
+    finding: DataQualityFinding
+
+
+class IngestionStarted(DomainEvent):
+    """A market-data ingestion run began."""
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.INGESTION_STARTED
+
+    run_id: UUID
+    source_id: Text
+    source_path: Text
+    expected_symbol: Symbol
+    expected_market_type: MarketType
+    expected_timeframe: Timeframe
+
+
+class IngestionCompleted(DomainEvent):
+    """A market-data ingestion run finished successfully, with or without findings."""
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.INGESTION_COMPLETED
+
+    run: IngestionRun
+
+
+class IngestionFailed(DomainEvent):
+    """A market-data ingestion run failed; no bars from it were persisted."""
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.INGESTION_FAILED
+
+    run: IngestionRun
 
 
 class FeaturesComputed(DomainEvent):

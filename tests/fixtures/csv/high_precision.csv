@@ -1,0 +1,2 @@
+symbol,market_type,timeframe,open_time,close_time,open,high,low,close,volume,trade_count
+BTC/USDT,spot,1h,2026-01-01T00:00:00+00:00,2026-01-01T01:00:00+00:00,50000.123456789012345678,50200.5,49900.25,50100.87654321,12.000000000000000001,100

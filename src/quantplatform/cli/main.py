@@ -1,8 +1,8 @@
 """Command line entry point.
 
-Phase 1 exposes only what is needed to confirm that an installation is sound: the platform
-version and a configuration check that surfaces unsafe or incoherent settings without ever
-printing a secret.
+Exposes the platform version, a configuration check that surfaces unsafe or incoherent
+settings, and the ``data`` command group for historical market-data validation, ingestion
+and inspection. No command ever prints a secret.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import json
 import typer
 
 from quantplatform import __version__
+from quantplatform.cli import data
 from quantplatform.config.settings import Settings, load_settings
 from quantplatform.core.errors import QuantPlatformError
 
@@ -23,6 +24,7 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+app.add_typer(data.app)
 
 _EXIT_CONFIGURATION_ERROR = 2
 

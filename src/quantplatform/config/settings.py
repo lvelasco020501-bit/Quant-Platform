@@ -23,16 +23,18 @@ from quantplatform.core.enums import (
     AssetClass,
     Environment,
     ExecutionMode,
+    FindingSeverity,
     LogFormat,
     MarketType,
     Timeframe,
 )
 from quantplatform.core.errors import ConfigurationError, LiveTradingNotAuthorizedError
-from quantplatform.core.models.base import AssetCode, Symbol
+from quantplatform.core.models.base import AssetCode, Symbol, UtcDatetime, VenueId
 from quantplatform.core.numeric import Money, NonNegativeMoney, Rate
 
 __all__ = [
     "BacktestSettings",
+    "DataSettings",
     "DatabaseSettings",
     "ExchangeSettings",
     "MarketSettings",
@@ -169,6 +171,62 @@ class DatabaseSettings(_SettingsSection):
     echo: bool = False
 
 
+class DataSettings(_SettingsSection):
+    """Configuration for the historical market-data ingestion pipeline.
+
+    Expected symbol, market type and timeframe are deliberately not duplicated here:
+    :attr:`MarketSettings.symbol`, :attr:`MarketSettings.market_type` and
+    :attr:`MarketSettings.timeframe` are the single source of truth, and the ingestion
+    service and CLI default to them unless a specific invocation overrides them (for
+    example, to prove that a fixture with the wrong symbol is correctly rejected).
+    """
+
+    csv_delimiter: str = Field(default=",", min_length=1, max_length=1)
+    csv_encoding: str = Field(default="utf-8", min_length=1)
+
+    close_grace_period_seconds: int = Field(default=0, ge=0)
+    """Extra time, beyond the bar's own close timestamp, before it is treated as closed."""
+
+    gap_severity: FindingSeverity = FindingSeverity.WARNING
+    """Severity recorded for each missing interval, before any escalation threshold."""
+
+    max_allowed_gap_bars: int = Field(default=24, ge=0)
+    """Total missing bars beyond which the dataset is treated as unusable and rejected.
+
+    A single missing bar or a handful of them only produces a ``WARNING`` (or whatever
+    :attr:`gap_severity` is configured to). Once the total count of missing intervals in a
+    dataset exceeds this threshold, an additional ``FATAL`` finding is raised and the whole
+    ingestion run fails, because a dataset with that many holes cannot be trusted for
+    downstream feature computation or backtesting.
+    """
+
+    max_data_age_multiplier: Money = Field(default=Decimal("2"), gt=1)
+    """Freshness budget, as a multiple of the timeframe, before the latest bar is stale.
+
+    Ignored whenever the ingestion is given an explicit historical reference time (either
+    through :attr:`historical_backfill_end` or a per-call override): an import that
+    intentionally ends in the past must never be flagged stale merely for being old.
+    """
+
+    historical_backfill_end: UtcDatetime | None = None
+    """Default "as of" boundary for historical imports, overridable per ingestion call."""
+
+    batch_size: int = Field(default=1000, ge=1)
+    """Number of bars written to storage per batch during ingestion."""
+
+    default_source_id: VenueId = "csv_historical"
+    """Default logical source identifier when an ingestion call does not supply one."""
+
+    @model_validator(mode="after")
+    def _validate_gap_severity(self) -> Self:
+        """Restrict the configurable gap severity to the two values the spec allows."""
+        allowed = (FindingSeverity.WARNING, FindingSeverity.ERROR)
+        if self.gap_severity not in allowed:
+            msg = "gap_severity must be either warning or error"
+            raise ValueError(msg)
+        return self
+
+
 class BacktestSettings(_SettingsSection):
     """Simulation assumptions recorded with every backtest run."""
 
@@ -226,6 +284,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    data: DataSettings = Field(default_factory=DataSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
 

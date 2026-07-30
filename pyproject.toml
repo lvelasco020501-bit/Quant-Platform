@@ -9,7 +9,7 @@ authors = [{ name = "Quant Platform Team" }]
 dependencies = [
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.8,<3",
-    "sqlalchemy>=2.0.36,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<3",
     "alembic>=1.14,<2",
     "psycopg[binary]>=3.2,<4",
     "numpy>=2.1,<3",
@@ -30,6 +30,9 @@ dev = [
     "ruff>=0.9,<1",
     "mypy>=1.14,<2",
     "pandas-stubs>=2.2",
+    # SQLite is only used to exercise the repository and migrations in tests without a
+    # running PostgreSQL instance; the production target remains PostgreSQL via psycopg.
+    "aiosqlite>=0.20,<1",
 ]
 
 [build-system]

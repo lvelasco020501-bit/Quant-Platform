@@ -19,11 +19,13 @@ from quantplatform.core.constants import (
 __all__ = [
     "AlertSeverity",
     "AssetClass",
+    "BarWriteOutcome",
     "CircuitBreakerReason",
     "DataQualityIssue",
     "Environment",
     "EventType",
     "ExecutionMode",
+    "FindingSeverity",
     "IngestionStatus",
     "LogFormat",
     "MarketType",
@@ -388,7 +390,15 @@ class DataQualityIssue(StrEnum):
     """A raw record could not be parsed into a valid bar."""
 
     REVISED_BAR = "revised_bar"
-    """A stored bar was overwritten with different prices or volume by a later fetch."""
+    """An incoming bar conflicts with a stored bar under the same natural key.
+
+    Named for the situation it describes — the source has revised a candle it already
+    published — not for an action taken: the platform never overwrites the stored bar, it
+    preserves it and records the conflict.
+    """
+
+    EMPTY_DATASET = "empty_dataset"
+    """A source produced no usable rows, either as delivered or after validation."""
 
 
 class IngestionStatus(StrEnum):
@@ -402,6 +412,45 @@ class IngestionStatus(StrEnum):
     def is_successful(self) -> bool:
         """Return whether the run persisted its data."""
         return self is not IngestionStatus.FAILED
+
+
+class FindingSeverity(StrEnum):
+    """Severity of a data-quality finding, defining what ingestion does about it.
+
+    ``INFO`` and ``WARNING`` are purely informational: ingestion continues and the
+    affected record, if any, is still persisted. ``ERROR`` rejects the specific record
+    that triggered it, but the rest of the dataset may still be ingested. ``FATAL`` fails
+    the entire ingestion run: no bars from that run are persisted, though the run and its
+    findings still are, so the failure remains auditable.
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    FATAL = "fatal"
+
+    @property
+    def blocks_record(self) -> bool:
+        """Return whether a finding at this severity causes its record to be rejected."""
+        return self in (FindingSeverity.ERROR, FindingSeverity.FATAL)
+
+    @property
+    def blocks_ingestion(self) -> bool:
+        """Return whether a finding at this severity fails the entire ingestion run."""
+        return self is FindingSeverity.FATAL
+
+
+class BarWriteOutcome(StrEnum):
+    """Result of attempting to persist a single normalised bar.
+
+    Reused by the bar repository to report, per bar, whether it was newly inserted, was
+    an exact repeat of an already-stored bar (idempotent no-op), or conflicted with an
+    already-stored bar that has different OHLCV values (never silently overwritten).
+    """
+
+    INSERTED = "inserted"
+    EXACT_DUPLICATE = "exact_duplicate"
+    CONFLICTING = "conflicting"
 
 
 class ReconciliationStatus(StrEnum):
@@ -432,7 +481,9 @@ class EventType(StrEnum):
 
     MARKET_BAR_RECEIVED = "market_bar_received"
     DATA_QUALITY_ISSUE_DETECTED = "data_quality_issue_detected"
+    INGESTION_STARTED = "ingestion_started"
     INGESTION_COMPLETED = "ingestion_completed"
+    INGESTION_FAILED = "ingestion_failed"
     FEATURES_COMPUTED = "features_computed"
     SIGNAL_GENERATED = "signal_generated"
     ORDER_INTENT_CREATED = "order_intent_created"

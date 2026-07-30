@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
+from types import TracebackType
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 
 from quantplatform.core.enums import ExecutionMode, MarketType, Timeframe
 from quantplatform.core.events import DomainEvent
+from quantplatform.core.models.data import BarWriteResult, DataQualityFinding, IngestionRun
 from quantplatform.core.models.health import ComponentHealth
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
@@ -27,8 +29,11 @@ from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 
 __all__ = [
+    "DataUnitOfWork",
     "EventPublisher",
     "ExecutionAdapter",
+    "IngestionRunRepository",
+    "MarketBarRepository",
     "MarketDataProvider",
     "PortfolioEngine",
     "RiskEngine",
@@ -255,4 +260,157 @@ class EventPublisher(Protocol):
 
     async def publish_many(self, events: Sequence[DomainEvent]) -> None:
         """Publish events in order."""
+        ...
+
+
+@runtime_checkable
+class MarketBarRepository(Protocol):
+    """Persists and retrieves normalised market bars.
+
+    The natural key of a bar is ``(symbol, market_type, timeframe, open_time)``. Adding a
+    bar that already exists under that key with identical OHLCV values is a no-op; adding
+    one with different values must never silently overwrite the stored bar. Implementations
+    must not commit or roll back a transaction themselves: the caller owns that boundary.
+    """
+
+    async def add_bars(self, bars: Sequence[MarketBar]) -> Sequence[BarWriteResult]:
+        """Idempotently stage bars for persistence.
+
+        Args:
+            bars: Normalised bars to add, in any order.
+
+        Returns:
+            One :class:`~quantplatform.core.models.data.BarWriteResult` per input bar,
+            in the same order, reporting whether it was inserted, was an exact duplicate,
+            or conflicted with an already-stored bar.
+        """
+        ...
+
+    async def get_bars(
+        self,
+        *,
+        symbol: str,
+        market_type: MarketType,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+    ) -> Sequence[MarketBar]:
+        """Return stored bars whose open time falls in the half-open interval ``[start, end)``.
+
+        Args:
+            symbol: Canonical platform symbol.
+            market_type: Market the bars belong to.
+            timeframe: Bar interval.
+            start: Inclusive lower bound, timezone-aware.
+            end: Exclusive upper bound, timezone-aware.
+
+        Returns:
+            Bars ordered deterministically by ascending open time.
+        """
+        ...
+
+    async def get_latest_bar(
+        self,
+        *,
+        symbol: str,
+        market_type: MarketType,
+        timeframe: Timeframe,
+    ) -> MarketBar | None:
+        """Return the most recent stored bar for a symbol, market and timeframe, if any."""
+        ...
+
+    async def exists(
+        self,
+        *,
+        symbol: str,
+        market_type: MarketType,
+        timeframe: Timeframe,
+        open_time: datetime,
+    ) -> bool:
+        """Return whether a bar is already stored under this natural key."""
+        ...
+
+    async def count_bars(
+        self,
+        *,
+        symbol: str,
+        market_type: MarketType,
+        timeframe: Timeframe,
+    ) -> int:
+        """Return the number of stored bars for a symbol, market and timeframe."""
+        ...
+
+
+@runtime_checkable
+class IngestionRunRepository(Protocol):
+    """Persists ingestion provenance and the findings raised while producing it.
+
+    Implementations must not commit or roll back a transaction themselves: the ingestion
+    service owns that boundary, and writes the run together with its findings as a single
+    atomic unit after every bar-write attempt has already concluded, whether that attempt
+    succeeded or was rolled back.
+    """
+
+    async def record_run(
+        self,
+        run: IngestionRun,
+        findings: Sequence[DataQualityFinding],
+    ) -> None:
+        """Persist a concluded ingestion run together with every finding it raised.
+
+        Args:
+            run: The run's final provenance and outcome.
+            findings: Every finding raised while processing the run, in any order.
+        """
+        ...
+
+    async def get_run(self, run_id: UUID) -> IngestionRun | None:
+        """Return a previously persisted run by id, if it exists."""
+        ...
+
+    async def get_findings(self, run_id: UUID) -> Sequence[DataQualityFinding]:
+        """Return every finding recorded against a run, in any order."""
+        ...
+
+
+@runtime_checkable
+class DataUnitOfWork(Protocol):
+    """A single transactional scope over the market-data repositories.
+
+    This port is what gives the ingestion service explicit transaction ownership. The
+    repositories it exposes never commit on their own, so nothing reaches the database
+    until the service calls :meth:`commit`; leaving the context without committing rolls
+    everything back. That is what makes "no bars are persisted when a fatal finding is
+    raised" a structural guarantee rather than a matter of remembering to clean up.
+    """
+
+    @property
+    def bars(self) -> MarketBarRepository:
+        """Return the market bar repository bound to this transaction."""
+        ...
+
+    @property
+    def runs(self) -> IngestionRunRepository:
+        """Return the ingestion run repository bound to this transaction."""
+        ...
+
+    async def __aenter__(self) -> DataUnitOfWork:
+        """Begin the transactional scope."""
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Roll back and release the scope unless it was explicitly committed."""
+        ...
+
+    async def commit(self) -> None:
+        """Commit everything staged in this scope."""
+        ...
+
+    async def rollback(self) -> None:
+        """Discard everything staged in this scope."""
         ...

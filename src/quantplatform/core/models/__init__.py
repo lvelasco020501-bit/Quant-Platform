@@ -15,6 +15,7 @@ from quantplatform.core.models.base import (
     UtcDatetime,
     VenueId,
 )
+from quantplatform.core.models.data import BarWriteResult, DataQualityFinding, IngestionRun
 from quantplatform.core.models.health import (
     CircuitBreakerStatus,
     ComponentHealth,
@@ -30,11 +31,14 @@ __all__ = [
     "ApprovedOrder",
     "AssetCode",
     "Balance",
+    "BarWriteResult",
     "CircuitBreakerStatus",
     "ComponentHealth",
+    "DataQualityFinding",
     "DomainModel",
     "Fill",
     "HealthStatus",
+    "IngestionRun",
     "MarketBar",
     "Order",
     "OrderIntent",

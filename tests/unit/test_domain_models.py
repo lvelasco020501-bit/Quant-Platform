@@ -399,6 +399,37 @@ def test_rejected_order_cannot_carry_fills() -> None:
         )
 
 
+def test_pending_new_order_cannot_carry_fills() -> None:
+    # Never reached the venue, so nothing could have executed against it.
+    assert not OrderStatus.PENDING_NEW.may_carry_fills
+    with pytest.raises(ValidationError, match="cannot carry fills"):
+        make_order(
+            status=OrderStatus.PENDING_NEW,
+            filled_quantity=Decimal("0.1"),
+            avg_fill_price=Decimal(50_000),
+        )
+
+
+@pytest.mark.parametrize("status", [OrderStatus.CANCELED, OrderStatus.EXPIRED])
+def test_a_partially_filled_order_keeps_its_fills_when_it_terminates(
+    status: OrderStatus,
+) -> None:
+    # Partial execution followed by cancellation of the remainder is ordinary venue
+    # behaviour — every IOC order that does not fill completely ends exactly this way — so
+    # these terminal states must retain the quantity that executed while the order was live.
+    assert status.may_carry_fills
+    assert not status.can_produce_fills
+    order = make_order(
+        status=status,
+        quantity=Decimal("0.1"),
+        filled_quantity=Decimal("0.04"),
+        avg_fill_price=Decimal(50_000),
+        cancel_reason="ioc remainder cancelled" if status is OrderStatus.CANCELED else None,
+    )
+    assert order.filled_quantity == Decimal("0.04")
+    assert order.remaining_quantity == Decimal("0.06")
+
+
 def test_rejected_order_requires_a_reason() -> None:
     with pytest.raises(ValidationError, match="requires a reject_reason"):
         make_order(status=OrderStatus.REJECTED)

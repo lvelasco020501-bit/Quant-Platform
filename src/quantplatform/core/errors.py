@@ -24,10 +24,13 @@ __all__ = [
     "InconsistentSeedStateError",
     "InsufficientBalanceError",
     "InsufficientPositionError",
+    "InsufficientReservationError",
     "InvalidFillSideError",
     "LiveTradingNotAuthorizedError",
+    "MatchingError",
     "NegativeBalanceError",
     "OrderNotFoundError",
+    "OrderStateTransitionError",
     "OrderSubmissionError",
     "OutOfOrderDataError",
     "OutOfOrderFillError",
@@ -49,6 +52,8 @@ __all__ = [
     "UnknownOrderStateError",
     "UnsupportedFeeAssetError",
     "UnsupportedMarketTypeError",
+    "UnsupportedOrderTypeError",
+    "UnsupportedTimeInForceError",
 ]
 
 
@@ -249,6 +254,36 @@ class ExchangeUnavailableError(ExecutionError):
     """Raised when the venue is unreachable or reports itself unhealthy."""
 
     code = "exchange_unavailable"
+
+
+class OrderStateTransitionError(ExecutionError):
+    """Raised when an order is moved between two states that no lifecycle path connects."""
+
+    code = "order_state_transition"
+
+
+class UnsupportedOrderTypeError(ExecutionError):
+    """Raised when an order type is outside the set the adapter can execute."""
+
+    code = "unsupported_order_type"
+
+
+class UnsupportedTimeInForceError(ExecutionError):
+    """Raised when a time-in-force instruction is outside the set the adapter honours."""
+
+    code = "unsupported_time_in_force"
+
+
+class MatchingError(ExecutionError):
+    """Raised when a bar cannot be matched against an order, for example on a symbol clash."""
+
+    code = "matching_error"
+
+
+class InsufficientReservationError(ExecutionError):
+    """Raised when releasing more of a reservation than an order still holds."""
+
+    code = "insufficient_reservation"
 
 
 # --- Portfolio -------------------------------------------------------------------------

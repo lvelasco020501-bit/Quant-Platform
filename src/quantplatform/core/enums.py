@@ -21,6 +21,7 @@ __all__ = [
     "AssetClass",
     "BarWriteOutcome",
     "CircuitBreakerReason",
+    "CommissionModel",
     "DataQualityIssue",
     "Environment",
     "EventType",
@@ -38,6 +39,7 @@ __all__ = [
     "RiskCheckStatus",
     "RiskOutcome",
     "SignalAction",
+    "SlippageModel",
     "SystemState",
     "TimeInForce",
     "Timeframe",
@@ -300,7 +302,7 @@ class OrderStatus(StrEnum):
 
     @property
     def can_produce_fills(self) -> bool:
-        """Return whether the status permits fills to be attributed to the order.
+        """Return whether the status permits *new* fills to be attributed to the order.
 
         ``PENDING_CANCEL`` is included deliberately: a cancel request in flight must not,
         by itself, cause a fill that the venue already executed to be rejected as invalid.
@@ -311,6 +313,130 @@ class OrderStatus(StrEnum):
             OrderStatus.PENDING_CANCEL,
             OrderStatus.FILLED,
         )
+
+    @property
+    def may_carry_fills(self) -> bool:
+        """Return whether an order in this status may report a non-zero ``filled_quantity``.
+
+        Broader than :attr:`can_produce_fills`, which asks whether a *new* fill may be
+        attributed right now. An order that traded and was then cancelled or expired keeps
+        the quantity it already executed: partial execution followed by cancellation of the
+        remainder is ordinary venue behaviour (every ``IOC`` order that does not fill
+        completely ends exactly this way), so those terminal states must be able to carry
+        the fills that happened while the order was still live. Only ``PENDING_NEW`` (never
+        reached the venue) and ``REJECTED`` (never became a working order) genuinely cannot.
+        """
+        return self is not OrderStatus.PENDING_NEW and self is not OrderStatus.REJECTED
+
+    def can_transition_to(self, target: OrderStatus) -> bool:
+        """Return whether moving from this status to ``target`` is a legal transition.
+
+        A terminal status admits no transition at all, including to itself. The
+        self-transition ``PARTIALLY_FILLED -> PARTIALLY_FILLED`` is legal and expected: each
+        further partial execution on an already partly filled order reports a status change
+        carrying its new cumulative quantity.
+        """
+        return target in _ORDER_TRANSITIONS[self]
+
+
+_ORDER_TRANSITIONS: Final[dict[OrderStatus, frozenset[OrderStatus]]] = {
+    OrderStatus.PENDING_NEW: frozenset(
+        {
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        }
+    ),
+    OrderStatus.OPEN: frozenset(
+        {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.PENDING_CANCEL,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        }
+    ),
+    OrderStatus.PARTIALLY_FILLED: frozenset(
+        {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.PENDING_CANCEL,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        }
+    ),
+    OrderStatus.PENDING_CANCEL: frozenset(
+        {
+            OrderStatus.CANCELED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.EXPIRED,
+            OrderStatus.UNKNOWN,
+        }
+    ),
+    # Reconciliation is the only way out of UNKNOWN: it resolves to whatever the venue
+    # actually did, which may be any outcome including none.
+    OrderStatus.UNKNOWN: frozenset(
+        {
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        }
+    ),
+    OrderStatus.FILLED: frozenset(),
+    OrderStatus.CANCELED: frozenset(),
+    OrderStatus.REJECTED: frozenset(),
+    OrderStatus.EXPIRED: frozenset(),
+}
+"""Legal order-status transitions. Terminal statuses map to the empty set."""
+
+
+class SlippageModel(StrEnum):
+    """Deterministic price-adjustment model applied by the simulated broker.
+
+    Both values are fully deterministic; the platform deliberately offers no probabilistic
+    slippage, because a backtest whose fills depend on a random draw is not reproducible.
+    """
+
+    OFF = "off"
+    """Execute at the unadjusted matched price."""
+
+    FIXED_BPS = "fixed_bps"
+    """Move the execution price against the taker by a fixed number of basis points."""
+
+
+class CommissionModel(StrEnum):
+    """Deterministic commission model applied by the simulated broker."""
+
+    NONE = "none"
+    """Charge nothing."""
+
+    BASIS_POINTS = "basis_points"
+    """Charge a rate in basis points of the executed notional, where ``10`` is 0.1 percent.
+
+    Named for the unit it is actually expressed in. Calling this "percentage" while reading
+    a basis-point field is exactly the ambiguity that turns a 0.1 percent fee into a 10
+    percent one.
+    """
+
+    FLAT = "flat"
+    """Charge a fixed quote-asset amount once per order, independent of size.
+
+    Charged on an order's **first** fill and never again, so the total commission of an
+    order is knowable before it starts executing. A per-fill flat fee would not be: the
+    number of partial fills a resting order will need is not known when its funds are
+    reserved, so reserving for it would mean either under-reserving (and failing to settle
+    a fill the venue already executed) or holding an arbitrary multiple of the fee hostage.
+    """
 
 
 class RiskCheckStatus(StrEnum):

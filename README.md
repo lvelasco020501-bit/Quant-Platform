@@ -267,9 +267,81 @@ exposure, average-cost accounting, fees denominated in the account's single quot
   (so its `unrealized_pnl` is always zero by construction), while `PortfolioEngine.snapshot()`
   accepts caller-supplied real mark prices for a genuinely marked view.
 
-Deferred to the Phase 3B simulated broker and beyond: order matching, simulated execution,
-commissions, slippage, fee-currency conversion, order/fill/position/portfolio persistence,
-and order-status transition-sequence enforcement.
+Deferred beyond Phase 3: fee-currency conversion, order/fill/position/portfolio persistence,
+and restoring an open position when a process restarts.
+
+### Phase 3B: `SimulatedBroker`
+
+`quantplatform.execution.broker.SimulatedBroker` turns risk-approved orders into fills
+against closed bars. It owns the order book — working orders, their lifecycle, their
+reservations and the fills they produce — and nothing else. It never touches balances,
+positions, PnL or snapshots: every fill it generates is handed to the portfolio engine,
+which stays the sole accounting authority. It emits `OrderStatusChanged` and `FillReceived`,
+never `PortfolioUpdated`.
+
+**Supported.** Order types `MARKET` and `LIMIT`; sides `BUY` and `SELL`; time in force `GTC`
+and `IOC`; spot markets only. Anything else is refused at submission with a specific error
+(`UnsupportedOrderTypeError`, `UnsupportedTimeInForceError`, `UnsupportedMarketTypeError`).
+
+**Matching rules.** Only closed bars are matched, in submission order, by fixed rules:
+
+| Order | Matches when | Executes at |
+| --- | --- | --- |
+| Market buy / sell | Always | `bar.open`, moved by slippage |
+| Limit buy | `bar.low <= limit_price` | `limit_price` |
+| Limit sell | `bar.high >= limit_price` | `limit_price` |
+
+An `IOC` order that does not fill completely on the bar it meets has its remainder cancelled
+immediately; a `GTC` order stays working until it fills or is cancelled. There is no
+probabilistic matching, no intrabar path reconstruction and no queue-position model: those
+need order-book data this platform does not have, and inventing them would produce
+confident-looking fills that nothing justifies.
+
+**Reservation lifecycle.** Every accepted order holds funds in `Balance.locked`, which
+changes availability but never ownership — `Balance.total`, positions and PnL are untouched,
+so a reservation is invisible to accounting. A sell reserves its base quantity. A buy reserves
+the largest quote debit it can incur: `price_cap × quantity` plus the most commission that
+notional can attract, where the cap is `limit_price` for a limit buy and `max_execution_price`
+for a market buy. That field is required on every approved market buy precisely so the debit
+is boundable in advance — without it two market buys would each be accepted while silently
+competing for the same money. A buy that would execute above its cap is cancelled rather than
+filled. Reservations are released in full on cancellation and completion — including any
+unused remainder of an over-reservation — and partially on a partial fill, with the
+unconsumed remainder staying locked. A rejected order reserves nothing.
+
+**Slippage** is deterministic: `OFF`, or `FIXED_BPS` moving the price against the taker.
+It applies to market orders only — filling a limit order away from its limit would breach the
+price the risk engine approved. **Commission** is likewise deterministic: `NONE`,
+`BASIS_POINTS` of notional (`10` is 0.1 percent), or `FLAT` charged **once per order**. Flat
+is per order, not per fill, because the number of partial fills a resting order will need is
+unknowable when its funds are reserved, and a fee that cannot be bounded in advance cannot be
+reserved without either under-holding or locking an arbitrary multiple. Both rates are
+Decimal-only and capped at 10 000 basis points. The broker stamps the fee onto each `Fill`
+and never aggregates it; summing fees is portfolio accounting.
+
+**Cancellation** always traverses `OPEN`/`PARTIALLY_FILLED` → `PENDING_CANCEL` → `CANCELED`,
+emitting a status event for each transition, including for an IOC remainder. A simulated venue
+confirms instantly, but collapsing the two would erase the in-flight state the order contract
+exists to model. A partially filled order keeps its filled quantity and average fill price
+through both transitions.
+
+**Settlement is atomic per order.** The reservation is released, the fill is handed to the
+portfolio, and only then is broker state written. If the portfolio refuses the fill, the
+release is compensated exactly — restoring the balance's original timestamp too — and no fill,
+transition, reservation change or event survives. Because the portfolio engine has no
+un-apply, atomicity is per order rather than per bar: orders that already settled in a bar
+stay settled. Matching is therefore recorded **per order per bar**, so retrying a bar after a
+mid-bar failure resumes at the order that failed and can never re-execute one that succeeded.
+
+**No clock.** The broker starts at an explicit instant and advances only when a bar is
+processed, taking that bar's `close_time`. Every fill, order and event timestamp comes from
+there, and every identifier is derived, so a replay reproduces the run exactly. Resubmitting
+a known `client_order_id` returns the existing order without reserving again; reprocessing a
+completed bar is a no-op; cancelling an already-terminal order releases nothing.
+
+**Deferred.** Real exchange APIs, websocket feeds, persistence, stop and stop-limit orders,
+`FOK`, iceberg, OCO, trailing stops, leverage, margin, futures, options, order expiry, and
+any execution algorithm beyond the rules above.
 
 ### Execution modes
 
@@ -321,9 +393,13 @@ supports it, and be distinct from paper or testnet credentials.
 - **Gap detection covers only the interior of a dataset.** A file that starts late or ends
   early is not faulted, because the data layer has no way to know the range the caller
   intended to cover.
-- **No order execution yet.** `SpotPortfolioEngine` (Phase 3A) accounts for fills that
-  already exist; nothing in the platform yet creates a fill. Order matching, a simulated
-  broker, commissions and slippage are the Phase 3B simulated broker's responsibility.
+- **Execution is simulated only.** `SimulatedBroker` (Phase 3B) matches orders against
+  historical closed bars. No real venue is reachable, nothing is persisted, and no risk
+  engine yet stands between a strategy and the broker — approved orders are constructed by
+  hand until phase 4.
+- **Fills are bar-resolution.** A fill is priced from a bar's open, high or low and stamped
+  with the bar's close time. Anything that depends on where inside the bar a trade actually
+  happened — queue position, partial-book walks, latency races — is not modelled.
 
 ## License
 

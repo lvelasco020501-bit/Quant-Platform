@@ -121,6 +121,22 @@ class ApprovedOrder(DomainModel):
     quantity: Quantity
     limit_price: Price | None = None
     stop_price: Price | None = None
+    max_execution_price: Price | None = None
+    """The worst price a **market buy** may be executed at, and the basis for reserving its
+    funds.
+
+    A market order carries no price, so without this an execution adapter cannot know how
+    much quote asset to hold against it, and two market buys approved against the same
+    balance would each be accepted while silently competing for the same money. Requiring
+    the risk engine to state a ceiling makes the debit boundable in advance
+    (``max_execution_price * quantity``, plus commission on that notional) and makes any
+    execution above it a contract violation rather than a surprise.
+
+    Required for a market buy and forbidden otherwise: a limit order is already capped by
+    its own ``limit_price``, and a sell incurs no quote debit to bound. A *minimum*
+    acceptable sell price is a different concept and is deliberately not modelled here.
+    """
+
     time_in_force: TimeInForce
     execution_mode: ExecutionMode
     idempotency_key: str = Field(min_length=8, max_length=128)
@@ -128,8 +144,15 @@ class ApprovedOrder(DomainModel):
 
     @model_validator(mode="after")
     def _validate_prices(self) -> Self:
-        """Check the price fields against the order type."""
+        """Check the price fields against the order type and side."""
         _validate_price_fields(self.order_type, self.limit_price, self.stop_price)
+        needs_cap = self.order_type is OrderType.MARKET and self.side is OrderSide.BUY
+        if needs_cap and self.max_execution_price is None:
+            msg = "a market buy requires a max_execution_price to bound its quote debit"
+            raise ValueError(msg)
+        if not needs_cap and self.max_execution_price is not None:
+            msg = "only a market buy may carry a max_execution_price"
+            raise ValueError(msg)
         return self
 
 
@@ -196,7 +219,7 @@ class Order(DomainModel):
         if self.filled_quantity == 0 and self.avg_fill_price is not None:
             msg = "an unfilled order must not carry an avg_fill_price"
             raise ValueError(msg)
-        if not self.status.can_produce_fills and self.filled_quantity > 0:
+        if not self.status.may_carry_fills and self.filled_quantity > 0:
             msg = f"status {self.status} cannot carry fills"
             raise ValueError(msg)
         if self.status is OrderStatus.FILLED and self.filled_quantity != self.quantity:

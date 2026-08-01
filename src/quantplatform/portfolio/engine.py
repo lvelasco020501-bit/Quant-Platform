@@ -91,8 +91,11 @@ class SpotPortfolioEngine:
     base-asset balance's ``total`` (``free + locked``) — per the committed contract in
     :mod:`quantplatform.core.models.portfolio`. Reserving base asset against a working sell
     order (moving it from ``free`` to ``locked``) does not close or reduce the economic
-    position; only a fill changes owned quantity. This engine never mutates ``locked``
-    balances itself, and a sell may only ever spend ``free`` base asset — never ``locked``.
+    position; only a fill changes owned quantity. Applying a fill only ever spends ``free``
+    — never ``locked``. The one way ``locked`` moves at all is
+    :meth:`reserve`/:meth:`release`, which this engine exposes for execution adapters as
+    :class:`~quantplatform.core.interfaces.SettlementLedger`; both leave
+    ``Balance.total`` unchanged and so are invisible to every accounting figure.
 
     **Seed state (flat-start).** The engine only ever starts flat: positions always start
     empty and cumulative realised PnL and fees always start at zero, with no constructor
@@ -220,6 +223,81 @@ class SpotPortfolioEngine:
     ) -> PortfolioSnapshot:
         """Produce an immutable marked snapshot of the account using caller-supplied prices."""
         return self._build_snapshot(as_of=as_of, mark_prices=dict(mark_prices))
+
+    # --- SettlementLedger protocol --------------------------------------------------------
+
+    def reserve(self, *, asset: str, amount: Decimal, at: datetime) -> None:
+        """Move ``amount`` of ``asset`` from available to reserved.
+
+        Implements :class:`~quantplatform.core.interfaces.SettlementLedger` so an
+        execution adapter can hold funds against a working order without owning balances.
+        This is deliberately **not** an accounting operation: ``Balance.total`` is unchanged,
+        so the ``Position.quantity == Balance.total`` reconciliation and every PnL and
+        cost-basis figure are untouched. Reserving changes availability, never ownership.
+
+        Args:
+            asset: Asset to reserve against.
+            amount: Non-negative amount to move from ``free`` to ``locked``.
+            at: Instant recorded on the updated balance.
+
+        Raises:
+            InsufficientBalanceError: If ``free`` does not cover ``amount``.
+        """
+        if amount == ZERO:
+            return
+        balance = self._get_balance(asset, at=at)
+        if balance.free < amount:
+            raise InsufficientBalanceError(
+                "insufficient available balance to reserve",
+                asset=asset,
+                required=str(amount),
+                available=str(balance.free),
+            )
+        self._balances[asset] = Balance(
+            asset=asset,
+            free=balance.free - amount,
+            locked=balance.locked + amount,
+            updated_at=at,
+        )
+
+    def release(self, *, asset: str, amount: Decimal, at: datetime) -> None:
+        """Move ``amount`` of ``asset`` from reserved back to available.
+
+        The exact inverse of :meth:`reserve`, and equally not an accounting operation.
+
+        Args:
+            asset: Asset whose reservation is being released.
+            amount: Non-negative amount to move from ``locked`` back to ``free``.
+            at: Instant recorded on the updated balance.
+
+        Raises:
+            InsufficientBalanceError: If ``locked`` does not cover ``amount``.
+        """
+        if amount == ZERO:
+            return
+        balance = self._get_balance(asset, at=at)
+        if balance.locked < amount:
+            raise InsufficientBalanceError(
+                "insufficient reserved balance to release",
+                asset=asset,
+                required=str(amount),
+                available=str(balance.locked),
+            )
+        self._balances[asset] = Balance(
+            asset=asset,
+            free=balance.free + amount,
+            locked=balance.locked - amount,
+            updated_at=at,
+        )
+
+    def reserved(self, asset: str) -> Decimal:
+        """Return the currently reserved amount of ``asset``, zero when it is unknown."""
+        balance = self._balances.get(asset)
+        return balance.locked if balance is not None else ZERO
+
+    def balance(self, asset: str) -> Balance | None:
+        """Return the current balance for ``asset``, or ``None`` when it is unknown."""
+        return self._balances.get(asset)
 
     # --- Extended API: explicit result with events ---------------------------------------
 

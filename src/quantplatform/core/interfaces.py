@@ -37,6 +37,7 @@ __all__ = [
     "MarketDataProvider",
     "PortfolioEngine",
     "RiskEngine",
+    "SettlementLedger",
     "Strategy",
 ]
 
@@ -246,6 +247,71 @@ class PortfolioEngine(Protocol):
 
         Returns:
             A snapshot whose equity equals cash plus marked position value.
+        """
+        ...
+
+
+@runtime_checkable
+class SettlementLedger(Protocol):
+    """Everything an execution adapter may do to an account, and nothing more.
+
+    This is the **only** port between execution and portfolio accounting. An adapter can
+    hand over a fill and move funds between the available and reserved halves of a balance;
+    it cannot read positions, cost basis, realised PnL or snapshots, so it structurally
+    cannot begin keeping books of its own. Adapters must not declare a private protocol of
+    their own alongside this one — two descriptions of the same boundary drift apart.
+
+    Reserving is not an accounting event: it changes availability, never ownership, so
+    ``Balance.total`` and every position, cost-basis and PnL figure are unaffected. Only a
+    fill changes what the account owns, and only through :meth:`apply_fill`.
+
+    Implementations are expected to be the same component that implements
+    :class:`PortfolioEngine`, since balances have exactly one owner.
+    """
+
+    def apply_fill(self, fill: Fill) -> None:
+        """Incorporate a fill into balances, positions and realised PnL.
+
+        Implementations must be idempotent with respect to the fill's identifier.
+        """
+        ...
+
+    def reserve(self, *, asset: str, amount: Decimal, at: datetime) -> None:
+        """Move ``amount`` of ``asset`` from available to reserved.
+
+        Args:
+            asset: Asset whose balance is being reserved against.
+            amount: Non-negative amount to reserve.
+            at: Instant recorded on the updated balance, from the event being processed.
+
+        Raises:
+            InsufficientBalanceError: If the available amount does not cover ``amount``.
+        """
+        ...
+
+    def release(self, *, asset: str, amount: Decimal, at: datetime) -> None:
+        """Move ``amount`` of ``asset`` from reserved back to available.
+
+        Args:
+            asset: Asset whose reservation is being released.
+            amount: Non-negative amount to release.
+            at: Instant recorded on the updated balance, from the event being processed.
+
+        Raises:
+            InsufficientBalanceError: If the reserved amount does not cover ``amount``.
+        """
+        ...
+
+    def reserved(self, asset: str) -> Decimal:
+        """Return the currently reserved amount of ``asset``, zero when it is unknown."""
+        ...
+
+    def balance(self, asset: str) -> Balance | None:
+        """Return the current balance for ``asset``, or ``None`` when it is unknown.
+
+        Exposed so an adapter can capture a balance before mutating it and restore it
+        exactly if the mutation has to be undone. It carries no accounting information
+        beyond the asset's available and reserved amounts.
         """
         ...
 

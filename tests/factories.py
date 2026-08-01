@@ -35,6 +35,8 @@ from quantplatform.core.models.risk import RiskCheckResult, RiskContext, RiskDec
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.timeutils import bar_close_time
+from quantplatform.execution.broker import SimulatedBroker
+from quantplatform.execution.config import ExecutionConfig
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.strategies.base import BaseStrategy
 
@@ -178,7 +180,13 @@ def make_approved_order(
     decision_id: UUID,
     *,
     quantity: Decimal = Decimal("0.1"),
+    max_execution_price: Decimal | None = None,
 ) -> ApprovedOrder:
+    # A market buy must carry a price cap; supply a permissive default so callers that only
+    # care about other fields still build a valid order.
+    needs_cap = intent.order_type is OrderType.MARKET and intent.side is OrderSide.BUY
+    if needs_cap and max_execution_price is None:
+        max_execution_price = Decimal(100_000)
     return ApprovedOrder(
         client_order_id=client_order_id_from_key(intent.idempotency_key),
         intent_id=intent.intent_id,
@@ -192,6 +200,7 @@ def make_approved_order(
         quantity=quantity,
         limit_price=None,
         stop_price=None,
+        max_execution_price=max_execution_price,
         time_in_force=intent.time_in_force,
         execution_mode=intent.execution_mode,
         idempotency_key=intent.idempotency_key,
@@ -388,6 +397,78 @@ def make_portfolio_engine(
         initial_balances=initial_balances,
         source="test",
     )
+
+
+def make_approved(
+    *,
+    side: OrderSide = OrderSide.BUY,
+    order_type: OrderType = OrderType.MARKET,
+    quantity: Decimal = Decimal("0.1"),
+    limit_price: Decimal | None = None,
+    stop_price: Decimal | None = None,
+    max_execution_price: Decimal | None = None,
+    time_in_force: TimeInForce = TimeInForce.GTC,
+    symbol: str = SYMBOL,
+    tag: str = "1",
+) -> ApprovedOrder:
+    """Build an approved order with a client order id distinguished by ``tag``.
+
+    A market buy is given a default ``max_execution_price`` so callers that do not care about
+    the cap still produce a valid order; pass one explicitly to exercise the cap.
+    """
+    needs_cap = order_type is OrderType.MARKET and side is OrderSide.BUY
+    if needs_cap and max_execution_price is None:
+        max_execution_price = Decimal(100_000)
+    key = f"qp-{tag}{'0' * 60}"
+    return ApprovedOrder(
+        client_order_id=f"qp-order-{tag}",
+        intent_id=deterministic_uuid("order_intent", key),
+        decision_id=deterministic_uuid("risk_decision", key),
+        strategy_id=_STRATEGY_ID,
+        strategy_version=_STRATEGY_VERSION,
+        symbol=symbol,
+        market_type=MarketType.SPOT,
+        side=side,
+        order_type=order_type,
+        quantity=quantity,
+        limit_price=limit_price,
+        stop_price=stop_price,
+        max_execution_price=max_execution_price,
+        time_in_force=time_in_force,
+        execution_mode=ExecutionMode.PAPER,
+        idempotency_key=key,
+        approved_at=ANCHOR,
+    )
+
+
+def make_broker(
+    *,
+    portfolio: SpotPortfolioEngine | None = None,
+    symbols: Mapping[str, SymbolRules] | None = None,
+    config: ExecutionConfig | None = None,
+    started_at: datetime = ANCHOR,
+    execution_mode: ExecutionMode = ExecutionMode.PAPER,
+    quote_free: Decimal = Decimal(1_000_000),
+) -> tuple[SimulatedBroker, SpotPortfolioEngine]:
+    resolved_symbols = symbols if symbols is not None else {SYMBOL: make_symbol_rules()}
+    resolved_portfolio = (
+        portfolio
+        if portfolio is not None
+        else make_portfolio_engine(
+            symbols=resolved_symbols,
+            initial_balances=(make_balance(free=quote_free),),
+            execution_mode=execution_mode,
+        )
+    )
+    broker = SimulatedBroker(
+        symbols=resolved_symbols,
+        portfolio=resolved_portfolio,
+        execution_mode=execution_mode,
+        started_at=started_at,
+        config=config,
+        source="test",
+    )
+    return broker, resolved_portfolio
 
 
 def make_health(

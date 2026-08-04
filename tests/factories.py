@@ -10,6 +10,9 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from quantplatform.backtesting.config import BacktestConfig
+from quantplatform.backtesting.engine import BacktestEngine
+from quantplatform.core.constants import ONE
 from quantplatform.core.enums import (
     CommissionModel,
     ExecutionMode,
@@ -40,6 +43,7 @@ from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.timeutils import bar_close_time
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
+from quantplatform.features import NullFeaturePipeline
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.engine import StandardRiskEngine
@@ -627,3 +631,69 @@ class DummyStrategy(BaseStrategy):
                 ),
             )
         return ()
+
+
+def make_backtest(
+    *,
+    strategy: BaseStrategy,
+    features: object | None = None,
+    symbols: Mapping[str, SymbolRules] | None = None,
+    cash: Decimal = Decimal(100_000),
+    policy: ExecutionPolicy | None = None,
+    config: BacktestConfig | None = None,
+    fill_ratio: Decimal = ONE,
+    **risk_overrides: object,
+) -> tuple[BacktestEngine, SimulatedBroker, SpotPortfolioEngine]:
+    """Wire a complete backtest from one shared execution policy.
+
+    Returns the engine plus the broker and portfolio it was built with, so a test can assert
+    against the very instances the run mutated rather than against copies.
+    """
+    resolved_symbols = symbols if symbols is not None else {SYMBOL: make_symbol_rules()}
+    resolved_policy = policy if policy is not None else make_execution_policy()
+    resolved_features = features if features is not None else NullFeaturePipeline()
+    portfolio = make_portfolio_engine(
+        symbols=resolved_symbols,
+        initial_balances=(make_balance(free=cash),),
+        execution_mode=ExecutionMode.BACKTEST,
+    )
+    broker = SimulatedBroker(
+        symbols=resolved_symbols,
+        portfolio=portfolio,
+        execution_mode=ExecutionMode.BACKTEST,
+        started_at=ANCHOR,
+        config=ExecutionConfig(policy=resolved_policy, fill_ratio=fill_ratio),
+    )
+    defaults: dict[str, object] = {
+        "execution_policy": resolved_policy,
+        "market_buy_buffer_bps": Decimal(500),
+        "max_order_notional": Decimal(10**12),
+        "max_symbol_exposure": Decimal(10**12),
+        "max_orders_per_hour": 100,
+        "max_orders_per_day": 1000,
+        "max_open_orders": 5,
+    }
+    risk = StandardRiskEngine(config=make_risk_config(**{**defaults, **risk_overrides}))
+    resolved_config = config if config is not None else make_backtest_config(cash=cash)
+    engine = BacktestEngine(
+        config=resolved_config,
+        strategy=strategy,
+        features=resolved_features,  # type: ignore[arg-type]
+        risk_engine=risk,
+        broker=broker,
+        portfolio=portfolio,
+        symbols=resolved_symbols,
+    )
+    return engine, broker, portfolio
+
+
+def make_backtest_config(
+    *, cash: Decimal = Decimal(100_000), **overrides: object
+) -> BacktestConfig:
+    """Build a run configuration that states its spread assumption explicitly."""
+    defaults: dict[str, object] = {
+        "initial_capital": cash,
+        "execution_mode": ExecutionMode.BACKTEST,
+        "assumed_spread_basis_points": Decimal(2),
+    }
+    return BacktestConfig(**{**defaults, **overrides})  # type: ignore[arg-type]

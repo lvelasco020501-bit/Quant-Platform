@@ -432,6 +432,48 @@ supplied by the caller in the context rather than derived by the engine, so thei
 an orchestration responsibility. Volatility is a single scalar, not a term structure. There is
 no per-strategy exposure breakdown.
 
+### Phase 5: `BacktestEngine`
+
+`quantplatform.backtesting.engine.BacktestEngine` is the platform's only orchestrator. It
+connects the finished components in one fixed order and lets none of them reach around
+another:
+
+```
+bars -> features -> strategy -> intents -> risk -> broker -> fills -> portfolio -> snapshot
+```
+
+**Execution is next-bar.** A decision taken from bar *N*'s close is submitted to the broker
+and matched against bar *N+1*, at *N+1*'s open. The engine therefore settles the previous
+bar's orders at the top of each iteration, before the current bar is decided on. Matching a
+bar-*N* decision against bar *N* would fill it at a price that printed before the strategy saw
+the data it decided on — look-ahead, and the most effective way to make a losing strategy look
+profitable.
+
+**Sizing lives in risk, not in the strategy.** A strategy returns opinions; orchestration
+turns an entry into a request for a share of equity and an exit into a request to close what
+is held; the risk engine reduces or refuses either. A strategy never sees the account.
+
+**Determinism.** No clock is read, no random number is drawn, no global state is touched.
+Timestamps come from bars, identifiers are derived, and two runs over the same data with the
+same configuration produce byte-identical fills, snapshots, metrics and event sequence.
+
+**Metrics are computable or absent.** Sharpe, Sortino, CAGR and the trade ratios report
+`None` when the run cannot support them rather than a zero that reads like an answer — a
+Sharpe of `0.0` from a one-bar run is worse than no number at all.
+
+**Assumptions are stated, not defaulted.** Realised volatility is measured from the bars.
+Spread is *not*: an OHLCV bar records no bid or ask, so a run states
+`assumed_spread_basis_points` explicitly. Under the risk engine's strict-missing-metrics
+default the engine refuses to start rather than silently rejecting every intent, and a
+strategy cannot trade until enough bars exist to measure volatility at all.
+
+**Failure behaviour.** A strategy exception, corrupt data or a violated accounting invariant
+stops the run. A risk rejection or a broker refusal does not — both are ordinary outcomes and
+are recorded.
+
+**Deferred.** Live and paper trading, exchange adapters, persistence of runs, parameter
+search and any form of concurrency.
+
 ### Execution modes
 
 | Mode | Market data | Orders |
@@ -482,6 +524,10 @@ supports it, and be distinct from paper or testnet credentials.
 - **Gap detection covers only the interior of a dataset.** A file that starts late or ends
   early is not faulted, because the data layer has no way to know the range the caller
   intended to cover.
+- **Backtests hold no state between runs.** A `BacktestResult` is returned, never persisted,
+  and the engine cannot resume an interrupted run.
+- **One strategy per run.** Portfolio-level allocation across several strategies is not
+  modelled.
 - **Execution is simulated only.** `SimulatedBroker` (Phase 3B) matches orders against
   historical closed bars. No real venue is reachable and nothing is persisted.
 - **Nothing yet drives the pipeline end to end.** The risk engine and the broker are wired by

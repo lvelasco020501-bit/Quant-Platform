@@ -288,3 +288,67 @@ def test_risk_and_execution_both_consume_the_shared_policy() -> None:
     assert importers == {"risk", "execution"}, (
         f"both risk and execution must consume the shared execution policy; got {importers}"
     )
+
+
+# --- Backtesting boundaries ----------------------------------------------------------------
+
+_ORCHESTRATION_FORBIDDEN: Final[frozenset[str]] = frozenset({"storage", "api", "cli"})
+"""Packages the backtest engine must never reach for.
+
+Orchestration composes the domain; it does not persist, serve or parse. Reaching into
+storage in particular would make a backtest depend on a database being present, which is the
+opposite of the reproducible-from-inputs property the engine exists to provide.
+"""
+
+
+def test_backtesting_never_imports_infrastructure() -> None:
+    for path in _source_files():
+        if _domain_of(path) != "backtesting":
+            continue
+        imported = _imported_domains(path)
+        forbidden = sorted(imported & _ORCHESTRATION_FORBIDDEN)
+        assert not forbidden, f"{path.relative_to(PACKAGE_ROOT)} may not import {forbidden}"
+
+
+def test_backtesting_never_imports_sqlalchemy_or_alembic() -> None:
+    for path in _source_files():
+        if _domain_of(path) != "backtesting":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node)
+            assert not roots & {"sqlalchemy", "alembic"}, path
+
+
+def test_backtesting_is_the_only_package_that_composes_the_whole_chain() -> None:
+    # Every other domain sees a strict subset. If a second package started importing strategy,
+    # risk and execution together, there would be two orchestrators and no single answer to
+    # "what order do things happen in".
+    composers = set()
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain in {"orchestration", "api", "cli"} or domain is None:
+            continue
+        imported = _imported_domains(path)
+        if {"strategies", "risk", "execution"} <= imported:
+            composers.add(domain)
+    assert composers <= {"backtesting"}, f"more than one orchestrator: {sorted(composers)}"
+
+
+def test_strategies_cannot_reach_the_orchestrator() -> None:
+    # The strategy contract's whole point: it cannot see the account, the venue or the engine.
+    for path in _source_files():
+        if _domain_of(path) != "strategies":
+            continue
+        imported = _imported_domains(path)
+        assert "backtesting" not in imported, path
+        assert "portfolio" not in imported, path
+        assert "execution" not in imported, path
+        assert "risk" not in imported, path
+
+
+def test_features_depend_only_on_the_domain_and_configuration() -> None:
+    for path in _source_files():
+        if _domain_of(path) != "features":
+            continue
+        assert _imported_domains(path) <= {"core", "config", "features"}, path

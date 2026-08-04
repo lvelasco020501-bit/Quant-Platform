@@ -32,6 +32,7 @@ __all__ = [
     "DataUnitOfWork",
     "EventPublisher",
     "ExecutionAdapter",
+    "FeaturePipeline",
     "IngestionRunRepository",
     "MarketBarRepository",
     "MarketDataProvider",
@@ -115,6 +116,43 @@ class Strategy(Protocol):
 
         Returns:
             Zero or more signals. An empty result means no opinion.
+        """
+        ...
+
+
+@runtime_checkable
+class FeaturePipeline(Protocol):
+    """Turns a window of closed bars into the feature values a strategy reads.
+
+    A pure function of the bars it is given, for the same reason strategies are: a backtest
+    that cannot reproduce its own features cannot reproduce its own signals. Implementations
+    read no clock, perform no input or output, and must return the same mapping for the same
+    window every time.
+
+    The window ends at the bar being decided on and never extends past it, which is what
+    keeps a feature from seeing a price that had not yet printed.
+    """
+
+    @property
+    def feature_names(self) -> Sequence[str]:
+        """Return the names this pipeline can produce, for contract checking before a run."""
+        ...
+
+    @property
+    def required_history(self) -> int:
+        """Return the smallest number of bars that yields a complete feature set."""
+        ...
+
+    def compute(self, bars: Sequence[MarketBar]) -> Mapping[str, Decimal]:
+        """Compute features for the window ending at the most recent bar.
+
+        Args:
+            bars: Closed bars in ascending open-time order; the last is the bar being decided.
+
+        Returns:
+            Feature values keyed by name. A feature the window is too short to compute is
+            omitted rather than guessed at, so a strategy declaring it as required fails its
+            context check instead of trading on a fabricated number.
         """
         ...
 

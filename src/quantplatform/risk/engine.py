@@ -213,6 +213,16 @@ class StandardRiskEngine:
         self._config = config
         self._decisions: dict[str, RiskDecision] = {}
 
+    @property
+    def config(self) -> RiskConfiguration:
+        """Return the configuration this engine evaluates against.
+
+        Read-only, and exposed so a composition root can check its own assumptions against
+        the engine's before a run — for example, that a backtest supplies every metric the
+        engine is configured to require.
+        """
+        return self._config
+
     # --- RiskEngine protocol ----------------------------------------------------------------
 
     def evaluate(self, intent: OrderIntent, context: RiskContext) -> RiskDecision:

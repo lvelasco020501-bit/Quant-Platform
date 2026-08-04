@@ -36,6 +36,7 @@ __all__ = [
     "PositionState",
     "ReconciliationStatus",
     "RiskCheckCode",
+    "RiskCheckSeverity",
     "RiskCheckStatus",
     "RiskOutcome",
     "SignalAction",
@@ -448,6 +449,22 @@ class RiskCheckStatus(StrEnum):
     """Not applicable in the current mode or configuration; recorded for auditability."""
 
 
+class RiskCheckSeverity(StrEnum):
+    """Whether a failing risk check blocks the order or is merely recorded.
+
+    Separating severity from :class:`RiskCheckStatus` is what lets the engine evaluate and
+    report a check whose failure is informative but not disqualifying, without that report
+    silently becoming a veto. A decision is rejected if and only if at least one
+    ``BLOCKING`` check failed.
+    """
+
+    BLOCKING = "blocking"
+    """A failure rejects the intent."""
+
+    ADVISORY = "advisory"
+    """A failure is recorded for the audit trail but never rejects on its own."""
+
+
 class RiskOutcome(StrEnum):
     """Final verdict of the risk engine over an order intent."""
 
@@ -469,21 +486,33 @@ class RiskCheckCode(StrEnum):
     """
 
     SYSTEM_STATE = "system_state"
+    CONFIGURATION_VALID = "configuration_valid"
+    EXECUTION_MODE = "execution_mode"
     DATA_FRESHNESS = "data_freshness"
     CLOSED_CANDLE = "closed_candle"
+    SYMBOL_RULES_FRESHNESS = "symbol_rules_freshness"
+    REFERENCE_PRICE = "reference_price"
     DUPLICATE_SIGNAL = "duplicate_signal"
     DUPLICATE_ORDER = "duplicate_order"
     PENDING_ORDERS = "pending_orders"
+    CONFLICTING_ORDER = "conflicting_order"
     AVAILABLE_BALANCE = "available_balance"
+    ACCOUNTING_INVARIANT = "accounting_invariant"
     ALLOWED_SYMBOL = "allowed_symbol"
     ALLOWED_MARKET_TYPE = "allowed_market_type"
+    ALLOWED_ORDER_TYPE = "allowed_order_type"
+    ALLOWED_TIME_IN_FORCE = "allowed_time_in_force"
     QUANTITY_PRECISION = "quantity_precision"
     PRICE_PRECISION = "price_precision"
     MINIMUM_QUANTITY = "minimum_quantity"
     MAXIMUM_QUANTITY = "maximum_quantity"
     MINIMUM_NOTIONAL = "minimum_notional"
+    MAXIMUM_NOTIONAL = "maximum_notional"
+    MAX_ORDER_NOTIONAL = "max_order_notional"
     MAX_POSITION_COUNT = "max_position_count"
     MAX_EXPOSURE = "max_exposure"
+    MAX_SYMBOL_EXPOSURE = "max_symbol_exposure"
+    MARKET_BUY_CAP = "market_buy_cap"
     MAX_DAILY_ORDERS = "max_daily_orders"
     MAX_HOURLY_ORDERS = "max_hourly_orders"
     DAILY_DRAWDOWN = "daily_drawdown"

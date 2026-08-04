@@ -26,8 +26,10 @@ __all__ = [
     "InsufficientPositionError",
     "InsufficientReservationError",
     "InvalidFillSideError",
+    "InvalidRiskConfigurationError",
     "LiveTradingNotAuthorizedError",
     "MatchingError",
+    "MissingRiskContextError",
     "NegativeBalanceError",
     "OrderNotFoundError",
     "OrderStateTransitionError",
@@ -38,6 +40,7 @@ __all__ = [
     "QuantPlatformError",
     "ReconciliationError",
     "RiskError",
+    "RiskInvariantError",
     "RiskRejectionError",
     "StaleDataError",
     "StorageError",
@@ -53,6 +56,7 @@ __all__ = [
     "UnsupportedFeeAssetError",
     "UnsupportedMarketTypeError",
     "UnsupportedOrderTypeError",
+    "UnsupportedRiskInputError",
     "UnsupportedTimeInForceError",
 ]
 
@@ -203,6 +207,39 @@ class SymbolRuleViolationError(RiskError):
     """Raised when an order violates venue trading rules for the symbol."""
 
     code = "symbol_rule_violation"
+
+
+class InvalidRiskConfigurationError(RiskError):
+    """Raised when risk limits are internally contradictory or unsafe to trade under."""
+
+    code = "invalid_risk_configuration"
+
+
+class MissingRiskContextError(RiskError):
+    """Raised when the risk engine is handed a context lacking data a check requires.
+
+    Reserved for data the engine cannot proceed *at all* without. A missing optional metric
+    that a check can record and move past is a failed or skipped
+    :class:`~quantplatform.core.models.risk.RiskCheckResult`, not an exception.
+    """
+
+    code = "missing_risk_context"
+
+
+class RiskInvariantError(RiskError):
+    """Raised when the risk engine would emit a decision that violates its own invariants.
+
+    A programming error, never an ordinary rejection: an intent the engine declines is a
+    ``REJECTED`` decision, not a raised exception.
+    """
+
+    code = "risk_invariant_violation"
+
+
+class UnsupportedRiskInputError(RiskError):
+    """Raised when an intent is structurally outside anything the engine can reason about."""
+
+    code = "unsupported_risk_input"
 
 
 class SystemHaltedError(RiskError):

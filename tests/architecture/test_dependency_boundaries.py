@@ -242,3 +242,49 @@ def _imported_root_modules(node: ast.AST) -> set[str]:
     if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
         return {node.module.split(".")[0]}
     return set()
+
+
+# --- Risk / execution isolation ---------------------------------------------------------------
+
+_SHARED_EXECUTION_POLICY_MODULE: Final[str] = "quantplatform.core.models.execution_policy"
+"""Where the fee and slippage formulas shared by risk and execution must live.
+
+Both packages need identical execution assumptions — the risk engine funds exactly what the
+broker charges — but neither may import the other. The only way to share the definition is a
+neutral layer both already depend on, which is ``core``.
+"""
+
+
+def test_risk_and_execution_never_import_each_other() -> None:
+    # Enforced generically by the dependency budget, but stated explicitly because the reason
+    # matters: the two agree on execution costs through a shared core contract, never by one
+    # reaching into the other.
+    for domain, forbidden in (("risk", "execution"), ("execution", "risk")):
+        for path in _source_files():
+            if _domain_of(path) != domain:
+                continue
+            assert forbidden not in _imported_domains(path), (
+                f"{path.relative_to(PACKAGE_ROOT)} may not import {forbidden}"
+            )
+
+
+def test_shared_execution_assumptions_live_in_core() -> None:
+    module_path = PACKAGE_ROOT / "core" / "models" / "execution_policy.py"
+    assert module_path.is_file(), "the shared execution policy must live in core"
+
+
+def test_risk_and_execution_both_consume_the_shared_policy() -> None:
+    # A shared contract nothing imports is not shared. Both sides must actually reach for it,
+    # which is what makes fee and slippage drift between them unrepresentable.
+    importers: set[str] = set()
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain not in {"risk", "execution"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == _SHARED_EXECUTION_POLICY_MODULE:
+                importers.add(domain)
+    assert importers == {"risk", "execution"}, (
+        f"both risk and execution must consume the shared execution policy; got {importers}"
+    )

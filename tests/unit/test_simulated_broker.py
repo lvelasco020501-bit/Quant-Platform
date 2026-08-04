@@ -31,10 +31,11 @@ from quantplatform.core.errors import (
 )
 from quantplatform.core.events import FillReceived, OrderStatusChanged, PortfolioUpdated
 from quantplatform.core.interfaces import SettlementLedger
+from quantplatform.core.models.execution_policy import ExecutionPolicy, FeePolicy, SlippagePolicy
 from quantplatform.core.models.orders import ApprovedOrder, Fill
 from quantplatform.core.models.portfolio import Balance
 from quantplatform.execution.broker import SimulatedBroker
-from quantplatform.execution.config import CommissionConfig, ExecutionConfig, SlippageConfig
+from quantplatform.execution.config import ExecutionConfig
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from tests.factories import (
     ANCHOR,
@@ -349,7 +350,9 @@ def test_cancelling_an_unknown_order_raises() -> None:
 
 def test_reservation_is_created_for_a_limit_buy_including_commission() -> None:
     config = ExecutionConfig(
-        commission=CommissionConfig(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
+        policy=ExecutionPolicy(
+            fee=FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
+        )
     )
     broker, portfolio = make_broker(config=config)
 
@@ -440,7 +443,9 @@ def test_two_limit_buys_cannot_reserve_the_same_funds() -> None:
 
 def test_a_market_buy_breaching_its_cap_is_cancelled_not_filled() -> None:
     config = ExecutionConfig(
-        slippage=SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=Decimal(100))
+        policy=ExecutionPolicy(
+            slippage=SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(100))
+        )
     )
     broker, portfolio = make_broker(config=config)
     broker.submit(
@@ -629,7 +634,9 @@ def test_average_fill_price_is_the_weighted_average_across_fills() -> None:
 
 
 def test_slippage_off_executes_at_the_matched_price() -> None:
-    broker, _ = make_broker(config=ExecutionConfig(slippage=SlippageConfig()))
+    broker, _ = make_broker(
+        config=ExecutionConfig(policy=ExecutionPolicy(slippage=SlippagePolicy()))
+    )
     broker.submit(make_approved(tag="1"))
 
     result = broker.process_bar(make_bar(index=0, open_price=Decimal(50_000)))
@@ -645,7 +652,9 @@ def test_fixed_bps_slippage_moves_the_price_against_the_taker(
     side: OrderSide, expected: Decimal
 ) -> None:
     config = ExecutionConfig(
-        slippage=SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=Decimal(10))
+        policy=ExecutionPolicy(
+            slippage=SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(10))
+        )
     )
     broker, _ = make_broker(config=config)
     if side is OrderSide.SELL:
@@ -660,7 +669,9 @@ def test_fixed_bps_slippage_moves_the_price_against_the_taker(
 
 def test_slippage_is_not_applied_to_limit_orders() -> None:
     config = ExecutionConfig(
-        slippage=SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=Decimal(100))
+        policy=ExecutionPolicy(
+            slippage=SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(100))
+        )
     )
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1", order_type=OrderType.LIMIT, limit_price=Decimal(48_000)))
@@ -685,7 +696,9 @@ def test_no_commission_charges_nothing() -> None:
 
 def test_percentage_commission_charges_basis_points_of_notional() -> None:
     config = ExecutionConfig(
-        commission=CommissionConfig(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
+        policy=ExecutionPolicy(
+            fee=FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
+        )
     )
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1", quantity=Decimal("0.1")))
@@ -697,7 +710,9 @@ def test_percentage_commission_charges_basis_points_of_notional() -> None:
 
 def test_flat_commission_charges_a_fixed_amount_per_fill() -> None:
     config = ExecutionConfig(
-        commission=CommissionConfig(model=CommissionModel.FLAT, flat_amount=Decimal("2.5"))
+        policy=ExecutionPolicy(
+            fee=FeePolicy(model=CommissionModel.FLAT, flat_amount=Decimal("2.5"))
+        )
     )
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1", quantity=Decimal("0.1")))
@@ -709,7 +724,9 @@ def test_flat_commission_charges_a_fixed_amount_per_fill() -> None:
 
 def test_broker_never_aggregates_fees_onto_the_order() -> None:
     config = ExecutionConfig(
-        commission=CommissionConfig(model=CommissionModel.FLAT, flat_amount=Decimal("2.5"))
+        policy=ExecutionPolicy(
+            fee=FeePolicy(model=CommissionModel.FLAT, flat_amount=Decimal("2.5"))
+        )
     )
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1"))
@@ -730,12 +747,12 @@ def test_commission_config_rejects_parameters_its_model_ignores(
     config: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError, match="only meaningful"):
-        CommissionConfig(**config)  # type: ignore[arg-type]
+        FeePolicy(**config)  # type: ignore[arg-type]
 
 
 def test_slippage_config_rejects_a_rate_while_switched_off() -> None:
     with pytest.raises(ValueError, match="must be zero when slippage is off"):
-        SlippageConfig(model=SlippageModel.OFF, basis_points=Decimal(5))
+        SlippagePolicy(model=SlippageModel.OFF, basis_points=Decimal(5))
 
 
 # --- Determinism ----------------------------------------------------------------------------
@@ -921,10 +938,10 @@ def test_a_terminal_order_is_never_rematched() -> None:
 def test_every_numeric_output_is_decimal_never_float() -> None:
     broker, _ = make_broker(
         config=ExecutionConfig(
-            slippage=SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=Decimal(7)),
-            commission=CommissionConfig(
-                model=CommissionModel.BASIS_POINTS, basis_points=Decimal(13)
-            ),
+            policy=ExecutionPolicy(
+                slippage=SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(7)),
+                fee=FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(13)),
+            )
         )
     )
     broker.submit(make_approved(tag="1"))
@@ -940,8 +957,8 @@ def test_high_precision_prices_survive_matching_exactly() -> None:
     price = Decimal("49999.123456789012345678")
     broker, _ = make_broker(
         config=ExecutionConfig(
-            commission=CommissionConfig(
-                model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10)
+            policy=ExecutionPolicy(
+                fee=FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
             )
         )
     )
@@ -1085,7 +1102,7 @@ def test_cancelling_twice_does_not_release_funds_twice() -> None:
 def test_flat_commission_is_charged_once_per_order_across_partial_fills() -> None:
     config = ExecutionConfig(
         fill_ratio=Decimal("0.5"),
-        commission=CommissionConfig(model=CommissionModel.FLAT, flat_amount=Decimal(3)),
+        policy=ExecutionPolicy(fee=FeePolicy(model=CommissionModel.FLAT, flat_amount=Decimal(3))),
     )
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1", order_type=OrderType.LIMIT, limit_price=Decimal(48_000)))
@@ -1107,7 +1124,7 @@ def test_flat_commission_is_charged_once_per_order_across_partial_fills() -> Non
 
 def test_flat_commission_reservation_covers_the_whole_order() -> None:
     config = ExecutionConfig(
-        commission=CommissionConfig(model=CommissionModel.FLAT, flat_amount=Decimal(3))
+        policy=ExecutionPolicy(fee=FeePolicy(model=CommissionModel.FLAT, flat_amount=Decimal(3)))
     )
     broker, portfolio = make_broker(config=config)
 
@@ -1127,7 +1144,9 @@ def test_flat_commission_reservation_covers_the_whole_order() -> None:
 def test_basis_point_commission_never_exceeds_its_reservation_across_partial_fills() -> None:
     config = ExecutionConfig(
         fill_ratio=Decimal("0.5"),
-        commission=CommissionConfig(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10)),
+        policy=ExecutionPolicy(
+            fee=FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10))
+        ),
     )
     broker, _ = make_broker(config=config)
     submission = broker.submit(
@@ -1152,16 +1171,16 @@ def test_basis_point_commission_never_exceeds_its_reservation_across_partial_fil
 @pytest.mark.parametrize("field", ["basis_points"])
 def test_commission_rates_are_bounded_and_reject_floats(field: str) -> None:
     with pytest.raises(ValueError, match="less than or equal to 10000"):
-        CommissionConfig(model=CommissionModel.BASIS_POINTS, **{field: Decimal(10_001)})
+        FeePolicy(model=CommissionModel.BASIS_POINTS, **{field: Decimal(10_001)})
     with pytest.raises(ValueError, match="binary floating point"):
-        CommissionConfig(model=CommissionModel.BASIS_POINTS, **{field: 10.0})
+        FeePolicy(model=CommissionModel.BASIS_POINTS, **{field: 10.0})
 
 
 def test_slippage_rate_is_bounded_and_rejects_floats() -> None:
     with pytest.raises(ValueError, match="less than or equal to 10000"):
-        SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=Decimal(10_001))
+        SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(10_001))
     with pytest.raises(ValueError, match="binary floating point"):
-        SlippageConfig(model=SlippageModel.FIXED_BPS, basis_points=10.0)
+        SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=10.0)
 
 
 # --- Mid-bar failure and deterministic resume (audit) ---------------------------------------

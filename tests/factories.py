@@ -11,6 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from quantplatform.core.enums import (
+    CommissionModel,
     ExecutionMode,
     MarketType,
     OrderSide,
@@ -22,11 +23,13 @@ from quantplatform.core.enums import (
     RiskCheckStatus,
     RiskOutcome,
     SignalAction,
+    SlippageModel,
     SystemState,
     Timeframe,
     TimeInForce,
 )
 from quantplatform.core.ids import client_order_id_from_key, deterministic_uuid, idempotency_key
+from quantplatform.core.models.execution_policy import ExecutionPolicy, FeePolicy, SlippagePolicy
 from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
@@ -38,6 +41,8 @@ from quantplatform.core.timeutils import bar_close_time
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
 from quantplatform.portfolio.engine import SpotPortfolioEngine
+from quantplatform.risk.config import RiskConfiguration
+from quantplatform.risk.engine import StandardRiskEngine
 from quantplatform.strategies.base import BaseStrategy
 
 ANCHOR: Final[datetime] = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
@@ -364,17 +369,21 @@ def make_position(
 def make_snapshot(
     *,
     cash: Decimal = Decimal(5_000),
+    quote_locked: Decimal = Decimal(0),
     positions: Sequence[Position] = (),
     mark_prices: Mapping[str, Decimal] | None = None,
+    balances: Sequence[Balance] | None = None,
 ) -> PortfolioSnapshot:
     resolved_marks = dict(mark_prices) if mark_prices is not None else {SYMBOL: Decimal(50_000)}
+    quote = Balance(asset="USDT", free=cash - quote_locked, locked=quote_locked, updated_at=ANCHOR)
+    resolved_balances = tuple(balances) if balances is not None else (quote,)
     return PortfolioSnapshot(
         snapshot_id=deterministic_uuid("snapshot", ANCHOR.isoformat(), str(cash)),
         taken_at=ANCHOR,
         execution_mode=ExecutionMode.PAPER,
         quote_asset="USDT",
         cash=cash,
-        balances=(Balance(asset="USDT", free=cash, locked=Decimal(0), updated_at=ANCHOR),),
+        balances=resolved_balances,
         positions=tuple(positions),
         mark_prices=resolved_marks,
         realized_pnl=Decimal(0),
@@ -446,6 +455,7 @@ def make_broker(
     portfolio: SpotPortfolioEngine | None = None,
     symbols: Mapping[str, SymbolRules] | None = None,
     config: ExecutionConfig | None = None,
+    policy: ExecutionPolicy | None = None,
     started_at: datetime = ANCHOR,
     execution_mode: ExecutionMode = ExecutionMode.PAPER,
     quote_free: Decimal = Decimal(1_000_000),
@@ -460,12 +470,15 @@ def make_broker(
             execution_mode=execution_mode,
         )
     )
+    resolved_config = config
+    if resolved_config is None and policy is not None:
+        resolved_config = ExecutionConfig(policy=policy)
     broker = SimulatedBroker(
         symbols=resolved_symbols,
         portfolio=resolved_portfolio,
         execution_mode=execution_mode,
         started_at=started_at,
-        config=config,
+        config=resolved_config,
         source="test",
     )
     return broker, resolved_portfolio
@@ -494,26 +507,87 @@ def make_risk_context(
     *,
     snapshot: PortfolioSnapshot | None = None,
     health: HealthStatus | None = None,
+    symbol_rules: SymbolRules | None = None,
+    reference_price: Decimal = Decimal(50_000),
+    as_of: datetime = ANCHOR,
+    latest_bar_close_time: datetime | None = None,
+    latest_bar_is_closed: bool = True,
+    open_order_count: int = 0,
+    open_order_symbols: frozenset[str] = frozenset(),
+    approved_orders_last_hour: int = 0,
+    approved_orders_today: int = 0,
+    pending_buy_notional: Mapping[str, Decimal] | None = None,
+    day_start_equity: Decimal | None = None,
+    peak_equity: Decimal | None = None,
+    spread_basis_points: Decimal | None = Decimal(1),
+    realized_volatility: Decimal | None = Decimal("0.01"),
+    consecutive_api_failures: int = 0,
+    known_idempotency_keys: frozenset[str] = frozenset(),
 ) -> RiskContext:
     resolved_snapshot = snapshot if snapshot is not None else make_snapshot()
     return RiskContext(
-        as_of=ANCHOR,
+        as_of=as_of,
         health=health if health is not None else make_health(),
         snapshot=resolved_snapshot,
-        symbol_rules=make_symbol_rules(),
-        reference_price=Decimal(50_000),
-        latest_bar_close_time=ANCHOR,
-        latest_bar_is_closed=True,
-        open_order_count=0,
-        orders_in_last_hour=0,
-        orders_today=0,
-        day_start_equity=resolved_snapshot.equity,
-        peak_equity=resolved_snapshot.equity,
-        spread_basis_points=Decimal(1),
-        realized_volatility=Decimal("0.01"),
-        consecutive_api_failures=0,
-        known_idempotency_keys=frozenset(),
+        symbol_rules=symbol_rules if symbol_rules is not None else make_symbol_rules(),
+        reference_price=reference_price,
+        latest_bar_close_time=(
+            latest_bar_close_time if latest_bar_close_time is not None else as_of
+        ),
+        latest_bar_is_closed=latest_bar_is_closed,
+        open_order_count=open_order_count,
+        open_order_symbols=open_order_symbols,
+        approved_orders_last_hour=approved_orders_last_hour,
+        approved_orders_today=approved_orders_today,
+        pending_buy_notional=dict(pending_buy_notional or {}),
+        day_start_equity=(
+            day_start_equity if day_start_equity is not None else resolved_snapshot.equity
+        ),
+        peak_equity=peak_equity if peak_equity is not None else resolved_snapshot.equity,
+        spread_basis_points=spread_basis_points,
+        realized_volatility=realized_volatility,
+        consecutive_api_failures=consecutive_api_failures,
+        known_idempotency_keys=known_idempotency_keys,
     )
+
+
+def make_execution_policy(
+    *,
+    slippage_bps: Decimal = Decimal(0),
+    fee_model: CommissionModel = CommissionModel.NONE,
+    fee_basis_points: Decimal = Decimal(0),
+    flat_amount: Decimal = Decimal(0),
+    fee_asset: str | None = None,
+) -> ExecutionPolicy:
+    """Build the single execution policy shared by a risk engine and a broker."""
+    slippage = SlippagePolicy(
+        model=SlippageModel.FIXED_BPS if slippage_bps > 0 else SlippageModel.OFF,
+        basis_points=slippage_bps,
+    )
+    fee = FeePolicy(
+        model=fee_model,
+        basis_points=fee_basis_points,
+        flat_amount=flat_amount,
+        fee_asset=fee_asset,
+    )
+    return ExecutionPolicy(fee=fee, slippage=slippage)
+
+
+def make_risk_config(**overrides: object) -> RiskConfiguration:
+    """Build a permissive-but-valid risk configuration, overridden per test."""
+    defaults: dict[str, object] = {
+        "execution_policy": make_execution_policy(slippage_bps=Decimal(10)),
+        "market_buy_buffer_bps": Decimal(50),
+        "max_order_notional": Decimal(1_000_000),
+        "max_symbol_exposure": Decimal(1_000_000),
+        "max_open_orders": 5,
+        "max_open_positions": 5,
+    }
+    return RiskConfiguration.model_validate({**defaults, **overrides})
+
+
+def make_risk_engine(**overrides: object) -> StandardRiskEngine:
+    return StandardRiskEngine(config=make_risk_config(**overrides))
 
 
 class DummyParams(BaseModel):

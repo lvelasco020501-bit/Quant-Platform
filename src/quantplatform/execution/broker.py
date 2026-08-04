@@ -471,7 +471,7 @@ class SimulatedBroker:
         remaining = order.remaining_quantity
         quantity = self._fill_quantity(remaining, rules)
         notional = price * quantity
-        fee = self._config.commission.charge(notional, is_first_fill=order.filled_quantity == ZERO)
+        fee = self._config.commission.fee_for(notional, is_first_fill=order.filled_quantity == ZERO)
         executed_at = bar.close_time
 
         fill = Fill(
@@ -484,7 +484,7 @@ class SimulatedBroker:
             quantity=quantity,
             price=price,
             fee=fee,
-            fee_asset=rules.quote_asset,
+            fee_asset=self._config.commission.resolve_fee_asset(rules.quote_asset),
             execution_mode=self._execution_mode,
             is_maker=order.order_type is OrderType.LIMIT,
             executed_at=executed_at,
@@ -652,7 +652,7 @@ class SimulatedBroker:
         maximum_notional = cap * approved.quantity
         return _Reservation(
             asset=rules.quote_asset,
-            amount=maximum_notional + self._config.commission.maximum_charge(maximum_notional),
+            amount=maximum_notional + self._config.commission.maximum_fee(maximum_notional),
         )
 
     def _price_cap(self, approved: ApprovedOrder) -> Decimal:

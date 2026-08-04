@@ -343,6 +343,95 @@ completed bar is a no-op; cancelling an already-terminal order releases nothing.
 `FOK`, iceberg, OCO, trailing stops, leverage, margin, futures, options, order expiry, and
 any execution algorithm beyond the rules above.
 
+### Phase 4: `StandardRiskEngine`
+
+`quantplatform.risk.engine.StandardRiskEngine` is the only component permitted to turn an
+`OrderIntent` into an `ApprovedOrder`, which is what makes traversing it unavoidable on the
+path from a strategy signal to a venue. It is a pure function of the intent and the
+`RiskContext` it is handed: no clock, no connection, no balance mutation, nothing written.
+
+**Outcomes.** `APPROVED` when the requested size survives untouched, `RESIZED` when a smaller
+valid order remains, `REJECTED` when none does. Sizing only ever reduces — no path through
+the engine increases what a strategy asked for. Rounding a quantity down onto the venue lot
+grid counts as a resize, because the account is getting less than it asked for.
+
+**Every check is evaluated**, not just the first failure, and all of them — passed, failed
+and skipped — are recorded on the decision with a severity and a sequence number. "Why was
+this rejected" is rarely answered well by one reason, and an operator tuning limits needs to
+see which other constraints the intent was also close to. A decision is rejected if and only
+if at least one *blocking* check failed; an advisory failure is recorded and does not veto.
+
+**Evaluation order** is fixed: system state → configuration → execution mode → data freshness
+→ closed candle → symbol-rules freshness → exchange health → reconciliation → API failures →
+duplicate intent → pending orders → conflicting order → hourly/daily limits → drawdown →
+spread → volatility → instrument and order permissions → reference price → price rounding →
+market-buy cap → quantity sizing → venue bounds → balance → position count → exposure.
+
+**Sizing.** A quantity-sized intent is rounded down to the lot step; a notional-sized intent
+is converted at the valuation price first. The result is then reduced to the smallest of the
+venue quantity ceiling, the per-order notional limit, what the free balance can fund, and the
+exposure headroom. A buy is always valued at the *worst* price it may pay — its limit price,
+or its market-buy cap — so every funding check is computed against the largest debit the
+order can incur. Limit prices round away from the market: a buy limit down, a sell limit up,
+so neither authorises execution at a worse price than was requested.
+
+**Shared execution assumptions.** Fees and slippage are defined once, in
+`core.models.execution_policy` (`FeePolicy`, `SlippagePolicy`, `ExecutionPolicy`), and the
+*same object* is injected into both the risk configuration and the broker. Risk must fund
+exactly what the broker will charge; two independently maintained copies of those numbers
+drift, and the symptom is quiet — approvals the broker then refuses, or a price cap its own
+slippage immediately breaches. Sharing one policy makes that unrepresentable rather than
+merely discouraged.
+
+**Market-buy cap.** `reference_price × (1 + total_buffer_bps / 10_000)`, rounded up to the
+venue tick, where the total buffer is `market_buy_buffer_bps + additional_market_buy_safety_bps`.
+The configuration refuses to construct if that total is below the shared policy's slippage
+rate. **Spread is not added on top**: the reference price is a traded price from a closed bar,
+so the spread is already inside it, and adding an allowance would count it twice. Spread is
+policed separately by its own guard, which rejects when the book is too wide to trade.
+
+**Fee funding.** A basis-point fee scales with size, so the affordable quantity divides by a
+per-unit cost; a flat fee does not, so it is subtracted once before dividing. Treating a flat
+fee as a rate is what breaks small orders — at a notional of 20, a flat 3 is 1500 basis
+points.
+
+**Pending orders count.** Position limits and exposure headroom are evaluated against what
+*will* exist once working orders resolve, not only what exists now: `pending_buy_notional`
+carries the value already committed per symbol, and a symbol pending a buy is treated as a
+position about to exist. Without it, two intents evaluated between one another's fills each
+see untouched headroom and are both approved, together breaching a limit neither breached
+alone. Pending sells are excluded — a sale reduces exposure.
+
+**Balance and exposure.** Only `Balance.free` is ever spendable — funds locked against a
+working order are already spoken for. A sell additionally requires the open position to cover
+it, and a position that disagrees with its base-asset balance is rejected on an
+accounting-invariant check rather than guessed at. Exposure is checked against projected
+values; a sell reduces exposure and is not constrained by those ceilings. Zero equity rejects
+rather than dividing by zero.
+
+**Idempotency.** Decisions are keyed by the intent's idempotency key. Re-evaluating a known
+key returns that exact decision with no events and no recomputation, so a retry after a crash
+cannot produce a second approved order for one logical intent. A key the *context* reports as
+already decided elsewhere is rejected as a duplicate, since the engine cannot see what that
+earlier decision authorised. Rejected intents consume no order-rate budget.
+
+**Relationship to the rest of the platform.** The engine reads a `PortfolioSnapshot` but never
+mutates it — `SpotPortfolioEngine` remains the sole accounting authority. It produces the
+`ApprovedOrder` that `SimulatedBroker` is the sole consumer of, and it never submits, reserves
+or fills anything itself.
+
+**Risk-to-broker guarantee.** An `ApprovedOrder` is submittable by the broker under the same
+shared policy and unchanged state — proven end to end across every fee model in
+`tests/integration/test_risk_to_broker.py`. The unavoidable gap is time-of-check to
+time-of-use: balances can change between evaluation and submission, so the broker still
+enforces its reservation atomically and refuses a stale approval rather than overdrawing.
+
+**Known limitations.** Order-rate counts (`approved_orders_last_hour` / `approved_orders_today`,
+counting approvals and resizes but not rejections), pending-order state and drawdown peaks are
+supplied by the caller in the context rather than derived by the engine, so their accuracy is
+an orchestration responsibility. Volatility is a single scalar, not a term structure. There is
+no per-strategy exposure breakdown.
+
 ### Execution modes
 
 | Mode | Market data | Orders |
@@ -394,9 +483,10 @@ supports it, and be distinct from paper or testnet credentials.
   early is not faulted, because the data layer has no way to know the range the caller
   intended to cover.
 - **Execution is simulated only.** `SimulatedBroker` (Phase 3B) matches orders against
-  historical closed bars. No real venue is reachable, nothing is persisted, and no risk
-  engine yet stands between a strategy and the broker — approved orders are constructed by
-  hand until phase 4.
+  historical closed bars. No real venue is reachable and nothing is persisted.
+- **Nothing yet drives the pipeline end to end.** The risk engine and the broker are wired by
+  hand in tests; the orchestration loop that walks bars, computes features, runs strategies
+  and assembles a `RiskContext` arrives with the backtesting engine in phase 5.
 - **Fills are bar-resolution.** A fill is priced from a bar's open, high or low and stamped
   with the bar's close time. Anything that depends on where inside the bar a trade actually
   happened — queue position, partial-book walks, latency races — is not modelled.

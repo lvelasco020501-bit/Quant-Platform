@@ -324,7 +324,7 @@ def test_approved_decision_cannot_contain_a_failed_check() -> None:
         decision,
         checks=[_payload(make_check(RiskCheckCode.MAX_EXPOSURE, RiskCheckStatus.FAILED))],
     )
-    with pytest.raises(ValidationError, match="must not contain failed risk checks"):
+    with pytest.raises(ValidationError, match="must not contain failed blocking risk checks"):
         RiskDecision.model_validate(payload)
 
 
@@ -340,7 +340,7 @@ def test_rejection_requires_a_failed_check() -> None:
     intent = make_intent()
     decision = make_decision(intent=intent, outcome=RiskOutcome.REJECTED)
     payload = _payload(decision, checks=[_payload(make_check())])
-    with pytest.raises(ValidationError, match="at least one failed check"):
+    with pytest.raises(ValidationError, match="at least one failed blocking check"):
         RiskDecision.model_validate(payload)
 
 

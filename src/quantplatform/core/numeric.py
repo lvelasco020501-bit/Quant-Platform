@@ -8,7 +8,7 @@ accounting.
 
 from __future__ import annotations
 
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal, InvalidOperation, localcontext
 from typing import Annotated, Final
 
 from pydantic import BeforeValidator, Field
@@ -29,6 +29,7 @@ __all__ = [
     "Quantity",
     "Rate",
     "apply_basis_points",
+    "ceil_to_step",
     "decimal_places",
     "is_multiple_of",
     "quantize_to_step",
@@ -171,6 +172,33 @@ def quantize_to_step(
         multiples = value / step
         rounding = ROUND_DOWN if round_down else ROUND_HALF_EVEN
         snapped = multiples.quantize(Decimal(1), rounding=rounding) * step
+    return snapped.quantize(step.normalize(), rounding=ROUND_HALF_EVEN)
+
+
+def ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """Snap ``value`` up onto the venue ``step`` grid.
+
+    The upward counterpart of :func:`quantize_to_step`. Rounding up is the safe direction
+    for a price ceiling — a sell limit that must not end up below what was asked for, or a
+    market-buy cap that must not end up under-reserving — exactly as rounding down is the
+    safe direction for a quantity.
+
+    Args:
+        value: Value to quantize.
+        step: Positive step size such as a tick size.
+
+    Returns:
+        The smallest venue-valid value not below ``value``.
+
+    Raises:
+        DomainValidationError: If ``step`` is not strictly positive.
+    """
+    if step <= ZERO:
+        raise DomainValidationError("step must be strictly positive", step=str(step))
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        multiples = value / step
+        snapped = multiples.quantize(Decimal(1), rounding=ROUND_UP) * step
     return snapped.quantize(step.normalize(), rounding=ROUND_HALF_EVEN)
 
 

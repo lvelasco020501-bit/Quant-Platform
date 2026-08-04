@@ -15,10 +15,16 @@ from uuid import UUID
 
 from pydantic import Field, model_validator
 
-from quantplatform.core.enums import RiskCheckCode, RiskCheckStatus, RiskOutcome
+from quantplatform.core.enums import (
+    RiskCheckCode,
+    RiskCheckSeverity,
+    RiskCheckStatus,
+    RiskOutcome,
+)
 from quantplatform.core.models.base import (
     DomainModel,
     StrategyId,
+    Symbol,
     Text,
     UtcDatetime,
 )
@@ -40,15 +46,44 @@ class RiskCheckResult(DomainModel):
 
     code: RiskCheckCode
     status: RiskCheckStatus
+    severity: RiskCheckSeverity = RiskCheckSeverity.BLOCKING
+    """Whether a failure of this check rejects the intent or is merely recorded."""
+
+    sequence: int = Field(default=0, ge=0)
+    """Position of this check in the engine's fixed evaluation order.
+
+    Recorded so a decision's check list can be replayed in the exact order it was produced
+    even after being serialised, sorted or stored, which is what makes two runs comparable
+    check by check rather than only by final outcome.
+    """
+
     message: Text
     observed: Money | None = None
     limit: Money | None = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    """Structured, non-sensitive context for this check, beyond the single observed/limit
+    pair — for example the requested and normalised quantity of a rounding check. Values are
+    strings so the record serialises losslessly; never place credentials or infrastructure
+    detail here."""
+
     evaluated_at: UtcDatetime
 
     @property
     def passed(self) -> bool:
         """Return whether the check did not block the order."""
         return self.status is not RiskCheckStatus.FAILED
+
+    @property
+    def blocks(self) -> bool:
+        """Return whether this result must reject the intent.
+
+        Only a failed *blocking* check does. A failed advisory check is reported and
+        deliberately does not veto, which is what lets the engine record a concern without
+        that record silently becoming a rejection.
+        """
+        return self.status is RiskCheckStatus.FAILED and self.severity is (
+            RiskCheckSeverity.BLOCKING
+        )
 
 
 class RiskContext(DomainModel):
@@ -58,14 +93,10 @@ class RiskContext(DomainModel):
     input or output of its own and its decisions are reproducible from a stored context.
     Which checks consume which fields is the responsibility of the risk engine itself.
 
-    **Provisional pending Phase 4.** This field set was derived from the 27 risk checks the
-    specification documents, written ahead of the risk engine that will actually consume
-    them. It has not yet been exercised against a real implementation of every check, so it
-    should be expected to change: Phase 4 may find a check that needs state not captured
-    here (for example, a per-strategy exposure breakdown, or trailing values needed for a
-    volatility check finer than a single ``realized_volatility`` scalar) and require adding
-    or reshaping fields. Treat this model as a draft contract, not a stable interface, until
-    the risk engine is implemented and its tests pass against it.
+    Exercised against the Phase 4 risk engine, which consumes every field below. Optional
+    metrics (``spread_basis_points``, ``realized_volatility``) are genuinely optional: the
+    engine records a check for each and, under a strict configuration, rejects when one it
+    needs is absent rather than assuming a value.
     """
 
     as_of: UtcDatetime
@@ -78,8 +109,38 @@ class RiskContext(DomainModel):
     latest_bar_close_time: UtcDatetime
     latest_bar_is_closed: bool
     open_order_count: int = Field(ge=0)
-    orders_in_last_hour: int = Field(ge=0)
-    orders_today: int = Field(ge=0)
+    open_order_symbols: frozenset[Symbol] = frozenset()
+    """Symbols that already have a working order, used to detect a conflicting order.
+
+    Distinct from :attr:`open_order_count`, which bounds total venue capacity: an account may
+    permit several working orders overall while still refusing a second one on the symbol an
+    intent targets.
+    """
+
+    pending_buy_notional: dict[Symbol, Money] = Field(default_factory=dict)
+    """Worst-case quote-asset value already committed by working **buy** orders, per symbol.
+
+    Exposure a decision has authorised but that has not yet reached a position. Without it,
+    two intents evaluated between one another's fills each see the same untouched headroom
+    and are both approved, together exceeding limits neither breached alone. A symbol present
+    here with no open position is also treated as a position about to exist, so the
+    position-count limit cannot be walked past the same way.
+
+    Pending **sells** are deliberately absent: a sale reduces exposure, and counting it as
+    committed value would make the account look more exposed the more it was unwinding.
+    """
+
+    approved_orders_last_hour: int = Field(ge=0)
+    """Decisions in the last hour that authorised an order — approved or resized.
+
+    Rejections are excluded: refusing an intent consumes no venue capacity, and counting it
+    would let a burst of bad signals lock out the good one behind them. A replayed decision
+    is counted once, when it was first made.
+    """
+
+    approved_orders_today: int = Field(ge=0)
+    """Decisions today that authorised an order; same accounting as
+    :attr:`approved_orders_last_hour`."""
     day_start_equity: NonNegativeMoney
     peak_equity: NonNegativeMoney
     spread_basis_points: Money | None = None
@@ -92,6 +153,11 @@ class RiskContext(DomainModel):
     def data_age_seconds(self) -> float:
         """Return how stale the most recent bar is at :attr:`as_of`."""
         return (self.as_of - self.latest_bar_close_time).total_seconds()
+
+    @property
+    def symbol_rules_age_seconds(self) -> float:
+        """Return how stale the venue trading rules are at :attr:`as_of`."""
+        return (self.as_of - self.symbol_rules.updated_at).total_seconds()
 
 
 class RiskDecision(DomainModel):
@@ -130,8 +196,8 @@ class RiskDecision(DomainModel):
         if self.approved_order is not None:
             msg = "a rejected decision must not carry an approved order"
             raise ValueError(msg)
-        if not self.failed_checks:
-            msg = "a rejected decision must record at least one failed check"
+        if not self.blocking_failures:
+            msg = "a rejected decision must record at least one failed blocking check"
             raise ValueError(msg)
         if not self.rejection_reasons:
             msg = "a rejected decision must record at least one rejection reason"
@@ -144,8 +210,8 @@ class RiskDecision(DomainModel):
             ValueError: If any check failed, the order is missing, or the linkage or the
                 resized quantity is inconsistent.
         """
-        if self.failed_checks:
-            msg = "an approved decision must not contain failed risk checks"
+        if self.blocking_failures:
+            msg = "an approved decision must not contain failed blocking risk checks"
             raise ValueError(msg)
         if self.rejection_reasons:
             msg = "an approved decision must not record rejection reasons"
@@ -189,8 +255,23 @@ class RiskDecision(DomainModel):
 
     @property
     def failed_checks(self) -> tuple[RiskCheckResult, ...]:
-        """Return every check that blocked the order."""
+        """Return every check that failed, blocking or advisory."""
         return tuple(check for check in self.checks if not check.passed)
+
+    @property
+    def blocking_failures(self) -> tuple[RiskCheckResult, ...]:
+        """Return every failed check that actually vetoes the intent.
+
+        The structural safety property is stated against *this* set, not
+        :attr:`failed_checks`: an approved order cannot coexist with a failed blocking
+        check, while a failed advisory check is recorded and does not prevent approval.
+        """
+        return tuple(check for check in self.checks if check.blocks)
+
+    @property
+    def ordered_checks(self) -> tuple[RiskCheckResult, ...]:
+        """Return the checks in the engine's fixed evaluation order."""
+        return tuple(sorted(self.checks, key=lambda check: check.sequence))
 
     @property
     def is_executable(self) -> bool:

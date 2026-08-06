@@ -36,6 +36,7 @@ __all__ = [
     "OrderSubmissionError",
     "OutOfOrderDataError",
     "OutOfOrderFillError",
+    "PaperSessionStateError",
     "PortfolioError",
     "QuantPlatformError",
     "ReconciliationError",
@@ -396,6 +397,12 @@ class OutOfOrderFillError(PortfolioError):
     """Raised when a fill's ``executed_at`` precedes the engine's last applied fill."""
 
     code = "out_of_order_fill"
+
+
+class PaperSessionStateError(PortfolioError):
+    """Raised when a paper session's persisted state cannot be safely resumed."""
+
+    code = "paper_session_state"
 
 
 class ReconciliationError(PortfolioError):

@@ -28,6 +28,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "features",
         "monitoring",
         "orchestration",
+        "paper",
         "portfolio",
         "research",
         "risk",
@@ -50,6 +51,21 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     "data": frozenset({"core", "config"}),
     "risk": frozenset({"core", "config"}),
     "portfolio": frozenset({"core", "config"}),
+    # Paper trading is orchestration over the finished chain: it reuses the backtest engine
+    # rather than reimplementing the pipeline, so it sees what that engine sees and nothing
+    # more. Notably not storage — a paper session persists through a port, never a database.
+    "paper": frozenset(
+        {
+            "core",
+            "config",
+            "backtesting",
+            "execution",
+            "features",
+            "portfolio",
+            "risk",
+            "strategies",
+        }
+    ),
     "execution": frozenset({"core", "config"}),
     "storage": frozenset({"core", "config"}),
     "monitoring": frozenset({"core", "config"}),
@@ -352,3 +368,58 @@ def test_features_depend_only_on_the_domain_and_configuration() -> None:
         if _domain_of(path) != "features":
             continue
         assert _imported_domains(path) <= {"core", "config", "features"}, path
+
+
+# --- Paper trading boundaries ----------------------------------------------------------------
+
+_PAPER_FORBIDDEN: Final[frozenset[str]] = frozenset({"storage", "api", "cli"})
+"""Packages a paper session must never reach for.
+
+Persistence goes through :class:`~quantplatform.core.interfaces.PaperStateRepository`, so the
+session never learns what a database is. A session that imported storage directly would make
+a paper run depend on one being present — and a paper run's whole value is that it is the
+production chain with only the market data made real.
+"""
+
+
+def test_paper_never_imports_infrastructure() -> None:
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        forbidden = sorted(_imported_domains(path) & _PAPER_FORBIDDEN)
+        assert not forbidden, f"{path.relative_to(PACKAGE_ROOT)} may not import {forbidden}"
+
+
+def test_paper_never_imports_a_network_client() -> None:
+    # The feed is a port. A paper session that opened its own socket would be an exchange
+    # adapter wearing a session's name, and the "no real orders" guarantee would rest on
+    # nobody having added a submit call yet.
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node)
+            assert not roots & {"requests", "httpx", "aiohttp", "websockets", "ccxt", "urllib"}, (
+                path
+            )
+
+
+def test_paper_reuses_the_pipeline_rather_than_reimplementing_it() -> None:
+    # The session must go through the backtest engine. If it stopped importing it, the two
+    # modes would have separate trading logic and paper would stop proving anything about
+    # what a backtest predicted.
+    session = PACKAGE_ROOT / "paper" / "session.py"
+    assert "backtesting" in _imported_domains(session)
+
+
+def test_the_paper_state_port_has_no_implementation_in_the_platform() -> None:
+    # Phase 6 defines the persistence port and deliberately ships no durable implementation.
+    # A SQL or key-value store appearing here would be a storage decision made inside the
+    # trading layer.
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        source = path.read_text(encoding="utf-8")
+        for token in ("sqlalchemy", "psycopg", "redis", "sqlite3"):
+            assert token not in source, f"{path.name} references {token}"

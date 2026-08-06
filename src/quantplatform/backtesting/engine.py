@@ -63,7 +63,7 @@ from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.risk.engine import StandardRiskEngine
 from quantplatform.strategies.base import BaseStrategy
 
-__all__ = ["BacktestEngine"]
+__all__ = ["BacktestEngine", "RunState"]
 
 _SECONDS_PER_HOUR = 3_600
 _SECONDS_PER_DAY = 86_400
@@ -76,11 +76,12 @@ _MIN_RETURNS_FOR_VOLATILITY = 2
 
 
 @dataclass(slots=True)
-class _RunState:
-    """Mutable bookkeeping for one run, discarded when the run ends.
+class RunState:
+    """Mutable bookkeeping for one run.
 
-    Deliberately local to a single :meth:`BacktestEngine.run` call rather than instance state,
-    so two runs on the same engine cannot contaminate one another.
+    Owned by the caller rather than by the engine, so two runs on the same engine cannot
+    contaminate one another — and so a caller that receives its bars one at a time, as paper
+    trading does, can hold the run open across arbitrarily long gaps between them.
     """
 
     curve: list[EquityPoint]
@@ -145,6 +146,11 @@ class BacktestEngine:
         self._portfolio = portfolio
         self._symbols = dict(symbols)
 
+    @property
+    def strategy_id(self) -> str:
+        """Return the identifier of the strategy this engine runs."""
+        return self._strategy.metadata.strategy_id
+
     def run(self, bars: Sequence[MarketBar]) -> BacktestResult:
         """Execute the full chain over ``bars`` and return an immutable record of the run.
 
@@ -163,20 +169,71 @@ class BacktestEngine:
             PortfolioError: If portfolio accounting refuses a fill; a violated ledger
                 invariant makes every later number meaningless, so the run stops.
         """
-        self._validate_contract()
         self._validate(bars)
-        state = self._initial_state()
-        if not bars:
+        state = self.begin()
+        for bar in bars:
+            self.advance(bar, state)
+        return self.summarise(state)
+
+    # --- Incremental API --------------------------------------------------------------------
+    #
+    # A backtest receives its bars all at once; paper trading receives them one at a time, over
+    # hours or days. Both run the identical chain, so the chain is exposed incrementally and
+    # :meth:`run` is simply the loop over it. Duplicating the pipeline for the streaming case
+    # would create a second implementation of the trading logic, and the two would drift.
+
+    def begin(self) -> RunState:
+        """Open a run and return the state that carries it.
+
+        Args:
+            None.
+
+        Returns:
+            Fresh bookkeeping for a run that has processed no bars.
+
+        Raises:
+            ConfigurationError: If the risk engine demands a metric this run cannot supply.
+            StrategyContextError: If the pipeline cannot produce a required feature.
+        """
+        self._validate_contract()
+        return self._initial_state()
+
+    def advance(self, bar: MarketBar, state: RunState) -> BarOutcome:
+        """Run the full chain for one bar and fold the outcome into ``state``.
+
+        Args:
+            bar: The next closed bar, at or after the last one this state processed.
+            state: Run state returned by :meth:`begin`.
+
+        Returns:
+            Everything this bar produced.
+
+        Raises:
+            DataIntegrityError: If the bar is open, unknown, or out of order.
+        """
+        previous = state.outcomes[-1].bar if state.outcomes else None
+        self._validate_bar(bar, previous)
+        self._process_bar(len(state.outcomes), bar, state)
+        return state.outcomes[-1]
+
+    def summarise(self, state: RunState) -> BacktestResult:
+        """Freeze a run's state into an immutable result, leaving the state usable.
+
+        Args:
+            state: Run state to summarise.
+
+        Returns:
+            The result as of every bar processed so far. A run that consumed nothing yields
+            an empty result rather than an error, because "no bars yet" is a legitimate state
+            for a paper session that has only just started.
+        """
+        if not state.outcomes:
             return BacktestResult(config=self._config, performance=self._empty_performance())
-
-        for index, bar in enumerate(bars):
-            self._process_bar(index, bar, state)
-
         return self._build_result(state)
 
     # --- One iteration ----------------------------------------------------------------------
 
-    def _process_bar(self, index: int, bar: MarketBar, state: _RunState) -> None:
+    def _process_bar(self, index: int, bar: MarketBar, state: RunState) -> None:
         """Run the mandated chain for a single bar."""
         events: list[DomainEvent] = []
 
@@ -242,7 +299,7 @@ class BacktestEngine:
         history: Sequence[MarketBar],
         features: Mapping[str, Decimal],
         snapshot: PortfolioSnapshot,
-        state: _RunState,
+        state: RunState,
     ) -> tuple[Signal, ...]:
         """Build the strategy context and ask the strategy for its opinion."""
         rules = self._symbols[bar.symbol]
@@ -286,7 +343,7 @@ class BacktestEngine:
         intents: Sequence[OrderIntent],
         bar: MarketBar,
         snapshot: PortfolioSnapshot,
-        state: _RunState,
+        state: RunState,
     ) -> tuple[tuple[RiskDecision, ...], tuple[ApprovedOrder, ...], tuple[DomainEvent, ...]]:
         """Evaluate every intent and submit whatever the risk engine authorised.
 
@@ -318,7 +375,7 @@ class BacktestEngine:
     # --- Context construction -----------------------------------------------------------------
 
     def _risk_context(
-        self, bar: MarketBar, snapshot: PortfolioSnapshot, state: _RunState
+        self, bar: MarketBar, snapshot: PortfolioSnapshot, state: RunState
     ) -> RiskContext:
         """Assemble everything the risk engine observes, entirely from run state."""
         return RiskContext(
@@ -367,7 +424,7 @@ class BacktestEngine:
             )
             return variance.sqrt()
 
-    def _pending_buy_notional(self, state: _RunState) -> dict[str, Decimal]:
+    def _pending_buy_notional(self, state: RunState) -> dict[str, Decimal]:
         """Return the worst-case quote value committed by each symbol's working buy orders.
 
         The same upper bound the broker reserved: a limit buy at its limit, a market buy at
@@ -387,7 +444,7 @@ class BacktestEngine:
             pending[order.symbol] = pending.get(order.symbol, ZERO) + cap * order.remaining_quantity
         return pending
 
-    def _approvals_within(self, state: _RunState, seconds: int, bar: MarketBar) -> int:
+    def _approvals_within(self, state: RunState, seconds: int, bar: MarketBar) -> int:
         """Count authorisations inside a trailing window ending at this bar's close.
 
         Measured against bar timestamps, never a clock, so the count is identical on replay.
@@ -415,7 +472,7 @@ class BacktestEngine:
             halt_reason=None,
         )
 
-    def _snapshot(self, bar: MarketBar, state: _RunState) -> PortfolioSnapshot:
+    def _snapshot(self, bar: MarketBar, state: RunState) -> PortfolioSnapshot:
         """Mark the account at the latest close of every symbol seen so far."""
         marks = dict(state.last_close)
         marks.setdefault(bar.symbol, bar.close)
@@ -430,7 +487,7 @@ class BacktestEngine:
 
     # --- Accounting -----------------------------------------------------------------------------
 
-    def _account_for_fills(self, fills: Sequence[Fill], bar: MarketBar, state: _RunState) -> None:
+    def _account_for_fills(self, fills: Sequence[Fill], bar: MarketBar, state: RunState) -> None:
         """Accumulate the modelled cost of executing this bar's fills.
 
         Slippage is measured against the bar's own open, which is what the broker would have
@@ -449,7 +506,7 @@ class BacktestEngine:
             else:
                 state.slippage += (bar.open - fill.price) * fill.quantity
 
-    def _record_equity(self, snapshot: PortfolioSnapshot, state: _RunState) -> None:
+    def _record_equity(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
         """Append an equity point and update the peak and daily anchors."""
         equity = snapshot.equity
         state.peak_equity = max(state.peak_equity, equity)
@@ -462,7 +519,7 @@ class BacktestEngine:
             state.day_start_equity = equity
         state.curve.append(EquityPoint(at=snapshot.taken_at, equity=equity, drawdown=drawdown))
 
-    def _record_closed_trades(self, state: _RunState) -> None:
+    def _record_closed_trades(self, state: RunState) -> None:
         """Record a round trip whenever a position lifecycle has just ended.
 
         A trade is a lifecycle that returned to flat, not a fill: an entry still open has no
@@ -516,28 +573,37 @@ class BacktestEngine:
         """
         previous: MarketBar | None = None
         for bar in bars:
-            if not bar.is_closed:
-                raise DataIntegrityError(
-                    "a backtest consumes only closed bars",
-                    symbol=bar.symbol,
-                    open_time=bar.open_time.isoformat(),
-                )
-            if bar.symbol not in self._symbols:
-                raise DataIntegrityError(
-                    "no venue rules are registered for this symbol", symbol=bar.symbol
-                )
-            if previous is not None and bar.close_time < previous.close_time:
-                raise DataIntegrityError(
-                    "bars must arrive in non-decreasing close-time order",
-                    symbol=bar.symbol,
-                    open_time=bar.open_time.isoformat(),
-                )
+            self._validate_bar(bar, previous)
             previous = bar
 
-    def _initial_state(self) -> _RunState:
+    def _validate_bar(self, bar: MarketBar, previous: MarketBar | None) -> None:
+        """Check one bar against the run's integrity rules.
+
+        Raises:
+            DataIntegrityError: If the bar is open, unknown to this engine, or precedes the
+                bar before it.
+        """
+        if not bar.is_closed:
+            raise DataIntegrityError(
+                "only closed bars may be processed",
+                symbol=bar.symbol,
+                open_time=bar.open_time.isoformat(),
+            )
+        if bar.symbol not in self._symbols:
+            raise DataIntegrityError(
+                "no venue rules are registered for this symbol", symbol=bar.symbol
+            )
+        if previous is not None and bar.close_time < previous.close_time:
+            raise DataIntegrityError(
+                "bars must arrive in non-decreasing close-time order",
+                symbol=bar.symbol,
+                open_time=bar.open_time.isoformat(),
+            )
+
+    def _initial_state(self) -> RunState:
         """Build the bookkeeping for a fresh run."""
         equity = self._config.initial_capital
-        return _RunState(
+        return RunState(
             curve=[],
             snapshots=[],
             outcomes=[],
@@ -584,7 +650,7 @@ class BacktestEngine:
             minimum_periods_for_ratios=self._config.minimum_periods_for_ratios,
         )
 
-    def _build_result(self, state: _RunState) -> BacktestResult:
+    def _build_result(self, state: RunState) -> BacktestResult:
         """Freeze the run's bookkeeping into an immutable result."""
         final = state.snapshots[-1]
         performance = compute_performance(

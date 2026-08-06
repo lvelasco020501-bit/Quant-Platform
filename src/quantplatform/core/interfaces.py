@@ -8,7 +8,7 @@ implementation detail of a venue or storage engine may leak through these signat
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from types import TracebackType
@@ -23,6 +23,7 @@ from quantplatform.core.models.data import BarWriteResult, DataQualityFinding, I
 from quantplatform.core.models.health import ComponentHealth
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
+from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
@@ -36,6 +37,8 @@ __all__ = [
     "IngestionRunRepository",
     "MarketBarRepository",
     "MarketDataProvider",
+    "PaperMarketDataFeed",
+    "PaperStateRepository",
     "PortfolioEngine",
     "RiskEngine",
     "SettlementLedger",
@@ -351,6 +354,75 @@ class SettlementLedger(Protocol):
         exactly if the mutation has to be undone. It carries no accounting information
         beyond the asset's available and reserved amounts.
         """
+        ...
+
+
+@runtime_checkable
+class PaperMarketDataFeed(Protocol):
+    """Delivers closed bars from a live market as they finish.
+
+    The only difference between a paper session and a backtest is where the bars come from,
+    so this port is deliberately shaped like an iterator over the same
+    :class:`~quantplatform.core.models.market.MarketBar` a backtest consumes. Everything
+    downstream — features, strategy, risk, execution, accounting — cannot tell the two apart,
+    which is the entire point of running paper mode before risking money.
+
+    **Only closed bars.** An implementation must not yield a forming candle. A strategy that
+    sees a partial bar is reading a price that has not settled, and every decision it makes
+    from one is unreproducible. Waiting for the close is the adapter's job; the session
+    re-checks it regardless, because a feed bug must not become an accounting bug.
+    """
+
+    @property
+    def symbols(self) -> Sequence[str]:
+        """Return the symbols this feed delivers bars for."""
+        ...
+
+    def closed_bars(self) -> Iterator[MarketBar]:
+        """Yield closed bars in non-decreasing close-time order.
+
+        Blocking until the next candle closes is expected and correct. The iterator ends when
+        the feed is stopped or the upstream source is exhausted.
+
+        Returns:
+            An iterator over closed bars.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the feed's resources; safe to call more than once."""
+        ...
+
+
+@runtime_checkable
+class PaperStateRepository(Protocol):
+    """Persists just enough of a paper session to resume it after a restart.
+
+    A paper session is long-lived — days or weeks — so a process restart must not silently
+    reset the account it was tracking. What is persisted is a snapshot of the session, not a
+    replay log: reconstructing a portfolio by re-running weeks of decisions would depend on
+    the strategy and the venue behaving identically the second time, which is exactly what a
+    paper run exists to find out.
+
+    **This is a port only.** No SQL, key-value or file implementation lives in the platform
+    yet; a composition root supplies one. That keeps the session testable with an in-memory
+    double and keeps a storage choice out of the trading logic.
+    """
+
+    def load(self, session_id: str) -> PaperSessionState | None:
+        """Return the stored state for a session, or ``None`` when it has never been saved."""
+        ...
+
+    def save(self, state: PaperSessionState) -> None:
+        """Store a session's state, replacing any previous snapshot for the same id.
+
+        Implementations should write atomically: a partially written snapshot is worse than
+        no snapshot, because it resumes into an account that never existed.
+        """
+        ...
+
+    def delete(self, session_id: str) -> None:
+        """Remove a session's stored state; a no-op when nothing was stored."""
         ...
 
 

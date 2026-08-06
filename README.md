@@ -474,6 +474,44 @@ are recorded.
 **Deferred.** Live and paper trading, exchange adapters, persistence of runs, parameter
 search and any form of concurrency.
 
+### Phase 6: paper trading
+
+`quantplatform.paper` runs the Phase 5 pipeline against a live market feed with virtual
+money. The chain is unchanged — bars, features, strategy, risk, broker, portfolio — and that
+is the whole design: a `PaperTradingSession` holds a `BacktestEngine` and feeds it one bar at
+a time instead of a whole history at once. A second implementation of the trading logic for
+the streaming case would be two things that must stay identical and would not.
+
+**Only the market data is real.** Orders go to the simulated broker and settle into a virtual
+portfolio. There is no code path from the paper package to a venue, and an architecture test
+asserts it imports no network client.
+
+**Closed candles only.** A bar is acted on once it is flagged closed *and* the injected clock
+has passed its close plus a configurable grace period. A still-forming candle is refused, as
+is one the session already processed — a refusal is an ordinary outcome and never stops a
+session that has been running for a week.
+
+**No wall clock.** Time comes through the `Clock` port, so a test drives a session through
+days of market time in microseconds and gets the decisions a real run would make.
+
+**Lifecycle.** `start()`, `stop()` and `resume()`. State survives a restart through the
+`PaperStateRepository` port — the platform defines the port and ships only an in-memory
+implementation, leaving the storage choice to a composition root. Resuming restores the
+account from the stored snapshot rather than replaying history, because re-running past
+decisions would assume the strategy, the feed and the venue all behave identically the second
+time, which is the thing a paper run exists to test.
+
+**Reporting.** `SessionSnapshot` for the account right now, `RuntimeMetrics` for how the
+process itself is holding up (bars received, accepted, rejected; uptime; saves; restarts),
+and `SessionResult` carrying the full pipeline record. Runtime health is kept separate from
+trading performance on purpose: a session can be flat and profitable while quietly dropping
+every third candle.
+
+**Extension points, not implementations.** Strategy ensembles, regime detection, adaptive
+selection and model-driven signals all plug in as further implementations of the existing
+`FeaturePipeline` and `BaseStrategy` contracts. None require a change to the session, and
+none are implemented in this phase.
+
 ### Execution modes
 
 | Mode | Market data | Orders |
@@ -524,6 +562,13 @@ supports it, and be distinct from paper or testnet credentials.
 - **Gap detection covers only the interior of a dataset.** A file that starts late or ends
   early is not faulted, because the data layer has no way to know the range the caller
   intended to cover.
+- **A paper session holding an open position cannot resume.** The portfolio engine is
+  flat-start by construction, so restoring an open position would bypass the invariant that
+  keeps a position and its base balance in lockstep. The session refuses loudly rather than
+  resuming into books that disagree with themselves; a seedable-portfolio contract is needed
+  before this changes.
+- **No live market-data adapter yet.** Phase 6 defines the `PaperMarketDataFeed` port and
+  tests against a replay double; a real exchange feed arrives in phase 7.
 - **Backtests hold no state between runs.** A `BacktestResult` is returned, never persisted,
   and the engine cannot resume an interrupted run.
 - **One strategy per run.** Portfolio-level allocation across several strategies is not

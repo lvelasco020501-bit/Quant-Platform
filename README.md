@@ -22,8 +22,9 @@ synthesised, prices are not interpolated, out-of-order input is detected before 
 happens, and a candle conflicting with one already stored is recorded rather than
 overwritten.
 
-There is no live exchange ingestion: this phase reads local CSV files only. REST clients,
-WebSocket streaming and real-time ingestion are explicitly out of scope until phase 7.
+The historical ingestion pipeline reads local CSV files only. Live candles arrive separately
+through `marketdata` (Phase 7A), which streams them read-only from the exchange; REST backfill
+and CCXT remain out of scope.
 
 ## Requirements
 
@@ -183,6 +184,7 @@ import fails the build rather than being caught in review.
 | `core` | Domain models, enums, errors, ports, clock, events, logging, ids, decimal maths |
 | `config` | Typed configuration loaded from the environment |
 | `data` | CSV loading, integrity validation, normalisation, ingestion service |
+| `marketdata` | Live read-only exchange candle streams, reconnection, gap detection |
 | `features` | Deterministic feature computation over closed bars |
 | `strategies` | Strategy contract and registry |
 | `risk` | Risk checks, sizing, limits, circuit breakers, idempotency |
@@ -512,6 +514,61 @@ selection and model-driven signals all plug in as further implementations of the
 `FeaturePipeline` and `BaseStrategy` contracts. None require a change to the session, and
 none are implemented in this phase.
 
+### Phase 7A: real market data
+
+`quantplatform.marketdata` connects the platform to a real exchange. It is the only door to
+the outside world, and it is deliberately the narrowest one: it reads public Binance Spot
+candle streams over a WebSocket and produces `MarketBar` objects. That is the entire contract.
+
+**It cannot trade.** No order method, no balance lookup, no account or user-data stream, no
+signed request, no credential. The endpoint is validated to be a public stream before a
+socket opens — a URL carrying credentials, a query string, or any of Binance's account and
+trading paths is refused at construction. Architecture tests assert the package imports no
+signing primitive (`hmac`, `hashlib`, `base64`), handles no `SecretStr`, and defines no
+operation named after a trade or an account. Making this package place an order is not a
+matter of adding a call; nothing in its vocabulary can describe one.
+
+**Nothing downstream knows it exists.** The feed satisfies `PaperMarketDataFeed`, the port
+the Phase 6 session already consumed, so a live stream drops in exactly where a replay double
+sat — with no adapter between them and no change to the session. `paper` does not import
+`marketdata` and an architecture test keeps it that way; a composition root chooses which
+implementation runs. An integration test drives the same candles through a socket and through
+a direct hand-off and asserts the resulting accounts are identical.
+
+**The transport is a port.** `CandleStreamTransport` moves text and reports failure, nothing
+more. Everything that makes a live feed hard — reconnection, heartbeats, duplicate
+suppression, gap detection — is logic tested deterministically against a scripted double,
+because none of it could be if producing a dropped socket required actually dropping one.
+
+**What the feed refuses, and how.** Conditions that are ordinary traffic on a healthy stream
+are counted and discarded: a still-forming candle, and a closed candle republished verbatim
+after a reconnect. Conditions that mean the data is wrong raise a domain error: an unparseable
+frame, an impossible price, a negative volume, an interval that does not match the
+subscription, a timestamp that moved backwards, and a venue revising a candle the pipeline has
+already traded on. Nothing is ever repaired or clamped.
+
+**A gap stops trading.** When a candle arrives later than the next one expected, the feed
+records a `GapReport`, moves to `PAUSED` and raises. It does not skip the hole and it never
+synthesises a candle to bridge one: an invented bar is indistinguishable downstream from a
+real one, and every feature, signal and fill computed from it would be fiction wearing the
+costume of history. Resuming requires an explicit `resynchronize()` — accepting a
+discontinuity is a decision an operator should own.
+
+**Reconnection is finite.** Exponential backoff with a ceiling and an attempt budget, no
+jitter (one feed against one venue gains nothing from it and loses reproducibility). Exhausting
+the budget raises rather than retrying forever, because a feed that stalls silently leaves a
+session reporting an hour-old portfolio while every number it publishes stays plausible.
+Continuity state survives a reconnect untouched, so the first candle after a stream returns is
+judged against the last one delivered before it went away — a replay is suppressed, a stream
+that skipped ahead is caught as a gap, one that rewound is refused.
+
+**No wall clock.** Every instant and every duration comes through the `Clock` port, so a
+dropped connection, an expired heartbeat and a full backoff schedule replay in microseconds
+and behave exactly as they would over a real hour.
+
+**Still simulated: execution.** Bars flow into the same simulated broker and virtual portfolio
+as ever. This phase makes the market data real and nothing else.
+
 ### Execution modes
 
 | Mode | Market data | Orders |
@@ -545,8 +602,9 @@ supports it, and be distinct from paper or testnet credentials.
 
 ## Known limitations
 
-- **No live or exchange-backed ingestion.** Only local CSV files are read. REST clients,
-  WebSocket streaming, CCXT and real-time ingestion are out of scope until phase 7.
+- **The historical ingestion pipeline is still CSV-only.** Phase 7A adds live WebSocket
+  candles through `marketdata`, but the `data` package that validates and persists history
+  still reads local files; REST backfill and CCXT remain out of scope.
 - **One CSV schema.** Arbitrary exchange CSV layouts are not auto-detected; a file must
   match the canonical header exactly.
 - **Only fixed-duration timeframes.** Calendar-variable intervals (months, quarters, years)
@@ -567,8 +625,19 @@ supports it, and be distinct from paper or testnet credentials.
   keeps a position and its base balance in lockstep. The session refuses loudly rather than
   resuming into books that disagree with themselves; a seedable-portfolio contract is needed
   before this changes.
-- **No live market-data adapter yet.** Phase 6 defines the `PaperMarketDataFeed` port and
-  tests against a replay double; a real exchange feed arrives in phase 7.
+- **Recovery from a gap is manual.** The feed detects a hole, pauses and raises, but nothing
+  backfills the missing candles. `resynchronize()` accepts the discontinuity and starts a
+  fresh series; the bars either side of the hole are no longer one continuous history, and
+  no automatic policy can know whether that is tolerable for the strategy running.
+- **One venue, one timeframe per feed.** Only Binance Spot klines are implemented, and a feed
+  subscribes at a single interval. Multi-venue and multi-timeframe streaming are not modelled.
+- **The real WebSocket transport is not covered by tests.** `WebSocketCandleTransport` is a
+  deliberately thin adapter — open, send, receive, close — precisely so the untested surface
+  stays that small; everything above it runs against a scripted double. It has not been
+  exercised against the live venue in this phase.
+- **No historical backfill on connect.** A feed starts from the next candle the venue
+  publishes. Warming a strategy's history from a REST endpoint before streaming begins is not
+  implemented, so a session must accumulate its own warm-up bars.
 - **Backtests hold no state between runs.** A `BacktestResult` is returned, never persisted,
   and the engine cannot resume an interrupted run.
 - **One strategy per run.** Portfolio-level allocation across several strategies is not

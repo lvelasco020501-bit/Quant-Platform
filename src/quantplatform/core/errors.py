@@ -28,6 +28,8 @@ __all__ = [
     "InvalidFillSideError",
     "InvalidRiskConfigurationError",
     "LiveTradingNotAuthorizedError",
+    "MarketDataConnectionError",
+    "MarketDataSubscriptionError",
     "MatchingError",
     "MissingRiskContextError",
     "NegativeBalanceError",
@@ -154,6 +156,28 @@ class OutOfOrderDataError(DataError):
     """Raised when a bar arrives with a timestamp earlier than the previous bar."""
 
     code = "out_of_order_data_error"
+
+
+class MarketDataConnectionError(DataError):
+    """Raised when a streaming market-data transport cannot be established or kept alive.
+
+    Distinct from :class:`ExchangeUnavailableError`, which concerns the *execution* venue.
+    A market-data feed being unreachable stops new decisions; it says nothing about whether
+    orders could be placed, and conflating the two would let a data outage read as an
+    execution outage in the audit trail.
+    """
+
+    code = "market_data_connection_error"
+
+
+class MarketDataSubscriptionError(DataError):
+    """Raised when a stream subscription is refused, or names an instrument the feed cannot map.
+
+    Always a configuration or wiring fault rather than a transient one: retrying a
+    subscription the venue has rejected produces the same rejection.
+    """
+
+    code = "market_data_subscription_error"
 
 
 # --- Strategy --------------------------------------------------------------------------

@@ -29,6 +29,7 @@ __all__ = [
     "FindingSeverity",
     "IngestionStatus",
     "LogFormat",
+    "MarketDataFeedState",
     "MarketType",
     "OrderSide",
     "OrderStatus",
@@ -572,6 +573,50 @@ class DataQualityIssue(StrEnum):
 
     EMPTY_DATASET = "empty_dataset"
     """A source produced no usable rows, either as delivered or after validation."""
+
+
+class MarketDataFeedState(StrEnum):
+    """Connection and synchronisation state of a streaming market-data feed.
+
+    Connectivity and *trustworthiness* are separate questions, which is why
+    :attr:`PAUSED` exists alongside :attr:`DISCONNECTED`. A feed that is perfectly
+    connected but has discovered a hole in the candle series must stop delivering bars
+    just as firmly as one whose socket has dropped: trading through a gap means deciding
+    on a history the market did not actually print.
+    """
+
+    DISCONNECTED = "disconnected"
+    """No transport is open; nothing has been attempted yet, or everything was released."""
+
+    CONNECTING = "connecting"
+    RECONNECTING = "reconnecting"
+    """A previous connection dropped and the backoff schedule is being worked through."""
+
+    CONNECTED = "connected"
+    """The transport is open but no subscription has been confirmed yet."""
+
+    STREAMING = "streaming"
+    """Subscribed and delivering candles."""
+
+    PAUSED = "paused"
+    """A continuity break was detected; recovery must be acknowledged before bars resume."""
+
+    STOPPED = "stopped"
+    """Deliberately shut down. Terminal for the feed instance."""
+
+    @property
+    def delivers_bars(self) -> bool:
+        """Return whether the feed may hand a bar to the trading pipeline in this state."""
+        return self is MarketDataFeedState.STREAMING
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether a transport is currently expected to be open."""
+        return self in (
+            MarketDataFeedState.CONNECTED,
+            MarketDataFeedState.STREAMING,
+            MarketDataFeedState.PAUSED,
+        )
 
 
 class IngestionStatus(StrEnum):

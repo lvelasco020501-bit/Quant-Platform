@@ -16,6 +16,11 @@ dependencies = [
     "pandas>=2.2,<3",
     "fastapi>=0.115,<1",
     "typer>=0.15,<1",
+    # Read-only market-data transport. The synchronous client (websockets.sync) is used
+    # deliberately: the paper runner and session are single-threaded and loop-free by
+    # design, and introducing an event loop underneath them would trade that determinism
+    # for nothing the feed needs.
+    "websockets>=14.1,<16",
 ]
 
 [project.scripts]

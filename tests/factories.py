@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -124,6 +125,66 @@ def make_bars(
         make_bar(index=index, close=close, timeframe=timeframe)
         for index, close in enumerate(closes)
     )
+
+
+def _epoch_millis(value: datetime) -> int:
+    return int((value - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds() * 1000)
+
+
+def make_kline_frame(
+    bar: MarketBar,
+    *,
+    is_closed: bool | None = None,
+    venue_symbol: str | None = None,
+    wrapped: bool = False,
+    overrides: Mapping[str, object] | None = None,
+    drop: Sequence[str] = (),
+) -> str:
+    """Render a bar as the JSON kline frame a Binance stream would publish.
+
+    Built from a :class:`~quantplatform.core.models.market.MarketBar` rather than from loose
+    numbers so a test can send the venue's version of the very bar it expects back, and any
+    discrepancy is the parser's rather than the fixture's.
+
+    Args:
+        bar: The candle to render.
+        is_closed: Override the venue's closed flag, leaving the bar itself untouched.
+        venue_symbol: Override the venue spelling, to exercise unknown-symbol handling.
+        wrapped: Wrap in the combined-stream ``{"stream": ..., "data": ...}`` envelope.
+        overrides: Fields to replace inside the kline object, for malformed-frame tests.
+        drop: Fields to remove from the kline object.
+
+    Returns:
+        The frame as JSON text.
+    """
+    open_millis = _epoch_millis(bar.open_time)
+    kline: dict[str, object] = {
+        "t": open_millis,
+        "T": _epoch_millis(bar.close_time) - 1,
+        "s": venue_symbol if venue_symbol is not None else bar.symbol.replace("/", ""),
+        "i": bar.timeframe.value,
+        "o": str(bar.open),
+        "h": str(bar.high),
+        "l": str(bar.low),
+        "c": str(bar.close),
+        "v": str(bar.volume),
+        "n": bar.trade_count if bar.trade_count is not None else 0,
+        "x": bar.is_closed if is_closed is None else is_closed,
+        "q": str(bar.quote_volume) if bar.quote_volume is not None else str(bar.volume * bar.close),
+    }
+    kline.update(overrides or {})
+    for field in drop:
+        kline.pop(field, None)
+    event: dict[str, object] = {"e": "kline", "E": open_millis, "s": kline["s"], "k": kline}
+    if wrapped:
+        stream = f"{str(kline['s']).lower()}@kline_{bar.timeframe.value}"
+        return json.dumps({"stream": stream, "data": event})
+    return json.dumps(event)
+
+
+def make_subscription_ack(request_id: int = 1) -> str:
+    """Render the acknowledgement a venue returns for a SUBSCRIBE frame."""
+    return json.dumps({"result": None, "id": request_id})
 
 
 def make_context(

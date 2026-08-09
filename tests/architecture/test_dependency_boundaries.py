@@ -26,6 +26,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "data",
         "execution",
         "features",
+        "marketdata",
         "monitoring",
         "orchestration",
         "paper",
@@ -49,6 +50,10 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     # ports declared in core, so it needs no dependency on storage at all. Composition
     # roots inject the SQLAlchemy implementations.
     "data": frozenset({"core", "config"}),
+    # Live market data is the platform's only door to the outside world, and it is
+    # deliberately the narrowest one: it sees the domain and its own configuration, and
+    # nothing that could turn a read into a write.
+    "marketdata": frozenset({"core", "config"}),
     "risk": frozenset({"core", "config"}),
     "portfolio": frozenset({"core", "config"}),
     # Paper trading is orchestration over the finished chain: it reuses the backtest engine
@@ -423,3 +428,162 @@ def test_the_paper_state_port_has_no_implementation_in_the_platform() -> None:
         source = path.read_text(encoding="utf-8")
         for token in ("sqlalchemy", "psycopg", "redis", "sqlite3"):
             assert token not in source, f"{path.name} references {token}"
+
+
+# --- Market data boundaries ---------------------------------------------------------------------
+
+_MARKETDATA_ALLOWED: Final[frozenset[str]] = frozenset({"core", "config", "marketdata"})
+
+_NETWORK_CLIENTS: Final[frozenset[str]] = frozenset(
+    {"requests", "httpx", "aiohttp", "ccxt", "http", "socket", "ftplib", "telnetlib"}
+)
+"""Ways to reach the network that the market-data layer must not use.
+
+``websockets`` is absent deliberately — it is the one client this package *is*, and a
+separate test pins it to this package alone.
+"""
+
+_SIGNING_PRIMITIVES: Final[frozenset[str]] = frozenset({"hmac", "hashlib", "base64"})
+"""Everything needed to sign an authenticated venue request.
+
+Public market-data streams require no signature. A package that cannot import these
+cannot authenticate, which makes "read-only" a property of the import graph rather than a
+claim in a docstring.
+"""
+
+_TRADING_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {
+        "submit",
+        "cancel",
+        "place_order",
+        "create_order",
+        "amend_order",
+        "open_orders",
+        "fetch_balances",
+        "fetch_fills",
+        "withdraw",
+        "transfer",
+        "authenticate",
+        "sign_request",
+        "get_account",
+        "user_data_stream",
+    }
+)
+"""Operation names that would mean this package had grown a trading or account surface."""
+
+_WALL_CLOCK_READS: Final[tuple[str, ...]] = (
+    "datetime.now(",
+    "time.time(",
+    "utcnow(",
+    "date.today(",
+    "time.monotonic(",
+)
+
+
+def _defined_names(path: Path) -> set[str]:
+    """Return every function and method name a module defines."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def _marketdata_files() -> tuple[Path, ...]:
+    return tuple(path for path in _source_files() if _domain_of(path) == "marketdata")
+
+
+def test_marketdata_depends_only_on_the_domain_and_configuration() -> None:
+    for path in _marketdata_files():
+        violations = sorted(_imported_domains(path) - _MARKETDATA_ALLOWED)
+        assert not violations, f"{path.relative_to(PACKAGE_ROOT)} may not import {violations}"
+
+
+def test_marketdata_never_reaches_the_trading_chain() -> None:
+    # Stated explicitly although the budget already enforces it, because the direction is
+    # the whole point: the feed is below the pipeline and must never learn what a strategy,
+    # a risk decision, a broker or a portfolio is.
+    forbidden = {"risk", "execution", "portfolio", "strategies", "backtesting", "paper"}
+    for path in _marketdata_files():
+        assert not _imported_domains(path) & forbidden, path
+
+
+def test_marketdata_is_the_only_package_that_speaks_websocket() -> None:
+    # One door to the outside world. A second package opening a socket would be a second
+    # place where the platform's read-only guarantee has to be re-established.
+    offenders: list[str] = []
+    for path in _source_files():
+        if _domain_of(path) == "marketdata":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if "websockets" in _imported_root_modules(node):
+                offenders.append(str(path.relative_to(PACKAGE_ROOT)))
+                break
+    assert not offenders, f"websockets imported outside marketdata: {offenders}"
+
+
+def test_marketdata_uses_no_other_network_client() -> None:
+    for path in _marketdata_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node) & _NETWORK_CLIENTS
+            assert not roots, f"{path.name} may not import {sorted(roots)}"
+
+
+def test_marketdata_cannot_sign_an_authenticated_request() -> None:
+    for path in _marketdata_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node) & _SIGNING_PRIMITIVES
+            assert not roots, f"{path.name} may not import {sorted(roots)}"
+
+
+def test_marketdata_never_handles_a_secret() -> None:
+    for path in _marketdata_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            imported = {alias.name for alias in node.names}
+            assert "SecretStr" not in imported, f"{path.name} imports SecretStr"
+            assert "Settings" not in imported, f"{path.name} imports Settings"
+
+
+def test_marketdata_declares_no_trading_or_account_operation() -> None:
+    # Read-only enforced by vocabulary. The package cannot place a trade because nothing in
+    # it can name one; adding the capability would mean adding the concept first.
+    for path in _marketdata_files():
+        offenders = sorted(_defined_names(path) & _TRADING_OPERATIONS)
+        assert not offenders, f"{path.name} defines {offenders}"
+
+
+def test_marketdata_never_imports_sqlalchemy_or_alembic() -> None:
+    for path in _marketdata_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node)
+            assert not roots & {"sqlalchemy", "alembic", "psycopg", "redis"}, path
+
+
+def test_marketdata_reads_no_wall_clock() -> None:
+    # Every instant and every duration comes through the injected clock, which is what lets
+    # a dropped connection, an expired heartbeat and a full backoff schedule be replayed in
+    # microseconds and behave exactly as they would over a real hour.
+    for path in _marketdata_files():
+        source = path.read_text(encoding="utf-8")
+        for token in _WALL_CLOCK_READS:
+            assert token not in source, f"{path.name} reads the wall clock via {token}"
+
+
+def test_paper_consumes_the_live_feed_through_the_port_not_by_importing_it() -> None:
+    # Phase 7A adds a real feed without the paper session changing at all, because the
+    # session was always written against PaperMarketDataFeed. Keeping paper free of any
+    # import of marketdata is what proves the substitution is genuine rather than a rewrite:
+    # a CSV replay, a recorded double and a live socket remain interchangeable, and the
+    # composition root decides which one runs.
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        assert "marketdata" not in _imported_domains(path), path

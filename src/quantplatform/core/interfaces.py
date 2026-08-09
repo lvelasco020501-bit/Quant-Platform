@@ -17,7 +17,12 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from quantplatform.core.enums import ExecutionMode, MarketType, Timeframe
+from quantplatform.core.enums import (
+    ExecutionMode,
+    MarketDataFeedState,
+    MarketType,
+    Timeframe,
+)
 from quantplatform.core.events import DomainEvent
 from quantplatform.core.models.data import BarWriteResult, DataQualityFinding, IngestionRun
 from quantplatform.core.models.health import ComponentHealth
@@ -30,6 +35,7 @@ from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 
 __all__ = [
+    "CandleStreamTransport",
     "DataUnitOfWork",
     "EventPublisher",
     "ExecutionAdapter",
@@ -43,6 +49,7 @@ __all__ = [
     "RiskEngine",
     "SettlementLedger",
     "Strategy",
+    "StreamingMarketDataProvider",
 ]
 
 
@@ -88,6 +95,144 @@ class MarketDataProvider(Protocol):
 
     async def health(self) -> ComponentHealth:
         """Report the reachability and freshness of this data source."""
+        ...
+
+
+@runtime_checkable
+class CandleStreamTransport(Protocol):
+    """A duplex text channel to a market-data stream, and nothing more.
+
+    This port exists to keep the network out of the feed's reasoning. Everything that makes
+    a live feed hard — reconnection, heartbeats, duplicate suppression, gap detection — is
+    logic that must be exercised deterministically, and none of it can be if the only way to
+    produce a dropped socket in a test is to actually drop a socket.
+
+    The contract is deliberately dumb: it moves text and reports failure. It cannot describe
+    an order, an account or a credential, so no amount of change on the far side of it can
+    turn a market-data adapter into a trading one.
+    """
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether a channel is currently open."""
+        ...
+
+    def connect(self, url: str) -> None:
+        """Open the channel.
+
+        Args:
+            url: Endpoint to connect to.
+
+        Raises:
+            MarketDataConnectionError: If the channel cannot be opened.
+        """
+        ...
+
+    def send(self, payload: str) -> None:
+        """Send one text frame.
+
+        Raises:
+            MarketDataConnectionError: If the channel is closed or the send fails.
+        """
+        ...
+
+    def receive(self, timeout_seconds: float) -> str | None:
+        """Return the next text frame, or ``None`` when none arrived in time.
+
+        A timeout is an ordinary, expected outcome on a quiet market — it is how the caller
+        learns to check its heartbeat — so it is reported as ``None`` rather than raised.
+        A genuine transport failure is raised.
+
+        Args:
+            timeout_seconds: How long to wait for a frame.
+
+        Returns:
+            The frame's text, or ``None`` on timeout.
+
+        Raises:
+            MarketDataConnectionError: If the channel failed while waiting.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the channel; safe to call more than once, and never raises."""
+        ...
+
+
+@runtime_checkable
+class StreamingMarketDataProvider(Protocol):
+    """A live, read-only source of closed candles.
+
+    The streaming counterpart to :class:`MarketDataProvider`, which fetches history on
+    request. The two are separate ports because they are separate problems: one answers
+    "what happened between these dates", the other "what just finished printing", and an
+    adapter is normally good at one of them rather than both.
+
+    **Read-only by construction.** There is no order method, no balance method, no account
+    or user-data stream, and no authenticated endpoint. An implementation of this protocol
+    cannot place a trade, because nothing in the contract can express one.
+
+    Shaped to satisfy :class:`PaperMarketDataFeed` as well: ``symbols``, ``closed_bars`` and
+    ``close`` carry the same meaning in both, so a real provider drops into a paper session
+    wherever a replay double sat, with no adapter in between and no change to the session.
+    """
+
+    @property
+    def name(self) -> str:
+        """Return the stable identifier of this data source, recorded on every bar."""
+        ...
+
+    @property
+    def symbols(self) -> Sequence[str]:
+        """Return the canonical platform symbols currently subscribed."""
+        ...
+
+    @property
+    def state(self) -> MarketDataFeedState:
+        """Return the feed's connection and synchronisation state."""
+        ...
+
+    def connect(self) -> None:
+        """Open the upstream connection.
+
+        Raises:
+            MarketDataConnectionError: If the connection cannot be established.
+        """
+        ...
+
+    def disconnect(self) -> None:
+        """Close the upstream connection, leaving the feed reusable."""
+        ...
+
+    def subscribe(self, symbols: Sequence[str]) -> None:
+        """Add symbols to the live subscription.
+
+        Args:
+            symbols: Canonical platform symbols.
+
+        Raises:
+            MarketDataSubscriptionError: If a symbol cannot be mapped or is refused.
+        """
+        ...
+
+    def unsubscribe(self, symbols: Sequence[str]) -> None:
+        """Remove symbols from the live subscription."""
+        ...
+
+    def closed_bars(self) -> Iterator[MarketBar]:
+        """Yield closed bars as the venue publishes them.
+
+        Blocking between candles is expected. Implementations must never yield a forming
+        bar, must never yield the same bar twice, and must stop yielding rather than skip
+        a missing one.
+
+        Returns:
+            An iterator over closed bars in strictly increasing open-time order.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release every resource the feed holds; safe to call more than once."""
         ...
 
 

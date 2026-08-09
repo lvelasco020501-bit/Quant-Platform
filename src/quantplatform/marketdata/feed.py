@@ -33,11 +33,14 @@ from quantplatform.core.clock import Clock
 from quantplatform.core.enums import MarketDataFeedState
 from quantplatform.core.errors import (
     DataGapError,
+    DataIntegrityError,
+    DataProviderError,
     MarketDataConnectionError,
     MarketDataSubscriptionError,
 )
 from quantplatform.core.interfaces import CandleStreamTransport
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.marketdata.clock import FeedClock
 from quantplatform.marketdata.config import MarketDataConfiguration
 from quantplatform.marketdata.models import (
@@ -262,6 +265,16 @@ class BinanceSpotMarketDataFeed:
         """Return the most recent bar delivered for a symbol, if any."""
         return self._sequence.last_accepted(symbol)
 
+    def read_feed_metrics(self) -> FeedMetricsSnapshot:
+        """Return the feed's cumulative counters in the vocabulary a report speaks.
+
+        Satisfies :class:`~quantplatform.core.interfaces.FeedMetricsReader`, so the feed can
+        be handed to a paper runner as its own telemetry source. Cumulative and never reset:
+        a caller wanting one day's activity subtracts two readings, and resetting here would
+        erase any window nobody had reported yet.
+        """
+        return self._metrics.health_snapshot()
+
     # --- Connection -------------------------------------------------------------------------
 
     def connect(self) -> None:
@@ -378,7 +391,7 @@ class BinanceSpotMarketDataFeed:
             if frame is None:
                 continue
             self._metrics = self._metrics.record(frames_received=1)
-            bar = self._parser.parse(frame)
+            bar = self._parse(frame)
             if bar is None:
                 self._metrics = self._metrics.record(control_frames=1)
                 continue
@@ -516,6 +529,25 @@ class BinanceSpotMarketDataFeed:
             self._policy.reset()
             self._metrics = self._metrics.record(reconnects=1)
             return
+
+    def _parse(self, frame: str) -> MarketBar | None:
+        """Parse one frame, recording a malformed one on the way past.
+
+        The counter is incremented and the failure is then re-raised unchanged. Counting is
+        not handling: a frame the venue mangled still stops the feed, exactly as it did
+        before. What changes is only that the day's report can say the run ended on bad
+        data, instead of the operator finding a stopped process and no reason.
+
+        Raises:
+            DataProviderError: If the frame is not valid JSON or not a JSON object.
+            DataIntegrityError: If a candle is present but cannot be trusted.
+            MarketDataSubscriptionError: If the candle names an unsubscribed instrument.
+        """
+        try:
+            return self._parser.parse(frame)
+        except (DataProviderError, DataIntegrityError):
+            self._metrics = self._metrics.record(malformed_frames=1)
+            raise
 
     def _apply(self, admission: CandleAdmission) -> MarketBar | None:
         """Account for one verdict and return the bar to deliver, if any.

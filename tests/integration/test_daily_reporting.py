@@ -8,6 +8,8 @@ computed, and that observing changed nothing about what the session did.
 
 from __future__ import annotations
 
+import itertools
+from collections.abc import Iterator
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,11 +17,28 @@ from pathlib import Path
 import pytest
 
 from quantplatform.core.clock import SimulatedClock
+from quantplatform.core.errors import (
+    DataProviderError,
+    FeedTelemetryRegressionError,
+    TelemetryNotConfiguredError,
+)
+from quantplatform.core.interfaces import FeedMetricsReader, StreamingMarketDataProvider
 from quantplatform.core.models.market import MarketBar
-from quantplatform.paper import PaperTradingSession
+from quantplatform.core.models.telemetry import (
+    ADDITIVE_FEED_COUNTERS,
+    ZERO_FEED_METRICS,
+    FeedMetricsSnapshot,
+)
+from quantplatform.marketdata.feed import BinanceSpotMarketDataFeed
+from quantplatform.paper import (
+    InMemoryPaperStateRepository,
+    PaperTradingRunner,
+    PaperTradingSession,
+)
 from quantplatform.paper.results import SessionResult
 from quantplatform.reporting import (
     CHART_FILENAMES,
+    AlertCode,
     DailyReport,
     DailyReportBuilder,
     DailyReportRecorder,
@@ -37,6 +56,14 @@ from tests.integration.test_backtest_engine import (
     Silent,
     _flat_bars,
     _Params,
+)
+from tests.integration.test_marketdata_feed import (
+    _bar_steps,
+    _fail,
+    _feed,
+    _frame,
+    _ScriptedTransport,
+    _Step,
 )
 
 _PNG_MAGIC = b"\x89PNG"
@@ -177,7 +204,14 @@ def test_a_broken_reporter_cannot_stop_a_session(tmp_path: Path) -> None:
         def day_of(self, moment: object) -> date:
             return ReportingConfiguration(output_directory=tmp_path).day_of(moment)  # type: ignore[arg-type]
 
-        def on_day_rollover(self, *, completed_day: date, result: SessionResult) -> None:
+        def on_day_rollover(
+            self,
+            *,
+            completed_day: date,
+            result: SessionResult,
+            feed_metrics: FeedMetricsSnapshot | None = None,
+        ) -> None:
+            _ = (completed_day, result, feed_metrics)
             msg = "the reporting disk is full"
             raise OSError(msg)
 
@@ -324,9 +358,9 @@ def test_feed_observations_reach_the_report_and_its_health(tmp_path: Path) -> No
     _run(session, clock, _two_day_bars())
 
     statistics = recorder.reports[0].statistics
-    assert statistics.reconnect_count == 5
-    assert statistics.gap_count == 2
-    assert statistics.duplicate_candles == 7
+    assert statistics.daily_reconnects == 5
+    assert statistics.daily_gaps == 2
+    assert statistics.daily_duplicate_candles == 7
     assert statistics.out_of_order_candles == 1
     assert statistics.unknown_symbols == 1
     assert recorder.reports[0].health.level is HealthLevel.RED
@@ -674,3 +708,550 @@ def test_the_recorder_tracks_the_day_boundary_it_was_configured_with(tmp_path: P
 
     assert recorder.day_of(ANCHOR) == date(2026, 1, 1)
     assert recorder.day_of(ANCHOR + timedelta(hours=15)) == date(2026, 1, 2)
+
+
+# --- Feed telemetry reaching the report ---------------------------------------------------------
+
+
+def _live_bars() -> tuple[MarketBar, ...]:
+    """Thirty hourly bars, crossing one UTC midnight."""
+    return make_bars([Decimal(50_000)] * 30)
+
+
+def _feed_over(
+    steps: list[_Step], clock: SimulatedClock
+) -> tuple[BinanceSpotMarketDataFeed, _ScriptedTransport, list[float]]:
+    return _feed(steps, clock=clock)
+
+
+def test_feed_metrics_travel_from_the_socket_to_the_report(tmp_path: Path) -> None:
+    # The whole point of the phase, end to end: a real feed's counters reach a report
+    # without paper or reporting ever importing the market-data package.
+    bars = _live_bars()
+    clock = SimulatedClock(ANCHOR)
+    steps = [
+        *_bar_steps(bars[:4]),
+        _fail(),  # one reconnect
+        *_bar_steps(bars[4:]),
+    ]
+    feed, _, _ = _feed_over(steps, clock)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+
+    PaperTradingRunner(
+        session=session,
+        feed=feed,
+        max_bars=len(bars),
+        feed_metrics=feed,
+    ).run()
+
+    assert recorder.reports != ()
+    statistics = recorder.reports[0].statistics
+    assert statistics.feed_metrics_available is True
+    assert statistics.daily_reconnects == 1
+    assert statistics.daily_candles_received > 0
+    assert statistics.daily_candles_accepted > 0
+
+
+def test_a_reconnect_beyond_the_threshold_changes_the_health_score(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+    result = session.result()
+
+    tolerated = builder.build(
+        day=date(2026, 1, 1),
+        result=result,
+        feed_metrics=FeedMetricsSnapshot(
+            reconnect_count=1, candles_received=23, candles_accepted=23
+        ),
+    )
+    excessive = builder.build(
+        day=date(2026, 1, 1),
+        result=result,
+        feed_metrics=FeedMetricsSnapshot(
+            reconnect_count=9, candles_received=23, candles_accepted=23
+        ),
+    )
+
+    assert tolerated.health.level is HealthLevel.GREEN
+    assert excessive.health.level is HealthLevel.RED
+    assert excessive.alerts.by_code(AlertCode.MULTIPLE_RECONNECTS) is not None
+
+
+def test_a_detected_gap_reaches_the_report(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+
+    report = builder.build(
+        day=date(2026, 1, 1),
+        result=session.result(),
+        feed_metrics=FeedMetricsSnapshot(detected_gaps=2, candles_received=23, candles_accepted=23),
+    )
+
+    assert report.statistics.daily_gaps == 2
+    assert report.health.feed_level is not HealthLevel.GREEN
+    assert report.alerts.by_code(AlertCode.GAP_DETECTED) is not None
+
+
+def test_heartbeat_failures_reach_the_report(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+
+    report = builder.build(
+        day=date(2026, 1, 1),
+        result=session.result(),
+        feed_metrics=FeedMetricsSnapshot(
+            heartbeat_timeouts=6, candles_received=23, candles_accepted=23
+        ),
+    )
+
+    assert report.statistics.daily_heartbeat_failures == 6
+    assert report.health.feed_level is HealthLevel.RED
+
+
+def test_a_measured_but_spotless_feed_still_reports_green(tmp_path: Path) -> None:
+    # Measuring must not make a clean day look worse than not measuring it.
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+
+    report = builder.build(
+        day=date(2026, 1, 1),
+        result=session.result(),
+        feed_metrics=FeedMetricsSnapshot(candles_received=23, candles_accepted=23),
+    )
+
+    assert report.health.level is HealthLevel.GREEN
+    assert report.health.feed_level is HealthLevel.GREEN
+    assert report.alerts.count == 0
+    assert report.statistics.feed_metrics_available is True
+
+
+def test_a_feed_dropping_candles_is_caught_where_it_used_to_pass(tmp_path: Path) -> None:
+    # Before this phase the report read the session's own acceptance rate, which counts
+    # only bars the session refused. A feed that never delivered them was invisible.
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+    result = session.result()
+
+    unmeasured = builder.build(day=date(2026, 1, 1), result=result)
+    measured = builder.build(
+        day=date(2026, 1, 1),
+        result=result,
+        feed_metrics=FeedMetricsSnapshot(
+            candles_received=100, candles_accepted=40, candles_rejected=60, rejected_frames=60
+        ),
+    )
+
+    assert unmeasured.health.level is HealthLevel.GREEN
+    assert measured.health.level is HealthLevel.RED
+    assert measured.alerts.by_code(AlertCode.LOW_ACCEPTANCE_RATE) is not None
+
+
+def test_the_session_carries_the_snapshot_without_reading_it(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    snapshot = FeedMetricsSnapshot(reconnect_count=7, candles_received=5, candles_accepted=5)
+
+    session.record_feed_metrics(snapshot)
+
+    assert session.feed_metrics is snapshot
+    _run(session, clock, _live_bars())
+    assert recorder.reports[0].statistics.daily_reconnects == 7
+
+
+def test_recording_a_snapshot_never_changes_what_the_session_trades() -> None:
+    bars = _live_bars()
+
+    watched_clock = SimulatedClock(ANCHOR)
+    watched, watched_portfolio = _session(clock=watched_clock)
+    watched.start()
+    for bar in bars:
+        watched_clock.set_time(bar.close_time)
+        watched.record_feed_metrics(
+            FeedMetricsSnapshot(reconnect_count=99, detected_gaps=99, candles_received=1)
+        )
+        watched.submit_bar(bar)
+    watched.stop()
+
+    quiet_clock = SimulatedClock(ANCHOR)
+    quiet, quiet_portfolio = _session(clock=quiet_clock)
+    _run(quiet, quiet_clock, bars)
+
+    assert watched.result().fills == quiet.result().fills
+    assert watched.result().snapshot.equity == quiet.result().snapshot.equity
+    assert watched_portfolio.positions() == quiet_portfolio.positions()  # type: ignore[attr-defined]
+
+
+def test_a_malformed_frame_is_counted_before_it_stops_the_feed() -> None:
+    # Counting is not handling. The frame still ends the run; the report can now say so.
+    clock = SimulatedClock(ANCHOR)
+    feed, _, _ = _feed_over([_frame("this is not json")], clock)
+
+    with pytest.raises(DataProviderError):
+        list(itertools.islice(feed.closed_bars(), 1))
+
+    assert feed.metrics.malformed_frames == 1
+    assert feed.metrics.health_snapshot().malformed_frames == 1
+    assert feed.metrics.health_snapshot().is_clean is False
+
+
+def test_the_written_report_carries_feed_health_in_every_format(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    config = _config(tmp_path, render_charts=False)
+    writer = DailyReportWriter(config=config)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+    report = DailyReportBuilder(config=config, clock=clock).build(
+        day=date(2026, 1, 1),
+        result=session.result(),
+        feed_metrics=FeedMetricsSnapshot(
+            reconnect_count=2,
+            detected_gaps=1,
+            heartbeat_timeouts=1,
+            malformed_frames=1,
+            rejected_frames=4,
+            candles_received=30,
+            candles_accepted=23,
+            candles_rejected=3,
+        ),
+    )
+
+    written = writer.write(report)
+
+    assert written.markdown_path is not None
+    markdown = written.markdown_path.read_text(encoding="utf-8")
+    assert "## Feed health" in markdown
+    assert "| Detected gaps | 1 |" in markdown
+    assert written.csv_path is not None
+    assert "feed_status" in written.csv_path.read_text(encoding="utf-8")
+    restored = writer.read(date(2026, 1, 1))
+    assert restored is not None
+    assert restored.statistics.daily_reconnects == 2
+    assert restored.statistics.daily_malformed_frames == 1
+
+
+# --- Daily telemetry across days ---------------------------------------------------------------
+
+
+class _Cumulative:
+    """A feed metrics reader whose counters climb, as a real feed's do."""
+
+    def __init__(self) -> None:
+        self.snapshot = ZERO_FEED_METRICS
+
+    def read_feed_metrics(self) -> FeedMetricsSnapshot:
+        return self.snapshot
+
+    def advance(self, **deltas: int) -> None:
+        values = {
+            name: getattr(self.snapshot, name) + deltas.get(name, 0)
+            for name in ADDITIVE_FEED_COUNTERS
+        }
+        self.snapshot = FeedMetricsSnapshot(**values)
+
+
+def _daily_bars(days: int) -> tuple[MarketBar, ...]:
+    """Enough hourly bars to cross ``days`` UTC midnights, plus one bar into the last day."""
+    return make_bars([Decimal(50_000)] * (24 * days + 2))
+
+
+def test_day_one_reconnects_do_not_appear_on_day_two(tmp_path: Path) -> None:
+    # The defect this phase closes. Cumulative counters made Monday's reconnects reappear
+    # every day for the rest of the week.
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    reader = _Cumulative()
+
+    session.start()
+    for bar in _daily_bars(2):
+        clock.set_time(bar.close_time)
+        if bar.close_time.hour == 12 and bar.close_time.day == 1:
+            reader.advance(reconnect_count=3, detected_gaps=2, heartbeat_timeouts=1)
+        reader.advance(candles_received=1, candles_accepted=1)
+        session.record_feed_metrics(reader.read_feed_metrics())
+        session.submit_bar(bar)
+    session.stop()
+
+    first, second = recorder.reports[0], recorder.reports[1]
+    assert first.statistics.daily_reconnects == 3
+    assert first.statistics.daily_gaps == 2
+    assert first.statistics.daily_heartbeat_failures == 1
+    assert second.statistics.daily_reconnects == 0
+    assert second.statistics.daily_gaps == 0
+    assert second.statistics.daily_heartbeat_failures == 0
+
+
+def test_health_recovers_the_day_after_a_bad_one(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    reader = _Cumulative()
+
+    session.start()
+    for bar in _daily_bars(2):
+        clock.set_time(bar.close_time)
+        if bar.close_time.hour == 12 and bar.close_time.day == 1:
+            reader.advance(detected_gaps=9)
+        reader.advance(candles_received=1, candles_accepted=1)
+        session.record_feed_metrics(reader.read_feed_metrics())
+        session.submit_bar(bar)
+    session.stop()
+
+    assert recorder.reports[0].health.level is HealthLevel.RED
+    assert recorder.reports[1].health.level is HealthLevel.GREEN
+    assert recorder.reports[1].health.feed_level is HealthLevel.GREEN
+
+
+def test_three_cumulative_days_produce_three_correct_daily_reports(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    reader = _Cumulative()
+    per_day = {1: 1, 2: 4, 3: 2}
+
+    session.start()
+    for bar in _daily_bars(3):
+        clock.set_time(bar.close_time)
+        if bar.close_time.hour == 12 and bar.close_time.day in per_day:
+            reader.advance(reconnect_count=per_day[bar.close_time.day])
+        reader.advance(candles_received=1, candles_accepted=1)
+        session.record_feed_metrics(reader.read_feed_metrics())
+        session.submit_bar(bar)
+    session.stop()
+
+    assert [report.day.day for report in recorder.reports] == [1, 2, 3]
+    assert [report.statistics.daily_reconnects for report in recorder.reports] == [1, 4, 2]
+    # Cumulative would have read 1, 5, 7 — each day inheriting every earlier fault.
+    assert reader.snapshot.reconnect_count == 7
+
+
+def test_the_first_report_covers_everything_since_the_session_began(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+
+    assert session.feed_baseline == ZERO_FEED_METRICS
+    session.record_feed_metrics(
+        FeedMetricsSnapshot(reconnect_count=2, candles_received=30, candles_accepted=30)
+    )
+    _run(session, clock, _two_day_bars())
+
+    assert recorder.reports[0].statistics.daily_reconnects == 2
+    assert recorder.reports[0].statistics.daily_candles_received == 30
+
+
+def test_a_produced_report_advances_the_baseline(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    closing = FeedMetricsSnapshot(reconnect_count=2, candles_received=30, candles_accepted=30)
+
+    session.record_feed_metrics(closing)
+    _run(session, clock, _two_day_bars())
+
+    assert recorder.reports != ()
+    assert session.feed_baseline == closing
+
+
+def test_a_failed_report_leaves_the_baseline_where_it_was(tmp_path: Path) -> None:
+    # Advancing past a day nobody reported would delete that day's feed history rather than
+    # defer it. Holding the baseline folds the lost window into the next report instead.
+    clock = SimulatedClock(ANCHOR)
+
+    def _refuse(report: DailyReport) -> None:
+        _ = report
+        msg = "sink unavailable"
+        raise RuntimeError(msg)
+
+    recorder = DailyReportRecorder(
+        builder=DailyReportBuilder(config=_config(tmp_path), clock=clock), sink=_refuse
+    )
+    session, _ = _session(clock=clock, observer=recorder)
+    session.record_feed_metrics(
+        FeedMetricsSnapshot(reconnect_count=2, candles_received=30, candles_accepted=30)
+    )
+
+    _run(session, clock, _two_day_bars())
+
+    assert recorder.failures == 1
+    assert session.feed_baseline == ZERO_FEED_METRICS
+    assert session.runtime_metrics().report_failures == 1
+
+
+def test_a_lost_day_folds_into_the_next_report_rather_than_vanishing(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    accepted: list[DailyReport] = []
+    failures = {"remaining": 1}
+
+    def _flaky(report: DailyReport) -> None:
+        if failures["remaining"]:
+            failures["remaining"] -= 1
+            msg = "disk full"
+            raise RuntimeError(msg)
+        accepted.append(report)
+
+    recorder = DailyReportRecorder(
+        builder=DailyReportBuilder(config=_config(tmp_path), clock=clock), sink=_flaky
+    )
+    session, _ = _session(clock=clock, observer=recorder)
+    reader = _Cumulative()
+
+    session.start()
+    for bar in _daily_bars(2):
+        clock.set_time(bar.close_time)
+        if bar.close_time.hour == 12:
+            reader.advance(reconnect_count=1)
+        reader.advance(candles_received=1, candles_accepted=1)
+        session.record_feed_metrics(reader.read_feed_metrics())
+        session.submit_bar(bar)
+    session.stop()
+
+    # Day one's report was lost, so day two carries both days' reconnects — visibly larger,
+    # which is how a lost report should show up rather than as silence.
+    assert len(accepted) == 1
+    assert accepted[0].statistics.daily_reconnects == 2
+
+
+def test_the_baseline_survives_a_stop_and_resume(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    repository = InMemoryPaperStateRepository()
+    recorder = _recorder(_config(tmp_path), clock)
+    engine, broker, portfolio = make_backtest(strategy=Silent(_Params()))
+    session = PaperTradingSession(
+        session_id="restarted",
+        engine=engine,
+        broker=broker,
+        portfolio=portfolio,
+        config=engine._config,
+        clock=clock,
+        state_repository=repository,
+        day_rollover_observer=recorder,
+    )
+    closing = FeedMetricsSnapshot(reconnect_count=3, candles_received=30, candles_accepted=30)
+    session.record_feed_metrics(closing)
+    _run(session, clock, _two_day_bars())
+    assert session.feed_baseline == closing
+
+    stored = repository.load("restarted")
+    assert stored is not None
+    assert stored.feed_baseline == closing
+
+    revived = PaperTradingSession(
+        session_id="restarted",
+        engine=engine,
+        broker=broker,
+        portfolio=portfolio,
+        config=engine._config,
+        clock=clock,
+        state_repository=repository,
+    )
+    revived.resume()
+
+    assert revived.feed_baseline == closing
+
+
+def test_a_session_that_never_reported_resumes_from_zero(tmp_path: Path) -> None:
+    _ = tmp_path
+    clock = SimulatedClock(ANCHOR)
+    repository = InMemoryPaperStateRepository()
+    engine, broker, portfolio = make_backtest(strategy=Silent(_Params()))
+    session = PaperTradingSession(
+        session_id="fresh",
+        engine=engine,
+        broker=broker,
+        portfolio=portfolio,
+        config=engine._config,
+        clock=clock,
+        state_repository=repository,
+    )
+    _run(session, clock, _flat_bars(4))
+
+    revived = PaperTradingSession(
+        session_id="fresh",
+        engine=engine,
+        broker=broker,
+        portfolio=portfolio,
+        config=engine._config,
+        clock=clock,
+        state_repository=repository,
+    )
+    revived.resume()
+
+    assert revived.feed_baseline == ZERO_FEED_METRICS
+
+
+def test_a_counter_regression_is_refused_rather_than_reported(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    builder = DailyReportBuilder(config=_config(tmp_path), clock=clock)
+    session, _ = _session(clock=clock)
+    _run(session, clock, _live_bars())
+
+    with pytest.raises(FeedTelemetryRegressionError, match="moved backwards"):
+        builder.build(
+            day=date(2026, 1, 1),
+            result=session.result(),
+            feed_metrics=FeedMetricsSnapshot(reconnect_count=1),
+            previous_feed_metrics=FeedMetricsSnapshot(reconnect_count=8),
+        )
+
+
+# --- Real-feed wiring ---------------------------------------------------------------------------
+
+
+def test_a_live_feed_without_telemetry_is_refused_at_wiring_time(tmp_path: Path) -> None:
+    # A run that cannot see its own data quality produces reports that look clean for the
+    # wrong reason. Wiring time is the last cheap place to catch that.
+    clock = SimulatedClock(ANCHOR)
+    feed, _, _ = _feed_over([], clock)
+    session, _ = _session(clock=clock, observer=_recorder(_config(tmp_path), clock))
+
+    with pytest.raises(TelemetryNotConfiguredError, match="must be wired with a feed_metrics"):
+        PaperTradingRunner(session=session, feed=feed)
+
+
+def test_a_live_feed_is_its_own_telemetry_reader(tmp_path: Path) -> None:
+    _ = tmp_path
+    clock = SimulatedClock(ANCHOR)
+    feed, _, _ = _feed_over([], clock)
+
+    assert isinstance(feed, FeedMetricsReader)
+    assert feed.read_feed_metrics() == ZERO_FEED_METRICS
+
+
+def test_a_replay_feed_still_runs_without_telemetry(tmp_path: Path) -> None:
+    # A deterministic replay has no health to report; forcing it to invent counters would
+    # put fiction where a report expects measurement.
+    _ = tmp_path
+    clock = SimulatedClock(ANCHOR)
+    bars = _flat_bars(4)
+
+    class _Replay:
+        symbols = ("BTC/USDT",)
+
+        def closed_bars(self) -> Iterator[MarketBar]:
+            for bar in bars:
+                clock.set_time(bar.close_time)
+                yield bar
+
+        def close(self) -> None:
+            return
+
+    replay = _Replay()
+    assert not isinstance(replay, StreamingMarketDataProvider)
+    session, _ = _session(clock=clock)
+
+    result = PaperTradingRunner(session=session, feed=replay, max_bars=4).run()
+
+    assert result.runtime.bars_processed == 4

@@ -1,5 +1,9 @@
 """Operational health: is the session's output worth believing?
 
+**Every feed figure judged here is a daily one.** The counters arrive as differences between
+two cumulative readings, so three reconnects on Monday leave Tuesday's reconnect check
+green. Thresholds are unchanged from Phase 7B; only what they are applied to moved.
+
 Nine questions, each answered independently against a configured threshold, and the day
 takes the worst answer. Health is kept strictly apart from performance — a profitable day
 that dropped a third of its candles is a *red* day, because the profit was earned on a
@@ -46,14 +50,14 @@ def evaluate_health(*, statistics: DailyStatistics, thresholds: AlertThresholds)
         _feed_stability(statistics, thresholds),
         _ceiling(
             HealthCheckName.GAP_COUNT,
-            observed=statistics.gap_count,
+            observed=statistics.daily_gaps,
             limit=thresholds.max_gap_count,
             step=thresholds.red_escalation_count,
             noun="candle gap",
         ),
         _ceiling(
             HealthCheckName.HEARTBEAT_FAILURES,
-            observed=statistics.heartbeat_failures,
+            observed=statistics.daily_heartbeat_failures,
             limit=thresholds.max_heartbeat_failures,
             step=thresholds.red_escalation_count,
             noun="heartbeat failure",
@@ -67,7 +71,7 @@ def evaluate_health(*, statistics: DailyStatistics, thresholds: AlertThresholds)
         ),
         _ceiling(
             HealthCheckName.RECONNECTS,
-            observed=statistics.reconnect_count,
+            observed=statistics.daily_reconnects,
             limit=thresholds.max_reconnects,
             step=thresholds.red_escalation_count,
             noun="reconnect",
@@ -134,7 +138,7 @@ def _ceiling(
 
 def _feed_stability(statistics: DailyStatistics, thresholds: AlertThresholds) -> HealthCheck:
     """Grade the share of received bars that reached the pipeline."""
-    observed = statistics.acceptance_rate
+    observed = statistics.observed_acceptance_rate
     minimum = thresholds.min_acceptance_rate
     if observed is None:
         return HealthCheck(

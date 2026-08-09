@@ -22,6 +22,7 @@ from quantplatform.core.enums import ExecutionMode
 from quantplatform.core.models.base import AssetCode, DomainModel, Text, UtcDatetime
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.portfolio import Balance, Position
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.core.numeric import Fee, Money
 
 __all__ = ["PaperSessionState"]
@@ -57,6 +58,15 @@ class PaperSessionState(DomainModel):
     restarts: int = Field(default=0, ge=0)
     """How many times this session has been resumed, recorded so an operator can tell a
     long-running session apart from one that keeps dying and coming back."""
+
+    feed_baseline: FeedMetricsSnapshot | None = None
+    """The feed reading the current reporting day started from.
+
+    Persisted because the feed's counters are cumulative and survive nothing: a session
+    that resumed with a zero baseline would report every candle since the feed started as
+    if it had all happened today. ``None`` means no day has been reported yet, which is
+    restored as a zero baseline — the same state a fresh session begins in.
+    """
 
     @model_validator(mode="after")
     def _validate_timeline(self) -> Self:

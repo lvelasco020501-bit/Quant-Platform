@@ -33,6 +33,7 @@ from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Posi
 from quantplatform.core.models.risk import RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 
 __all__ = [
     "CandleStreamTransport",
@@ -40,6 +41,7 @@ __all__ = [
     "EventPublisher",
     "ExecutionAdapter",
     "FeaturePipeline",
+    "FeedMetricsReader",
     "IngestionRunRepository",
     "MarketBarRepository",
     "MarketDataProvider",
@@ -156,6 +158,29 @@ class CandleStreamTransport(Protocol):
 
     def close(self) -> None:
         """Release the channel; safe to call more than once, and never raises."""
+        ...
+
+
+@runtime_checkable
+class FeedMetricsReader(Protocol):
+    """Anything that can report how healthy a market-data feed has been.
+
+    Separate from :class:`StreamingMarketDataProvider` because the two answer different
+    questions and not every feed can answer this one. A deterministic replay has no health
+    to report — nothing about it can drop, stall or skip — and forcing it to invent
+    counters would put fiction where a report expects measurement.
+
+    A live feed is expected to implement both. A paper runner given a streaming provider
+    without a reader refuses to start, because a run that cannot see its own data quality
+    produces reports that look clean for the wrong reason.
+    """
+
+    def read_feed_metrics(self) -> FeedMetricsSnapshot:
+        """Return the feed's cumulative counters as of now.
+
+        Cumulative, never reset: a caller wanting a window subtracts two readings. A feed
+        that reset its own counters would erase any window nobody had reported yet.
+        """
         ...
 
 

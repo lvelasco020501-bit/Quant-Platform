@@ -21,6 +21,7 @@ from pydantic import Field, model_validator
 
 from quantplatform.core.enums import AlertSeverity, OrderSide
 from quantplatform.core.models.base import DomainModel, Symbol, Text, UtcDatetime
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.core.numeric import Fee, Money, NonNegativeMoney
 
 __all__ = [
@@ -90,6 +91,18 @@ class HealthCheckName(StrEnum):
     CLOCK_DRIFT = "clock_drift"
 
 
+_FEED_CHECKS: frozenset[HealthCheckName] = frozenset(
+    {
+        HealthCheckName.FEED_STABILITY,
+        HealthCheckName.GAP_COUNT,
+        HealthCheckName.HEARTBEAT_FAILURES,
+        HealthCheckName.RECONNECTS,
+        HealthCheckName.MISSING_BARS,
+    }
+)
+"""The checks that describe the data stream rather than the process around it."""
+
+
 class AlertCode(StrEnum):
     """Conditions a day can raise."""
 
@@ -109,14 +122,17 @@ class AlertCode(StrEnum):
 class FeedDiagnostics(DomainModel):
     """What the feed and the process did, as observed from outside the session.
 
-    Supplied by whoever owns the feed rather than derived from the session, because the
-    session deliberately cannot see its data source — that is the property Phase 7A exists
-    to preserve. A composition root maps
-    :class:`~quantplatform.marketdata.models.FeedMetrics` onto the first four counters.
+    Reaches a report from outside the session, because the session deliberately cannot see
+    its data source — that is the property Phase 7A exists to preserve. The feed's own
+    counters arrive as a :class:`~quantplatform.core.models.telemetry.FeedMetricsSnapshot`,
+    a neutral core type, and :meth:`from_feed_metrics` maps them here. Reporting never
+    imports the market-data package, so nothing in this file knows what a WebSocket is.
 
-    ``out_of_order_candles``, ``unknown_symbols`` and ``runtime_exceptions`` have no
-    counterpart in the feed's own metrics: the feed *raises* on those rather than counting
-    them, so a non-zero value here was recorded by an error handler further out.
+    ``out_of_order_candles`` and ``unknown_symbols`` still have no counterpart in the feed's
+    counters: the feed *raises* on those rather than counting them, so a non-zero value here
+    was recorded by an error handler further out. Same for ``runtime_exceptions``,
+    ``session_interruptions`` and ``broker_rejections``, which describe the process and the
+    venue adapter rather than the stream.
     """
 
     reconnects: int = Field(default=0, ge=0)
@@ -131,12 +147,61 @@ class FeedDiagnostics(DomainModel):
     broker_rejections: int = Field(default=0, ge=0)
     """Orders the venue adapter refused, as opposed to those risk declined to send."""
 
+    rejected_frames: int = Field(default=0, ge=0)
+    """Frames carrying data the feed refused, malformed ones included."""
+
+    malformed_frames: int = Field(default=0, ge=0)
+    """Frames that could not be parsed, or whose candle failed validation."""
+
+    candles_received: int = Field(default=0, ge=0)
+    candles_accepted: int = Field(default=0, ge=0)
+    candles_rejected: int = Field(default=0, ge=0)
+
     clock_drift_seconds: Money | None = None
     """Measured local-versus-venue skew, or ``None`` when nothing measured it.
 
     Nothing in the platform measures this yet, so it is normally ``None`` and the
     corresponding health check reports itself skipped rather than passing.
     """
+
+    @classmethod
+    def from_feed_metrics(
+        cls, snapshot: FeedMetricsSnapshot, **observed: object
+    ) -> FeedDiagnostics:
+        """Build diagnostics from a feed's own reading of itself.
+
+        Every field the feed measures is taken from the snapshot rather than defaulted, so
+        a day with reconnects can no longer report zero of them and pass as healthy. The
+        fields the feed cannot measure — out-of-order candles, unknown symbols, runtime
+        exceptions, interruptions, broker rejections, clock drift — stay at their defaults
+        unless a caller supplies them, because there is nothing to read them from.
+
+        Args:
+            snapshot: The feed's counters.
+            **observed: Fields the feed cannot measure, supplied by whoever can.
+
+        Returns:
+            Diagnostics carrying the feed's real numbers.
+        """
+        return cls(
+            reconnects=snapshot.reconnect_count,
+            gaps_detected=snapshot.detected_gaps,
+            heartbeat_failures=snapshot.heartbeat_timeouts,
+            duplicate_candles=snapshot.duplicate_candles,
+            rejected_frames=snapshot.rejected_frames,
+            malformed_frames=snapshot.malformed_frames,
+            candles_received=snapshot.candles_received,
+            candles_accepted=snapshot.candles_accepted,
+            candles_rejected=snapshot.candles_rejected,
+            **observed,  # type: ignore[arg-type]
+        )
+
+    @property
+    def feed_acceptance_rate(self) -> Decimal | None:
+        """Return the share of parsed candles the feed delivered, or ``None`` if it saw none."""
+        if self.candles_received == 0:
+            return None
+        return Decimal(self.candles_accepted) / Decimal(self.candles_received)
 
 
 class RoundTrip(DomainModel):
@@ -283,10 +348,6 @@ class DailyStatistics(DomainModel):
     bars_rejected: int = Field(default=0, ge=0)
     """Session-cumulative, for the same reason."""
 
-    reconnect_count: int = Field(default=0, ge=0)
-    gap_count: int = Field(default=0, ge=0)
-    heartbeat_failures: int = Field(default=0, ge=0)
-    duplicate_candles: int = Field(default=0, ge=0)
     out_of_order_candles: int = Field(default=0, ge=0)
     unknown_symbols: int = Field(default=0, ge=0)
     missing_bars: int = Field(default=0, ge=0)
@@ -294,6 +355,50 @@ class DailyStatistics(DomainModel):
     session_interruptions: int = Field(default=0, ge=0)
     report_failures: int = Field(default=0, ge=0)
     clock_drift_seconds: Money | None = None
+
+    # --- Feed, daily ---------------------------------------------------------------------------
+    # Every counter below covers *this day only*, obtained by subtracting the feed reading
+    # at the day's start from the reading at its end. The feed's own counters are cumulative
+    # and never reset; naming these `daily_` is what stops a reader mistaking one for the
+    # other, which is exactly the confusion that let day one's reconnects haunt day two.
+    daily_reconnects: int = Field(default=0, ge=0)
+    daily_heartbeat_failures: int = Field(default=0, ge=0)
+    daily_gaps: int = Field(default=0, ge=0)
+    daily_rejected_frames: int = Field(default=0, ge=0)
+    daily_malformed_frames: int = Field(default=0, ge=0)
+    daily_candles_received: int = Field(default=0, ge=0)
+    daily_candles_accepted: int = Field(default=0, ge=0)
+    daily_candles_rejected: int = Field(default=0, ge=0)
+    daily_duplicate_candles: int = Field(default=0, ge=0)
+
+    daily_feed_acceptance_rate: Money | None = None
+    """Today's accepted candles over today's received candles.
+
+    Recomputed from the daily counts, never differenced: the change in a ratio is not the
+    ratio of the change. ``None`` when the feed delivered nothing today.
+    """
+
+    feed_metrics_available: bool = False
+    """Whether a feed reading reached this report at all.
+
+    The distinction that makes the rest of this section readable. Before Phase 7B.1 a day
+    with eleven reconnects and a day with no feed attached both reported zero, and the
+    report could not tell them apart. ``False`` means nobody measured; zeros beside
+    ``True`` mean the feed was genuinely clean.
+    """
+
+    @property
+    def observed_acceptance_rate(self) -> Decimal | None:
+        """Return the acceptance rate feed-stability should be judged on.
+
+        The feed's daily rate when a reading reached this report, and the session's
+        cumulative bar-acceptance rate otherwise. The two count different things — the feed
+        counts candles the venue sent that never became bars, the session counts bars it
+        refused for its own reasons — so the measured one wins whenever it exists.
+        """
+        if self.feed_metrics_available:
+            return self.daily_feed_acceptance_rate
+        return self.acceptance_rate
 
     @property
     def is_profitable(self) -> bool:
@@ -328,6 +433,17 @@ class DailyHealth(DomainModel):
     def failing(self) -> tuple[HealthCheck, ...]:
         """Return every check that came back worse than green."""
         return tuple(check for check in self.checks if check.level is not HealthLevel.GREEN)
+
+    @property
+    def feed_level(self) -> HealthLevel:
+        """Return the worst level among the checks that describe the data stream.
+
+        A narrower question than overall health: an operator deciding whether to trust
+        today's *data* does not care that the session restarted or that the clock drifted.
+        """
+        return HealthLevel.worst(
+            tuple(check.level for check in self.checks if check.name in _FEED_CHECKS)
+        )
 
     @property
     def skipped(self) -> tuple[HealthCheck, ...]:

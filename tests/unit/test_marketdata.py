@@ -24,6 +24,7 @@ from quantplatform.core.errors import (
     MarketDataSubscriptionError,
     OutOfOrderDataError,
 )
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.marketdata.clock import FeedClock
 from quantplatform.marketdata.config import MarketDataConfiguration
 from quantplatform.marketdata.models import CandleOutcome, FeedMetrics, GapReport
@@ -662,3 +663,82 @@ def test_a_gap_report_is_immutable() -> None:
 
     with pytest.raises((AttributeError, TypeError)):
         report.missing_bars = 0  # type: ignore[misc]
+
+
+# --- Health snapshot ----------------------------------------------------------------------------
+
+
+def test_metrics_map_onto_the_boundary_vocabulary() -> None:
+    # The one place the feed's internal names become the operational names a report speaks.
+    metrics = FeedMetrics(
+        frames_received=100,
+        control_frames=4,
+        candles_parsed=90,
+        bars_emitted=70,
+        forming_suppressed=15,
+        duplicates_suppressed=5,
+        gaps_detected=2,
+        heartbeat_timeouts=1,
+        reconnects=3,
+        malformed_frames=6,
+    )
+
+    snapshot = metrics.health_snapshot()
+
+    assert snapshot.reconnect_count == 3
+    assert snapshot.heartbeat_timeouts == 1
+    assert snapshot.detected_gaps == 2
+    assert snapshot.candles_received == 90
+    assert snapshot.candles_accepted == 70
+    assert snapshot.candles_rejected == 20
+    assert snapshot.duplicate_candles == 5
+    assert snapshot.malformed_frames == 6
+    assert snapshot.rejected_frames == 26
+
+
+def test_a_snapshot_of_an_untouched_feed_is_clean_and_undefined() -> None:
+    snapshot = FeedMetrics().health_snapshot()
+
+    assert snapshot.is_clean is True
+    assert snapshot.acceptance_rate is None
+
+
+def test_a_snapshot_reports_the_share_the_feed_delivered() -> None:
+    snapshot = FeedMetrics(candles_parsed=8, bars_emitted=6, forming_suppressed=2).health_snapshot()
+
+    assert snapshot.acceptance_rate == Decimal("0.75")
+
+
+def test_a_malformed_frame_makes_a_snapshot_unclean() -> None:
+    assert FeedMetrics(malformed_frames=1).health_snapshot().is_clean is False
+
+
+def test_a_snapshot_is_frozen() -> None:
+    snapshot = FeedMetrics().health_snapshot()
+
+    with pytest.raises(ValueError, match="frozen"):
+        snapshot.reconnect_count = 5  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"candles_received": 1, "candles_accepted": 2}, "cannot exceed candles received"),
+        ({"candles_received": 4, "candles_rejected": 3}, "cannot be fewer than rejected candles"),
+        ({"rejected_frames": 1, "malformed_frames": 2}, "cannot exceed rejected frames"),
+        (
+            {
+                "candles_received": 4,
+                "candles_rejected": 1,
+                "rejected_frames": 1,
+                "duplicate_candles": 2,
+            },
+            "cannot exceed rejected candles",
+        ),
+    ],
+)
+def test_an_impossible_snapshot_is_refused(overrides: dict[str, int], message: str) -> None:
+    # A snapshot that cannot describe a real history would make a report say something the
+    # feed never observed.
+    with pytest.raises(ValueError, match=message):
+        FeedMetricsSnapshot(**overrides)

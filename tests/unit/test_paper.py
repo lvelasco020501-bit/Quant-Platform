@@ -14,6 +14,7 @@ from quantplatform.core.errors import PaperSessionStateError
 from quantplatform.core.interfaces import PaperMarketDataFeed, PaperStateRepository
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
+from quantplatform.core.models.telemetry import ZERO_FEED_METRICS, FeedMetricsSnapshot
 from quantplatform.paper.clock import SessionClock
 from quantplatform.paper.results import RuntimeMetrics, SessionStatus
 from quantplatform.paper.state import InMemoryPaperStateRepository, restore_balances
@@ -228,3 +229,40 @@ class _RecordedFeed:
 
 def test_a_feed_double_satisfies_the_port() -> None:
     assert isinstance(_RecordedFeed(()), PaperMarketDataFeed)
+
+
+# --- Telemetry baseline -------------------------------------------------------------------------
+
+
+def test_state_carries_no_feed_baseline_until_a_day_is_reported() -> None:
+    assert _state().feed_baseline is None
+
+
+def test_a_stored_feed_baseline_survives_the_repository() -> None:
+    # The path a restart actually takes. A JSON round trip of the whole state is not
+    # exercised here because `Balance` publishes a computed `total` that dumps but is not
+    # an input field — a pre-existing property of the portfolio model, unrelated to
+    # telemetry, and the repository port stores objects rather than text.
+    baseline = FeedMetricsSnapshot(
+        reconnect_count=3, detected_gaps=1, candles_received=90, candles_accepted=88
+    )
+    repository = InMemoryPaperStateRepository()
+
+    repository.save(_state(feed_baseline=baseline))
+
+    restored = repository.load("session-1")
+    assert restored is not None
+    assert restored.feed_baseline == baseline
+
+
+def test_a_feed_baseline_round_trips_through_json_on_its_own() -> None:
+    baseline = FeedMetricsSnapshot(reconnect_count=3, candles_received=9, candles_accepted=9)
+
+    assert FeedMetricsSnapshot.model_validate_json(baseline.model_dump_json()) == baseline
+
+
+def test_the_baseline_field_is_frozen_like_the_rest_of_the_state() -> None:
+    stored = _state(feed_baseline=ZERO_FEED_METRICS)
+
+    with pytest.raises(ValueError, match="frozen"):
+        stored.feed_baseline = None  # type: ignore[misc]

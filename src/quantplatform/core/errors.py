@@ -21,6 +21,7 @@ __all__ = [
     "DuplicateOrderError",
     "ExchangeUnavailableError",
     "ExecutionError",
+    "FeedTelemetryRegressionError",
     "InconsistentSeedStateError",
     "InsufficientBalanceError",
     "InsufficientPositionError",
@@ -55,6 +56,7 @@ __all__ = [
     "SymbolMismatchError",
     "SymbolRuleViolationError",
     "SystemHaltedError",
+    "TelemetryNotConfiguredError",
     "UnknownOrderStateError",
     "UnsupportedFeeAssetError",
     "UnsupportedMarketTypeError",
@@ -156,6 +158,30 @@ class OutOfOrderDataError(DataError):
     """Raised when a bar arrives with a timestamp earlier than the previous bar."""
 
     code = "out_of_order_data_error"
+
+
+class FeedTelemetryRegressionError(DataError):
+    """Raised when feed counters move backwards between two readings.
+
+    Feed counters only ever climb, so a smaller number than last time means the two
+    readings do not describe the same continuous run — a restarted adapter, a swapped
+    feed, or two sessions' snapshots crossed. Subtracting them anyway would produce a
+    negative daily count, and a report is worse than useless once it contains one.
+    """
+
+    code = "feed_telemetry_regression"
+
+
+class TelemetryNotConfiguredError(ConfigurationError):
+    """Raised when a live feed is wired up without a way to read its health.
+
+    A deterministic replay needs no telemetry: nothing about it can degrade. A real stream
+    can drop, stall and skip, and a paper run that cannot see any of that produces reports
+    which look clean because nothing was measured. Refusing at wiring time is the only
+    point where that is still cheap to fix.
+    """
+
+    code = "telemetry_not_configured"
 
 
 class MarketDataConnectionError(DataError):

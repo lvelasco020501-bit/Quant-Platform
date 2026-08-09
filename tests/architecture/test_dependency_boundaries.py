@@ -674,6 +674,85 @@ def test_nothing_the_platform_trades_with_imports_reporting() -> None:
         )
 
 
+_TELEMETRY_MODULE: Final[str] = "quantplatform.core.models.telemetry"
+"""Where the feed-health contract shared by marketdata, paper and reporting must live.
+
+All three need the same numbers and none may import another: ``paper`` and ``reporting``
+are both barred from ``marketdata``, and that isolation is what keeps a session unable to
+tell a socket from a CSV replay. The only way to share the definition is a neutral layer
+they already depend on, exactly as risk and execution share their execution policy.
+"""
+
+
+def test_the_feed_health_contract_lives_in_core() -> None:
+    assert (PACKAGE_ROOT / "core" / "models" / "telemetry.py").is_file()
+
+
+def test_every_side_of_the_telemetry_path_consumes_the_shared_contract() -> None:
+    # A shared contract nothing imports is not shared. All three ends must reach for it,
+    # which is what makes the feed's health travel without the packages learning about
+    # each other.
+    importers: set[str] = set()
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain not in {"marketdata", "paper", "reporting"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == _TELEMETRY_MODULE:
+                importers.add(domain)
+    assert importers == {"marketdata", "paper", "reporting"}, (
+        f"the telemetry contract must be consumed by all three ends; got {sorted(importers)}"
+    )
+
+
+def test_the_telemetry_contract_carries_counters_not_connections() -> None:
+    # Checked structurally rather than by scanning the text, because the docstring names a
+    # WebSocket precisely to say it knows nothing about one. What matters is the shape: it
+    # imports no venue and declares no field describing how data arrived, so a package
+    # reading a report never inherits a dependency on the transport that produced it.
+    path = PACKAGE_ROOT / "core" / "models" / "telemetry.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    for node in ast.walk(tree):
+        assert not _imported_root_modules(node) & {
+            "websockets",
+            "requests",
+            "httpx",
+            "aiohttp",
+            "socket",
+            "ccxt",
+        }, "the telemetry contract may not import a transport"
+
+    fields = {
+        node.target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    for field in fields:
+        for token in ("url", "endpoint", "socket", "venue", "host", "stream"):
+            assert token not in field.lower(), f"telemetry field {field!r} names a transport"
+
+
+def test_the_daily_delta_is_computed_in_the_shared_contract() -> None:
+    # Subtracting two readings is the whole of "daily", and it belongs beside the type it
+    # subtracts. Putting it in reporting would mean paper could not check a regression, and
+    # putting it in marketdata would teach a feed what a reporting day is.
+    telemetry = PACKAGE_ROOT / "core" / "models" / "telemetry.py"
+    source = telemetry.read_text(encoding="utf-8")
+    assert "def delta_since" in source
+    assert "ADDITIVE_FEED_COUNTERS" in source
+
+
+def test_the_feed_metrics_reader_is_a_core_port() -> None:
+    # Paper must be able to demand telemetry from a live feed without importing one.
+    interfaces = (PACKAGE_ROOT / "core" / "interfaces.py").read_text(encoding="utf-8")
+    assert "class FeedMetricsReader" in interfaces
+    runner = PACKAGE_ROOT / "paper" / "runner.py"
+    assert "marketdata" not in _imported_domains(runner)
+    assert "FeedMetricsReader" in runner.read_text(encoding="utf-8")
+
+
 def test_the_day_rollover_observer_is_the_only_seam_into_the_session() -> None:
     # Phase 7B adds exactly one hook to a committed session, and it is a port the session
     # calls rather than a dependency it acquires.

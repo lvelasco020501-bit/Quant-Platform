@@ -23,6 +23,7 @@ brings the platform to the point where the only remaining fiction is the fills.
 
 from __future__ import annotations
 
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.marketdata.clock import FeedClock
 from quantplatform.marketdata.config import MarketDataConfiguration
 from quantplatform.marketdata.feed import BinanceSpotMarketDataFeed, WebSocketCandleTransport
@@ -46,6 +47,7 @@ __all__ = [
     "CandleSequenceValidator",
     "FeedClock",
     "FeedMetrics",
+    "FeedMetricsSnapshot",
     "GapReport",
     "MarketDataConfiguration",
     "ReconnectPolicy",

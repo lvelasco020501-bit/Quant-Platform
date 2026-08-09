@@ -681,7 +681,7 @@ def test_a_live_feed_drives_the_whole_chain_and_settles_virtually() -> None:
     feed, _, _ = _feed(_bar_steps(bars), clock=clock)
     session, portfolio = _session(feed, clock)
 
-    runner = PaperTradingRunner(session=session, feed=feed, max_bars=5)
+    runner = PaperTradingRunner(session=session, feed=feed, feed_metrics=feed, max_bars=5)
     result = runner.run()
 
     assert result.runtime.bars_processed == 5
@@ -697,7 +697,7 @@ def test_execution_stays_next_bar_when_the_bars_arrive_over_a_socket() -> None:
     feed, _, _ = _feed(_bar_steps(bars), clock=clock)
     session, _ = _session(feed, clock)
 
-    result = PaperTradingRunner(session=session, feed=feed, max_bars=5).run()
+    result = PaperTradingRunner(session=session, feed=feed, feed_metrics=feed, max_bars=5).run()
 
     detail = result.detail
     assert detail is not None
@@ -715,7 +715,7 @@ def test_the_pipeline_cannot_tell_a_socket_from_a_replay() -> None:
     live_clock = SimulatedClock(ANCHOR)
     feed, _, _ = _feed(_bar_steps(bars), clock=live_clock)
     live_session, live_portfolio = _session(feed, live_clock)
-    live = PaperTradingRunner(session=live_session, feed=feed, max_bars=6).run()
+    live = PaperTradingRunner(session=live_session, feed=feed, feed_metrics=feed, max_bars=6).run()
 
     direct_clock = SimulatedClock(ANCHOR)
     direct_engine, direct_broker, direct_portfolio = make_backtest(strategy=BuyOnce(_Params()))
@@ -749,7 +749,7 @@ def test_forming_candles_from_the_socket_never_reach_the_session() -> None:
     feed, _, _ = _feed(steps, clock=clock)
     session, _ = _session(feed, clock)
 
-    result = PaperTradingRunner(session=session, feed=feed, max_bars=4).run()
+    result = PaperTradingRunner(session=session, feed=feed, feed_metrics=feed, max_bars=4).run()
 
     assert result.runtime.bars_received == 4
     assert result.runtime.bars_rejected == 0
@@ -770,7 +770,7 @@ def test_a_gap_mid_session_stops_the_run_and_still_closes_everything() -> None:
     session, _ = _session(feed, clock)
 
     with pytest.raises(DataGapError):
-        PaperTradingRunner(session=session, feed=feed).run()
+        PaperTradingRunner(session=session, feed=feed, feed_metrics=feed).run()
 
     # The runner's finally block still ran: the session was stopped and the feed released.
     assert session.is_running is False
@@ -786,7 +786,7 @@ def test_a_run_over_a_socket_reads_no_wall_clock() -> None:
     feed, _, _ = _feed(_bar_steps(bars), clock=clock)
     session, _ = _session(feed, clock)
 
-    result = PaperTradingRunner(session=session, feed=feed, max_bars=4).run()
+    result = PaperTradingRunner(session=session, feed=feed, feed_metrics=feed, max_bars=4).run()
 
     assert result.status.started_at == ANCHOR
     assert clock.now() == bars[-1].close_time
@@ -807,7 +807,7 @@ def test_a_silent_session_still_records_every_candle_it_saw() -> None:
         clock=clock,
     )
 
-    result = PaperTradingRunner(session=session, feed=feed, max_bars=3).run()
+    result = PaperTradingRunner(session=session, feed=feed, feed_metrics=feed, max_bars=3).run()
 
     assert result.runtime.bars_processed == 3
     assert result.runtime.orders_submitted == 0

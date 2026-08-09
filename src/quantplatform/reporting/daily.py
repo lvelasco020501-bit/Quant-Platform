@@ -33,6 +33,7 @@ from quantplatform.core.clock import Clock
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
 from quantplatform.core.enums import AlertSeverity, OrderSide, OrderStatus, RiskOutcome
 from quantplatform.core.models.orders import Fill
+from quantplatform.core.models.telemetry import ZERO_FEED_METRICS, FeedMetricsSnapshot
 from quantplatform.core.numeric import to_decimal
 from quantplatform.core.timeutils import ensure_utc
 from quantplatform.paper.results import SessionResult
@@ -224,7 +225,7 @@ def evaluate_alerts(*, statistics: DailyStatistics, thresholds: AlertThresholds)
         raised,
         code=AlertCode.GAP_DETECTED,
         severity=AlertSeverity.ERROR,
-        observed=statistics.gap_count,
+        observed=statistics.daily_gaps,
         limit=thresholds.max_gap_count,
         message="candle gap(s) detected; the day's history is discontinuous",
     )
@@ -232,7 +233,7 @@ def evaluate_alerts(*, statistics: DailyStatistics, thresholds: AlertThresholds)
         raised,
         code=AlertCode.MULTIPLE_RECONNECTS,
         severity=AlertSeverity.WARNING,
-        observed=statistics.reconnect_count,
+        observed=statistics.daily_reconnects,
         limit=thresholds.max_reconnects,
         message="feed reconnection(s)",
     )
@@ -362,8 +363,13 @@ def _add_rejection_spikes(
 def _add_acceptance(
     raised: list[Alert], statistics: DailyStatistics, thresholds: AlertThresholds
 ) -> None:
-    """Flag a feed that delivered less than it should have."""
-    observed = statistics.acceptance_rate
+    """Flag a feed that delivered less than it should have.
+
+    Reads the same rate the feed-stability health check does, so an alert and a check can
+    never disagree about the day: one saying the stream was fine while the other says it
+    was not is worse than either verdict alone.
+    """
+    observed = statistics.observed_acceptance_rate
     if observed is None or observed >= thresholds.min_acceptance_rate:
         return
     raised.append(
@@ -498,6 +504,8 @@ class DailyReportBuilder:
         day: date,
         result: SessionResult,
         diagnostics: FeedDiagnostics | None = None,
+        feed_metrics: FeedMetricsSnapshot | None = None,
+        previous_feed_metrics: FeedMetricsSnapshot | None = None,
         previous: DailyReport | None = None,
     ) -> DailyReport:
         """Summarise one day of a session.
@@ -505,14 +513,27 @@ class DailyReportBuilder:
         Args:
             day: The reporting day to describe.
             result: Everything the session has produced so far.
-            diagnostics: Feed and process observations from outside the session, which
-                cannot see its own data source.
+            diagnostics: Process and venue observations the feed cannot make — out-of-order
+                candles, unknown symbols, runtime exceptions, interruptions, broker
+                rejections, clock drift.
+            feed_metrics: The feed's *cumulative* counters as of the end of this day. When
+                present these win over the matching fields of ``diagnostics``: a measurement
+                beats a guess, and the whole point of this path is that a day with
+                reconnects can no longer report zero of them.
+            previous_feed_metrics: The feed's cumulative counters as of the *start* of this
+                day. The difference is what the day actually did; without it the day would
+                inherit every reconnect since the session began.
             previous: The last reported day, for comparison.
 
         Returns:
             The finished, immutable report.
+
+        Raises:
+            FeedTelemetryRegressionError: If the feed's counters moved backwards between the
+                two readings, which means they do not describe one continuous run.
         """
-        observations = diagnostics if diagnostics is not None else _NO_DIAGNOSTICS
+        window = self._daily_window(feed_metrics, previous_feed_metrics)
+        observations = self._observations(diagnostics, window)
         detail = result.detail
         outcomes = self._outcomes_for(day, detail)
         trips = tuple(
@@ -529,6 +550,7 @@ class DailyReportBuilder:
             opening=opening,
             performance=performance,
             observations=observations,
+            feed_metrics=window,
         )
         health = evaluate_health(statistics=statistics, thresholds=self._config.thresholds)
         alerts = evaluate_alerts(statistics=statistics, thresholds=self._config.thresholds)
@@ -557,6 +579,46 @@ class DailyReportBuilder:
             series=self._series(outcomes, curve, trips),
             trades=trips,
             comparison=comparison,
+        )
+
+    @staticmethod
+    def _daily_window(
+        current: FeedMetricsSnapshot | None, previous: FeedMetricsSnapshot | None
+    ) -> FeedMetricsSnapshot | None:
+        """Return what the feed did during this day alone.
+
+        The feed's counters are cumulative and are never reset, so a day's activity is the
+        difference between the reading that closed it and the reading that opened it. With
+        no opening reading — the session's first reported day — the baseline is zero and the
+        window covers everything since the session began, which is exactly right.
+        """
+        if current is None:
+            return None
+        return current.delta_since(previous if previous is not None else ZERO_FEED_METRICS)
+
+    @staticmethod
+    def _observations(
+        diagnostics: FeedDiagnostics | None, feed_metrics: FeedMetricsSnapshot | None
+    ) -> FeedDiagnostics:
+        """Merge what the feed measured with what only an outside observer could.
+
+        The feed's own numbers are authoritative for everything the feed can count. A
+        caller that supplied both a snapshot and a hand-built ``diagnostics`` keeps its
+        process- and venue-level figures — those the feed genuinely cannot see — while the
+        stream figures are replaced by the measured ones.
+        """
+        if feed_metrics is None:
+            return diagnostics if diagnostics is not None else _NO_DIAGNOSTICS
+        supplied = diagnostics if diagnostics is not None else _NO_DIAGNOSTICS
+        return FeedDiagnostics.from_feed_metrics(
+            feed_metrics,
+            out_of_order_candles=supplied.out_of_order_candles,
+            unknown_symbols=supplied.unknown_symbols,
+            missing_bars=supplied.missing_bars,
+            runtime_exceptions=supplied.runtime_exceptions,
+            session_interruptions=supplied.session_interruptions,
+            broker_rejections=supplied.broker_rejections,
+            clock_drift_seconds=supplied.clock_drift_seconds,
         )
 
     def _outcomes_for(self, day: date, detail: BacktestResult | None) -> tuple[BarOutcome, ...]:
@@ -625,6 +687,7 @@ class DailyReportBuilder:
         opening: Decimal,
         performance: PerformanceSummary,
         observations: FeedDiagnostics,
+        feed_metrics: FeedMetricsSnapshot | None,
     ) -> DailyStatistics:
         """Fold every source into the day's counted figures."""
         flow = _OrderFlow.of(outcomes)
@@ -689,10 +752,6 @@ class DailyReportBuilder:
             acceptance_rate=runtime.acceptance_rate,
             bars_processed=len(outcomes),
             bars_rejected=runtime.bars_rejected,
-            reconnect_count=observations.reconnects,
-            gap_count=observations.gaps_detected,
-            heartbeat_failures=observations.heartbeat_failures,
-            duplicate_candles=observations.duplicate_candles,
             out_of_order_candles=observations.out_of_order_candles,
             unknown_symbols=observations.unknown_symbols,
             missing_bars=observations.missing_bars,
@@ -700,6 +759,19 @@ class DailyReportBuilder:
             session_interruptions=observations.session_interruptions or runtime.restarts,
             report_failures=runtime.report_failures,
             clock_drift_seconds=observations.clock_drift_seconds,
+            daily_reconnects=observations.reconnects,
+            daily_heartbeat_failures=observations.heartbeat_failures,
+            daily_gaps=observations.gaps_detected,
+            daily_duplicate_candles=observations.duplicate_candles,
+            daily_rejected_frames=observations.rejected_frames,
+            daily_malformed_frames=observations.malformed_frames,
+            daily_candles_received=observations.candles_received,
+            daily_candles_accepted=observations.candles_accepted,
+            daily_candles_rejected=observations.candles_rejected,
+            daily_feed_acceptance_rate=(
+                feed_metrics.acceptance_rate if feed_metrics is not None else None
+            ),
+            feed_metrics_available=feed_metrics is not None,
         )
 
     def _series(
@@ -881,12 +953,35 @@ class DailyReportRecorder:
         """Return the reporting day an instant falls in, per the reporting time zone."""
         return self._builder.config.day_of(moment)
 
-    def on_day_rollover(self, *, completed_day: date, result: SessionResult) -> None:
-        """Build and emit the report for a finished day, swallowing any failure."""
+    def on_day_rollover(
+        self,
+        *,
+        completed_day: date,
+        result: SessionResult,
+        feed_metrics: FeedMetricsSnapshot | None = None,
+        previous_feed_metrics: FeedMetricsSnapshot | None = None,
+    ) -> bool:
+        """Build and emit the report for a finished day, swallowing any failure.
+
+        Args:
+            completed_day: The day that ended.
+            result: Everything the session produced up to the rollover.
+            feed_metrics: The feed's cumulative counters at the end of the day, carried here
+                by the session. The session never reads them — it only passes them along —
+                so the feed's health reaches a report without ever becoming an input to a
+                trading decision.
+            previous_feed_metrics: The same counters at the start of the day.
+
+        Returns:
+            Whether a report was produced. The session advances its telemetry baseline only
+            on ``True``, so a failed report leaves its window open rather than losing it.
+        """
         try:
             report = self._builder.build(
                 day=completed_day,
                 result=result,
+                feed_metrics=feed_metrics,
+                previous_feed_metrics=previous_feed_metrics,
                 diagnostics=self._diagnostics() if self._diagnostics is not None else None,
                 previous=self._previous,
             )
@@ -895,5 +990,8 @@ class DailyReportRecorder:
             self._reports.append(report)
             self._previous = report
         except Exception:
-            # Contained deliberately: see the class docstring. Counted, never hidden.
+            # Contained deliberately: see the class docstring. Counted, never hidden, and
+            # reported as a failure so the session keeps the telemetry window open.
             self._failures += 1
+            return False
+        return True

@@ -42,6 +42,7 @@ from quantplatform.core.interfaces import PaperStateRepository
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import PortfolioSnapshot
+from quantplatform.core.models.telemetry import ZERO_FEED_METRICS, FeedMetricsSnapshot
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.paper.clock import SessionClock
 from quantplatform.paper.results import (
@@ -77,12 +78,29 @@ class DayRolloverObserver(Protocol):
         """Return the reporting day a UTC instant belongs to."""
         ...
 
-    def on_day_rollover(self, *, completed_day: date, result: SessionResult) -> None:
+    def on_day_rollover(
+        self,
+        *,
+        completed_day: date,
+        result: SessionResult,
+        feed_metrics: FeedMetricsSnapshot | None = None,
+        previous_feed_metrics: FeedMetricsSnapshot | None = None,
+    ) -> bool:
         """Handle a day that has just finished.
 
         Args:
             completed_day: The day that ended, as returned by :meth:`day_of`.
             result: Everything the session has produced up to the rollover.
+            feed_metrics: The latest cumulative reading of the data feed's health, or
+                ``None`` when nothing supplied one. Passed explicitly rather than fetched,
+                because the session cannot see its own data source and must not learn how to.
+            previous_feed_metrics: The reading at the start of the day being reported.
+                Subtracting the two is what turns cumulative counters into daily ones.
+
+        Returns:
+            Whether a report was actually produced. The session advances its telemetry
+            baseline only on ``True``, so a day whose report failed keeps its window open
+            and folds into the next one rather than vanishing.
         """
         ...
 
@@ -136,6 +154,8 @@ class PaperTradingSession:
         self._last_bar: MarketBar | None = None
         self._restarts = 0
         self._metrics = _MutableMetrics()
+        self._feed_metrics: FeedMetricsSnapshot | None = None
+        self._feed_baseline: FeedMetricsSnapshot = ZERO_FEED_METRICS
 
     # --- Lifecycle --------------------------------------------------------------------------
 
@@ -237,6 +257,12 @@ class PaperTradingSession:
         self._clock.adopt_start(stored.started_at)
         self._last_bar = stored.last_bar
         self._metrics.bars_processed = stored.bars_processed
+        # Restoring this is what stops a resumed session reporting every candle the feed has
+        # ever seen as today's activity. A missing baseline means no day was reported before
+        # the restart, which is the same state a fresh session starts in.
+        self._feed_baseline = (
+            stored.feed_baseline if stored.feed_baseline is not None else ZERO_FEED_METRICS
+        )
         self._metrics.last_bar_close_time = (
             stored.last_bar.close_time if stored.last_bar is not None else None
         )
@@ -292,6 +318,36 @@ class PaperTradingSession:
             self.save()
         return outcome
 
+    def record_feed_metrics(self, snapshot: FeedMetricsSnapshot) -> None:
+        """Accept the latest reading of the data feed's health.
+
+        The session stores the snapshot and carries it to the day-rollover observer. It
+        never reads a field of it, never derives anything from it and never acts on it —
+        doing any of those would make the feed's health an input to trading, which is
+        exactly the coupling the market-data boundary exists to prevent.
+
+        Snapshots are immutable, so what is stored is what the caller measured; there is no
+        copy to fall out of date and nothing here can edit the record after the fact.
+
+        Args:
+            snapshot: The feed's counters at this instant.
+        """
+        self._feed_metrics = snapshot
+
+    @property
+    def feed_metrics(self) -> FeedMetricsSnapshot | None:
+        """Return the most recent feed reading, or ``None`` if none was ever supplied."""
+        return self._feed_metrics
+
+    @property
+    def feed_baseline(self) -> FeedMetricsSnapshot:
+        """Return the reading the current reporting day started from.
+
+        Zero until the first day has been reported, which is what makes the first report
+        cover everything the feed did since the session began rather than nothing at all.
+        """
+        return self._feed_baseline
+
     def _notify_rollover(self, bar: MarketBar) -> None:
         """Tell the observer a day finished, if this bar starts a new one.
 
@@ -302,6 +358,12 @@ class PaperTradingSession:
         A failure here is contained rather than propagated: the observer is an onlooker, and
         a broken reporter must not stop a session from trading. The failure is counted, so
         containment does not become silence.
+
+        **The telemetry baseline advances only on a produced report.** The feed's counters
+        are cumulative, so the baseline is what makes them daily; moving it past a day whose
+        report never got written would delete that day's feed history rather than defer it.
+        A failed rollover therefore leaves the window open, and the next report covers both
+        days — visibly larger, which is the correct way for a lost report to show up.
         """
         observer = self._rollover_observer
         if observer is None or self._last_bar is None:
@@ -310,10 +372,20 @@ class PaperTradingSession:
             previous_day = observer.day_of(self._last_bar.close_time)
             if observer.day_of(bar.close_time) == previous_day:
                 return
-            observer.on_day_rollover(completed_day=previous_day, result=self.result())
+            current = self._feed_metrics
+            produced = observer.on_day_rollover(
+                completed_day=previous_day,
+                result=self.result(),
+                feed_metrics=current,
+                previous_feed_metrics=self._feed_baseline,
+            )
+            if produced and current is not None:
+                self._feed_baseline = current
+            if not produced:
+                self._metrics.report_failures += 1
         except Exception:
             # Deliberately broad: an onlooker may fail in any way it likes, and none of them
-            # are the session's problem.
+            # are the session's problem. The baseline is untouched, so the window survives.
             self._metrics.report_failures += 1
 
     def _is_actionable(self, bar: MarketBar) -> bool:
@@ -369,6 +441,7 @@ class PaperTradingSession:
             realized_pnl=snapshot.realized_pnl if snapshot is not None else ZERO,
             total_fees=snapshot.total_fees if snapshot is not None else ZERO,
             restarts=self._restarts,
+            feed_baseline=self._feed_baseline,
         )
 
     # --- Reporting --------------------------------------------------------------------------

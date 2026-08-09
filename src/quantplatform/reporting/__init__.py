@@ -23,6 +23,7 @@ strategy is worth running.
 
 from __future__ import annotations
 
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.reporting.charts import CHART_FILENAMES, ChartRenderer
 from quantplatform.reporting.config import (
     AlertThresholds,
@@ -73,6 +74,7 @@ __all__ = [
     "DailyStatistics",
     "DailySummary",
     "FeedDiagnostics",
+    "FeedMetricsSnapshot",
     "HealthCheck",
     "HealthCheckName",
     "HealthLevel",

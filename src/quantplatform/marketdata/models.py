@@ -19,6 +19,7 @@ from enum import StrEnum
 
 from quantplatform.core.enums import DataQualityIssue, Timeframe
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 
 __all__ = [
     "CandleAdmission",
@@ -161,6 +162,14 @@ class FeedMetrics:
     connection_attempts: int = 0
     subscriptions_sent: int = 0
 
+    malformed_frames: int = 0
+    """Frames that could not be parsed, or whose candle failed validation.
+
+    Counted immediately before the failure is re-raised, never instead of raising. A
+    malformed frame still stops the feed; this only records that it happened, so a day that
+    ended on bad data says so in its report rather than merely stopping.
+    """
+
     def record(self, **deltas: int) -> FeedMetrics:
         """Return a copy with the named counters incremented.
 
@@ -204,3 +213,26 @@ class FeedMetrics:
     def total_suppressed(self) -> int:
         """Return how many parsed candles were refused for any reason."""
         return self.forming_suppressed + self.duplicates_suppressed
+
+    def health_snapshot(self) -> FeedMetricsSnapshot:
+        """Return these counters in the vocabulary that crosses domain boundaries.
+
+        The mapping happens once, here, rather than in every reader. Neither a paper
+        session nor a report may import this package, so what travels outward is the
+        neutral :class:`~quantplatform.core.models.telemetry.FeedMetricsSnapshot` — and
+        that isolation is precisely what stops a session learning where its bars came from.
+
+        Returns:
+            An immutable reading of the feed's health at this instant.
+        """
+        return FeedMetricsSnapshot(
+            reconnect_count=self.reconnects,
+            heartbeat_timeouts=self.heartbeat_timeouts,
+            detected_gaps=self.gaps_detected,
+            rejected_frames=self.total_suppressed + self.malformed_frames,
+            malformed_frames=self.malformed_frames,
+            candles_received=self.candles_parsed,
+            candles_accepted=self.bars_emitted,
+            candles_rejected=self.total_suppressed,
+            duplicate_candles=self.duplicates_suppressed,
+        )

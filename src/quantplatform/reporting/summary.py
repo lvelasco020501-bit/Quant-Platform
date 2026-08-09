@@ -229,12 +229,12 @@ def render_markdown(report: DailyReport) -> str:
         (
             ("Bars processed (day)", str(statistics.bars_processed)),
             ("Bars rejected (session)", str(statistics.bars_rejected)),
-            ("Acceptance rate (session)", _optional_percent(statistics.acceptance_rate)),
+            ("Bar acceptance (session)", _optional_percent(statistics.acceptance_rate)),
             ("Runtime span (s)", _money(statistics.runtime_seconds)),
-            ("Reconnects", str(statistics.reconnect_count)),
-            ("Gaps", str(statistics.gap_count)),
-            ("Heartbeat failures", str(statistics.heartbeat_failures)),
-            ("Duplicate candles", str(statistics.duplicate_candles)),
+            ("Reconnects", str(statistics.daily_reconnects)),
+            ("Gaps", str(statistics.daily_gaps)),
+            ("Heartbeat failures", str(statistics.daily_heartbeat_failures)),
+            ("Duplicate candles", str(statistics.daily_duplicate_candles)),
             ("Out-of-order candles", str(statistics.out_of_order_candles)),
             ("Unknown symbols", str(statistics.unknown_symbols)),
             ("Missing bars", str(statistics.missing_bars)),
@@ -244,6 +244,7 @@ def render_markdown(report: DailyReport) -> str:
             ("Clock drift (s)", _optional(statistics.clock_drift_seconds)),
         ),
     )
+    lines += _feed_health_section(report)
     lines += _health_section(report)
     lines += _alert_section(report)
     lines += _comparison_section(report)
@@ -257,6 +258,57 @@ def _markdown_table(heading: str, rows: tuple[tuple[str, str], ...]) -> list[str
     lines += [f"| {name} | {value} |" for name, value in rows]
     lines.append("")
     return lines
+
+
+def _feed_health_section(report: DailyReport) -> list[str]:
+    """Render what the data stream did *today*.
+
+    Every counter here is a daily figure, obtained by subtracting the feed reading that
+    opened the day from the one that closed it. That distinction is the whole point of the
+    section heading: the feed's own counters never reset, so an operator reading a raw one
+    would see Monday's reconnects again on Friday.
+
+    Kept separate from the trading figures and from the wider health table because it
+    answers its own question: was the data this day traded on complete? A day can be
+    profitable and green on every process check while the feed dropped a quarter of what
+    the venue sent.
+
+    When no feed reading reached the report the section says so rather than printing
+    zeros. Zeros would read as a clean stream, and the whole point of measuring is to stop
+    an unmeasured day looking like a healthy one.
+    """
+    statistics = report.statistics
+    lines = ["## Feed health — daily", ""]
+    if not statistics.feed_metrics_available:
+        lines += [
+            "No feed metrics were supplied for this day, so stream health is unknown. "
+            "The counters below are not zero — they are unmeasured.",
+            "",
+        ]
+    rows = (
+        ("Reconnects", str(statistics.daily_reconnects)),
+        ("Heartbeat failures", str(statistics.daily_heartbeat_failures)),
+        ("Detected gaps", str(statistics.daily_gaps)),
+        ("Rejected frames", str(statistics.daily_rejected_frames)),
+        ("Malformed frames", str(statistics.daily_malformed_frames)),
+        ("Candles received", str(statistics.daily_candles_received)),
+        ("Candles accepted", str(statistics.daily_candles_accepted)),
+        ("Candles rejected", str(statistics.daily_candles_rejected)),
+        ("Duplicate candles", str(statistics.daily_duplicate_candles)),
+        ("Acceptance rate", _optional_percent(statistics.daily_feed_acceptance_rate)),
+        ("Overall feed status", _feed_status(report)),
+    )
+    lines += ["| Metric | Value |", "| --- | --- |"]
+    lines += [f"| {name} | {value} |" for name, value in rows]
+    lines.append("")
+    return lines
+
+
+def _feed_status(report: DailyReport) -> str:
+    """Return the one-word verdict on the data stream."""
+    if not report.statistics.feed_metrics_available:
+        return "unmeasured"
+    return report.health.feed_level.value
 
 
 def _health_section(report: DailyReport) -> list[str]:
@@ -336,6 +388,7 @@ def render_csv(report: DailyReport) -> str:
         "strategy_id": report.strategy_id,
         "timezone": report.timezone,
         "health": report.health.level.value,
+        "feed_status": _feed_status(report),
         "alerts": str(report.alerts.count),
     }
     for name, value in report.statistics.model_dump().items():

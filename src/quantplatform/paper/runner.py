@@ -13,8 +13,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 
-from quantplatform.core.errors import PaperSessionStateError
-from quantplatform.core.interfaces import PaperMarketDataFeed
+from quantplatform.core.errors import PaperSessionStateError, TelemetryNotConfiguredError
+from quantplatform.core.interfaces import (
+    FeedMetricsReader,
+    PaperMarketDataFeed,
+    StreamingMarketDataProvider,
+)
 from quantplatform.core.models.market import MarketBar
 from quantplatform.paper.results import SessionResult
 from quantplatform.paper.session import PaperTradingSession
@@ -32,6 +36,7 @@ class PaperTradingRunner:
         feed: PaperMarketDataFeed,
         max_bars: int | None = None,
         on_bar: Callable[[MarketBar], None] | None = None,
+        feed_metrics: FeedMetricsReader | None = None,
     ) -> None:
         """Wire a runner.
 
@@ -43,12 +48,26 @@ class PaperTradingRunner:
             on_bar: Optional observer called after each received bar, for progress reporting.
                 It cannot influence the session — it is handed the bar and its return value is
                 discarded — so a broken reporter cannot change a trading outcome.
+            feed_metrics: Reader of the feed's own health counters, handed to the session
+                before each bar so a daily report can describe the data it traded on.
+                Usually the feed itself. A separate port rather than a method on
+                :class:`~quantplatform.core.interfaces.PaperMarketDataFeed`, because a
+                deterministic replay has no health to report and forcing it to invent
+                counters would put fiction where a report expects measurement.
+
+        Raises:
+            TelemetryNotConfiguredError: If ``feed`` is a live streaming provider and no
+                reader was supplied. A replay may run without telemetry; a real stream may
+                not, because a run that cannot see its own data quality produces reports
+                that look clean for the wrong reason.
         """
         self._session = session
         self._feed = feed
         self._max_bars = max_bars
         self._on_bar = on_bar
+        self._feed_metrics = feed_metrics
         self._stopping = False
+        self._require_telemetry_for_live_feeds()
 
     @property
     def session(self) -> PaperTradingSession:
@@ -97,11 +116,47 @@ class PaperTradingRunner:
         for received, bar in enumerate(bars, start=1):
             if self._stopping:
                 break
+            self._refresh_feed_metrics()
             self._session.submit_bar(bar)
             if self._on_bar is not None:
                 self._on_bar(bar)
             if self._max_bars is not None and received >= self._max_bars:
                 break
+
+    def _require_telemetry_for_live_feeds(self) -> None:
+        """Refuse to drive a live stream that cannot report its own health.
+
+        The distinction is capability, not configuration. A feed that satisfies
+        :class:`~quantplatform.core.interfaces.StreamingMarketDataProvider` can drop, stall
+        and skip candles; one that does not — a replay, a recorded double — cannot. Only
+        the first kind can produce a report that looks healthy because nothing was measured,
+        and wiring time is the last moment where that is cheap to fix.
+
+        Raises:
+            TelemetryNotConfiguredError: If a streaming provider was supplied without a
+                reader.
+        """
+        if self._feed_metrics is not None:
+            return
+        if not isinstance(self._feed, StreamingMarketDataProvider):
+            return
+        raise TelemetryNotConfiguredError(
+            "a live market-data feed must be wired with a feed_metrics reader, so daily "
+            "reports describe the data the session actually traded on",
+            session_id=self._session.session_id,
+            feed=type(self._feed).__name__,
+        )
+
+    def _refresh_feed_metrics(self) -> None:
+        """Hand the session the feed's latest health reading, before the bar is offered.
+
+        Order matters. A day rollover is detected *inside* ``submit_bar``, so the snapshot
+        has to be in place before the first bar of a new day is submitted — refreshing
+        afterwards would report every day using the health reading from the day before.
+        """
+        if self._feed_metrics is None:
+            return
+        self._session.record_feed_metrics(self._feed_metrics.read_feed_metrics())
 
     def run_once(self, bar: MarketBar) -> None:
         """Offer a single bar without owning the loop.
@@ -116,4 +171,5 @@ class PaperTradingRunner:
             raise PaperSessionStateError(
                 "session is not running", session_id=self._session.session_id
             )
+        self._refresh_feed_metrics()
         self._session.submit_bar(bar)

@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from quantplatform.core.enums import AlertSeverity, OrderSide
+from quantplatform.core.errors import FeedTelemetryRegressionError
+from quantplatform.core.models.telemetry import ZERO_FEED_METRICS, FeedMetricsSnapshot
 from quantplatform.reporting.config import (
     AlertThresholds,
     ReportFormat,
@@ -29,6 +31,7 @@ from quantplatform.reporting.models import (
     DailyReport,
     DailySeries,
     DailyStatistics,
+    FeedDiagnostics,
     HealthCheckName,
     HealthLevel,
     RoundTrip,
@@ -276,7 +279,7 @@ def test_a_clean_day_is_green_across_every_check() -> None:
 
 
 def test_a_single_gap_turns_the_day_yellow() -> None:
-    health = _health(gap_count=1)
+    health = _health(daily_gaps=1)
 
     assert health.level is HealthLevel.YELLOW
     assert health.failing[0].name is HealthCheckName.GAP_COUNT
@@ -284,7 +287,7 @@ def test_a_single_gap_turns_the_day_yellow() -> None:
 
 def test_enough_gaps_turn_the_day_red() -> None:
     # A counter whose limit is zero cannot be exceeded by a factor, so it escalates by count.
-    health = _health(gap_count=3)
+    health = _health(daily_gaps=3)
 
     assert health.level is HealthLevel.RED
 
@@ -292,7 +295,7 @@ def test_enough_gaps_turn_the_day_red() -> None:
 def test_a_profitable_day_can_still_be_red() -> None:
     # Health and performance never blend: profit earned on a history the strategy never
     # fully saw is not evidence the strategy works.
-    health = _health(daily_pnl=Decimal(5_000), gap_count=9, acceptance_rate=Decimal("0.30"))
+    health = _health(daily_pnl=Decimal(5_000), daily_gaps=9, acceptance_rate=Decimal("0.30"))
 
     assert health.level is HealthLevel.RED
 
@@ -350,8 +353,8 @@ def test_a_quiet_day_raises_nothing() -> None:
     [
         ({"max_drawdown": Decimal("0.08")}, AlertCode.DRAWDOWN_EXCEEDED),
         ({"daily_pnl": Decimal(-900)}, AlertCode.LARGE_LOSS),
-        ({"gap_count": 2}, AlertCode.GAP_DETECTED),
-        ({"reconnect_count": 9}, AlertCode.MULTIPLE_RECONNECTS),
+        ({"daily_gaps": 2}, AlertCode.GAP_DETECTED),
+        ({"daily_reconnects": 9}, AlertCode.MULTIPLE_RECONNECTS),
         ({"missing_bars": 4}, AlertCode.MISSING_DATA),
         ({"runtime_exceptions": 1}, AlertCode.RUNTIME_EXCEPTION),
         ({"approved_orders": 1, "risk_rejections": 5}, AlertCode.RISK_REJECTION_SPIKE),
@@ -424,7 +427,7 @@ def test_the_summary_never_gives_investment_advice() -> None:
     statistics = _statistics(
         daily_pnl=Decimal(-4_000),
         max_drawdown=Decimal("0.4"),
-        gap_count=6,
+        daily_gaps=6,
         acceptance_rate=Decimal("0.2"),
         approved_orders=1,
         risk_rejections=9,
@@ -465,7 +468,7 @@ def test_a_quiet_day_is_called_out_as_an_anomaly() -> None:
 
 
 def test_markdown_carries_every_section() -> None:
-    text = render_markdown(_report(statistics=_statistics(gap_count=1)))
+    text = render_markdown(_report(statistics=_statistics(daily_gaps=1)))
 
     for heading in (
         "# Daily report",
@@ -521,3 +524,306 @@ def test_a_report_round_trips_through_json() -> None:
 def test_a_report_is_frozen() -> None:
     with pytest.raises(ValueError, match="frozen"):
         _report().day = date(2026, 2, 2)  # type: ignore[misc]
+
+
+# --- Feed telemetry ----------------------------------------------------------------------------
+
+
+def _snapshot(**overrides: object) -> FeedMetricsSnapshot:
+    defaults: dict[str, object] = {
+        "candles_received": 100,
+        "candles_accepted": 100,
+    }
+    return FeedMetricsSnapshot(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def test_diagnostics_take_every_field_the_feed_can_measure() -> None:
+    # The defect this phase closes: before, these all defaulted to zero and a day with
+    # eleven reconnects reported a clean stream.
+    snapshot = FeedMetricsSnapshot(
+        reconnect_count=4,
+        heartbeat_timeouts=2,
+        detected_gaps=3,
+        rejected_frames=30,
+        malformed_frames=5,
+        candles_received=100,
+        candles_accepted=75,
+        candles_rejected=25,
+        duplicate_candles=10,
+    )
+
+    diagnostics = FeedDiagnostics.from_feed_metrics(snapshot)
+
+    assert diagnostics.reconnects == 4
+    assert diagnostics.heartbeat_failures == 2
+    assert diagnostics.gaps_detected == 3
+    assert diagnostics.duplicate_candles == 10
+    assert diagnostics.rejected_frames == 30
+    assert diagnostics.malformed_frames == 5
+    assert diagnostics.candles_received == 100
+    assert diagnostics.candles_accepted == 75
+    assert diagnostics.candles_rejected == 25
+    assert diagnostics.feed_acceptance_rate == Decimal("0.75")
+
+
+def test_fields_the_feed_cannot_measure_stay_at_their_defaults() -> None:
+    # A feed cannot count a broker rejection or a clock drift. Leaving them defaulted is
+    # honest; filling them from the snapshot would be inventing numbers.
+    diagnostics = FeedDiagnostics.from_feed_metrics(_snapshot())
+
+    assert diagnostics.out_of_order_candles == 0
+    assert diagnostics.broker_rejections == 0
+    assert diagnostics.clock_drift_seconds is None
+
+
+def test_observations_the_feed_cannot_make_are_carried_alongside_it() -> None:
+    diagnostics = FeedDiagnostics.from_feed_metrics(
+        _snapshot(), broker_rejections=3, clock_drift_seconds=Decimal(7)
+    )
+
+    assert diagnostics.broker_rejections == 3
+    assert diagnostics.clock_drift_seconds == Decimal(7)
+    assert diagnostics.candles_received == 100
+
+
+def test_an_acceptance_rate_over_no_candles_is_undefined() -> None:
+    assert FeedDiagnostics().feed_acceptance_rate is None
+
+
+def test_the_feed_status_ignores_checks_that_are_not_about_the_stream() -> None:
+    # An operator asking "can I trust today's data" does not care that the session
+    # restarted; that is a different question with a different answer.
+    statistics = _statistics(
+        acceptance_rate=Decimal(1), session_interruptions=9, clock_drift_seconds=Decimal(99)
+    )
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+
+    assert health.level is HealthLevel.RED
+    assert health.feed_level is HealthLevel.GREEN
+
+
+def test_the_feed_status_turns_red_on_a_stream_fault() -> None:
+    statistics = _statistics(acceptance_rate=Decimal(1), daily_gaps=9)
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+
+    assert health.feed_level is HealthLevel.RED
+
+
+def test_markdown_carries_a_feed_health_section() -> None:
+    text = render_markdown(
+        _report(
+            statistics=_statistics(
+                acceptance_rate=Decimal("0.75"),
+                daily_reconnects=4,
+                daily_heartbeat_failures=2,
+                daily_gaps=3,
+                daily_rejected_frames=30,
+                daily_malformed_frames=5,
+                daily_candles_received=100,
+                daily_candles_accepted=75,
+                daily_candles_rejected=25,
+                feed_metrics_available=True,
+            )
+        )
+    )
+
+    assert "## Feed health" in text
+    for row in (
+        "| Reconnects | 4 |",
+        "| Heartbeat failures | 2 |",
+        "| Detected gaps | 3 |",
+        "| Rejected frames | 30 |",
+        "| Malformed frames | 5 |",
+        "| Candles received | 100 |",
+        "| Candles accepted | 75 |",
+        "| Candles rejected | 25 |",
+    ):
+        assert row in text, row
+    assert "| Overall feed status | red |" in text
+
+
+def test_a_day_without_feed_metrics_says_unmeasured_rather_than_showing_zeros() -> None:
+    # Zeros beside no measurement read as a clean stream. That was the whole defect.
+    text = render_markdown(_report(statistics=_statistics(acceptance_rate=Decimal(1))))
+
+    assert "| Overall feed status | unmeasured |" in text
+    assert "they are unmeasured" in text
+
+
+def test_a_measured_clean_day_reads_green_not_unmeasured() -> None:
+    text = render_markdown(
+        _report(
+            statistics=_statistics(
+                acceptance_rate=Decimal(1),
+                daily_candles_received=50,
+                daily_candles_accepted=50,
+                feed_metrics_available=True,
+            )
+        )
+    )
+
+    assert "| Overall feed status | green |" in text
+    assert "they are unmeasured" not in text
+
+
+def test_csv_carries_the_feed_columns_and_status() -> None:
+    text = render_csv(
+        _report(
+            statistics=_statistics(
+                daily_reconnects=4,
+                daily_malformed_frames=5,
+                daily_candles_received=100,
+                daily_candles_accepted=75,
+                daily_candles_rejected=25,
+                daily_rejected_frames=30,
+                feed_metrics_available=True,
+                acceptance_rate=Decimal("0.75"),
+            )
+        )
+    )
+    header, row = (line.split(",") for line in text.strip().split("\n"))
+    values = dict(zip(header, row, strict=True))
+
+    assert values["feed_status"] == "yellow"
+    assert values["daily_reconnects"] == "4"
+    assert values["daily_malformed_frames"] == "5"
+    assert values["daily_candles_received"] == "100"
+    assert values["daily_candles_accepted"] == "75"
+    assert values["daily_candles_rejected"] == "25"
+    assert values["daily_rejected_frames"] == "30"
+    assert values["feed_metrics_available"] == "True"
+
+
+def test_the_feed_fields_survive_a_json_round_trip() -> None:
+    original = _report(
+        statistics=_statistics(
+            daily_reconnects=4,
+            daily_malformed_frames=5,
+            daily_candles_received=100,
+            daily_candles_accepted=75,
+            daily_candles_rejected=25,
+            daily_rejected_frames=30,
+            feed_metrics_available=True,
+        )
+    )
+
+    restored = DailyReport.model_validate_json(original.model_dump_json())
+
+    assert restored == original
+    assert restored.statistics.daily_malformed_frames == 5
+    assert restored.statistics.feed_metrics_available is True
+
+
+# --- Daily deltas ------------------------------------------------------------------------------
+
+
+def test_a_day_delta_subtracts_every_additive_counter() -> None:
+    opening = FeedMetricsSnapshot(
+        reconnect_count=3,
+        heartbeat_timeouts=2,
+        detected_gaps=1,
+        rejected_frames=10,
+        malformed_frames=4,
+        candles_received=100,
+        candles_accepted=80,
+        candles_rejected=6,
+        duplicate_candles=2,
+    )
+    closing = FeedMetricsSnapshot(
+        reconnect_count=5,
+        heartbeat_timeouts=2,
+        detected_gaps=4,
+        rejected_frames=25,
+        malformed_frames=9,
+        candles_received=250,
+        candles_accepted=200,
+        candles_rejected=16,
+        duplicate_candles=7,
+    )
+
+    daily = closing.delta_since(opening)
+
+    assert daily.reconnect_count == 2
+    assert daily.heartbeat_timeouts == 0
+    assert daily.detected_gaps == 3
+    assert daily.rejected_frames == 15
+    assert daily.malformed_frames == 5
+    assert daily.candles_received == 150
+    assert daily.candles_accepted == 120
+    assert daily.candles_rejected == 10
+    assert daily.duplicate_candles == 5
+
+
+def test_the_first_day_measures_from_zero() -> None:
+    # No previous baseline means the first report covers everything since the session began,
+    # not nothing at all.
+    closing = FeedMetricsSnapshot(reconnect_count=4, candles_received=9, candles_accepted=9)
+
+    assert closing.delta_since(ZERO_FEED_METRICS) == closing
+
+
+def test_a_daily_acceptance_rate_is_recomputed_not_differenced() -> None:
+    # The change in a ratio is not the ratio of the change. Yesterday 100% and today 50%
+    # does not make today's rate -50%.
+    opening = FeedMetricsSnapshot(candles_received=100, candles_accepted=100)
+    closing = FeedMetricsSnapshot(candles_received=200, candles_accepted=150)
+
+    daily = closing.delta_since(opening)
+
+    assert opening.acceptance_rate == Decimal(1)
+    assert daily.candles_received == 100
+    assert daily.acceptance_rate == Decimal("0.5")
+
+
+def test_a_quiet_day_has_an_undefined_acceptance_rate() -> None:
+    steady = FeedMetricsSnapshot(candles_received=50, candles_accepted=50)
+
+    assert steady.delta_since(steady).acceptance_rate is None
+
+
+def test_a_counter_that_went_backwards_is_refused() -> None:
+    # Counters only climb. A smaller reading means the two do not describe one continuous
+    # run, and subtracting anyway would put a negative count in a report.
+    opening = FeedMetricsSnapshot(reconnect_count=9, candles_received=10, candles_accepted=10)
+    closing = FeedMetricsSnapshot(reconnect_count=2, candles_received=20, candles_accepted=20)
+
+    with pytest.raises(FeedTelemetryRegressionError, match="moved backwards") as caught:
+        closing.delta_since(opening)
+    assert caught.value.details["counters"] == ["reconnect_count"]
+
+
+def test_the_zero_baseline_is_a_clean_snapshot() -> None:
+    assert ZERO_FEED_METRICS.is_clean is True
+    assert ZERO_FEED_METRICS.acceptance_rate is None
+
+
+def test_daily_statistics_name_their_window() -> None:
+    # The rename is the fix: nothing on DailyStatistics carries a cumulative feed counter
+    # under a name that reads like a daily one.
+    fields = set(DailyStatistics.model_fields)
+
+    assert {"daily_reconnects", "daily_gaps", "daily_candles_received"} <= fields
+    assert "reconnect_count" not in fields
+    assert "gap_count" not in fields
+    assert "candles_received" not in fields
+
+
+def test_feed_stability_prefers_the_measured_daily_rate() -> None:
+    measured = _statistics(
+        acceptance_rate=Decimal(1),
+        daily_feed_acceptance_rate=Decimal("0.20"),
+        feed_metrics_available=True,
+    )
+    unmeasured = _statistics(acceptance_rate=Decimal(1), daily_feed_acceptance_rate=Decimal("0.20"))
+
+    assert measured.observed_acceptance_rate == Decimal("0.20")
+    assert unmeasured.observed_acceptance_rate == Decimal(1)
+
+
+def test_markdown_names_the_feed_section_daily() -> None:
+    text = render_markdown(
+        _report(statistics=_statistics(daily_reconnects=2, feed_metrics_available=True))
+    )
+
+    assert "## Feed health — daily" in text
+    assert "| Reconnects | 2 |" in text

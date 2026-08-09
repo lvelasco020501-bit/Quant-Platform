@@ -21,6 +21,9 @@ dependencies = [
     # design, and introducing an event loop underneath them would trade that determinism
     # for nothing the feed needs.
     "websockets>=14.1,<16",
+    # Static PNG report charts only. Used through the object-oriented Figure/Agg API rather
+    # than pyplot, so no global backend state is set and no GUI is ever initialised.
+    "matplotlib>=3.9,<4",
 ]
 
 [project.scripts]

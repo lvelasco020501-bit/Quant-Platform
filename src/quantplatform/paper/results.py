@@ -62,6 +62,14 @@ class RuntimeMetrics:
     fills_received: int = 0
     state_saves: int = 0
     restarts: int = 0
+    report_failures: int = 0
+    """Day-rollover observers that raised and were contained.
+
+    An observer is purely observational, so one that breaks must not take a week-long
+    session down with it. Containing the failure silently would be worse than the crash,
+    though, so it is counted here and surfaces in the session's own reporting.
+    """
+
     last_bar_close_time: datetime | None = None
     last_processed_at: datetime | None = None
 

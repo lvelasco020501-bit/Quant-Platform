@@ -19,10 +19,11 @@ from quantplatform.paper.results import (
     SessionStatus,
 )
 from quantplatform.paper.runner import PaperTradingRunner
-from quantplatform.paper.session import PaperTradingSession
+from quantplatform.paper.session import DayRolloverObserver, PaperTradingSession
 from quantplatform.paper.state import InMemoryPaperStateRepository, restore_balances
 
 __all__ = [
+    "DayRolloverObserver",
     "InMemoryPaperStateRepository",
     "PaperTradingRunner",
     "PaperTradingSession",

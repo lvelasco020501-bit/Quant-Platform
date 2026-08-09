@@ -31,6 +31,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "orchestration",
         "paper",
         "portfolio",
+        "reporting",
         "research",
         "risk",
         "storage",
@@ -71,6 +72,11 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
             "strategies",
         }
     ),
+    # Reporting observes a finished session and writes files. It reads the paper session's
+    # own record of itself and the backtesting metrics that record is expressed in, and
+    # reaches nothing else — notably not the engines whose behaviour it describes, so there
+    # is no path from a report back into a trading decision.
+    "reporting": frozenset({"core", "config", "paper", "backtesting"}),
     "execution": frozenset({"core", "config"}),
     "storage": frozenset({"core", "config"}),
     "monitoring": frozenset({"core", "config"}),
@@ -575,6 +581,105 @@ def test_marketdata_reads_no_wall_clock() -> None:
         source = path.read_text(encoding="utf-8")
         for token in _WALL_CLOCK_READS:
             assert token not in source, f"{path.name} reads the wall clock via {token}"
+
+
+# --- Reporting boundaries -------------------------------------------------------------------
+
+_REPORTING_ALLOWED: Final[frozenset[str]] = frozenset(
+    {"core", "config", "paper", "backtesting", "reporting"}
+)
+
+_REPORTING_FORBIDDEN: Final[frozenset[str]] = frozenset(
+    {"execution", "portfolio", "risk", "strategies", "marketdata", "storage", "data", "api", "cli"}
+)
+"""Packages a report must never reach for.
+
+Reporting describes what the engines did; it must not be able to call one. Reading a
+:class:`~quantplatform.paper.results.SessionResult` is enough to say what happened, and
+anything more would put an observer inside the thing it is observing.
+"""
+
+_REPORTING_MUTATORS: Final[frozenset[str]] = frozenset(
+    {
+        "submit",
+        "cancel",
+        "apply_fill",
+        "reserve",
+        "release",
+        "evaluate",
+        "generate",
+        "advance",
+        "begin",
+        "run",
+    }
+)
+"""Pipeline verbs. A report that defined one would be driving rather than observing."""
+
+
+def _reporting_files() -> tuple[Path, ...]:
+    return tuple(path for path in _source_files() if _domain_of(path) == "reporting")
+
+
+def test_reporting_depends_only_on_the_session_record_and_the_domain() -> None:
+    for path in _reporting_files():
+        violations = sorted(_imported_domains(path) - _REPORTING_ALLOWED)
+        assert not violations, f"{path.relative_to(PACKAGE_ROOT)} may not import {violations}"
+
+
+def test_reporting_never_reaches_an_engine_it_describes() -> None:
+    for path in _reporting_files():
+        forbidden = sorted(_imported_domains(path) & _REPORTING_FORBIDDEN)
+        assert not forbidden, f"{path.relative_to(PACKAGE_ROOT)} may not import {forbidden}"
+
+
+def test_reporting_never_imports_sqlalchemy_or_a_network_client() -> None:
+    # A report is a file on disk. Reaching a database or a venue from here would make
+    # observing a session something that can fail in the ways trading fails.
+    for path in _reporting_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            roots = _imported_root_modules(node)
+            forbidden = roots & {
+                "sqlalchemy",
+                "alembic",
+                "psycopg",
+                "redis",
+                "requests",
+                "httpx",
+                "aiohttp",
+                "websockets",
+                "ccxt",
+            }
+            assert not forbidden, f"{path.name} may not import {sorted(forbidden)}"
+
+
+def test_reporting_defines_no_pipeline_operation() -> None:
+    # Observation enforced by vocabulary: the package cannot drive the chain because
+    # nothing in it can name a step of the chain.
+    for path in _reporting_files():
+        offenders = sorted(_defined_names(path) & _REPORTING_MUTATORS)
+        assert not offenders, f"{path.name} defines {offenders}"
+
+
+def test_nothing_the_platform_trades_with_imports_reporting() -> None:
+    # The direction that matters. If paper, backtesting, risk, execution or portfolio could
+    # import reporting there would be a path from a report back into a decision, and every
+    # report would become a description partly of itself.
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain in {"orchestration", "api", "cli", "reporting"} or domain is None:
+            continue
+        assert "reporting" not in _imported_domains(path), (
+            f"{path.relative_to(PACKAGE_ROOT)} may not import reporting"
+        )
+
+
+def test_the_day_rollover_observer_is_the_only_seam_into_the_session() -> None:
+    # Phase 7B adds exactly one hook to a committed session, and it is a port the session
+    # calls rather than a dependency it acquires.
+    session = PACKAGE_ROOT / "paper" / "session.py"
+    assert "DayRolloverObserver" in session.read_text(encoding="utf-8")
+    assert "reporting" not in _imported_domains(session)
 
 
 def test_paper_consumes_the_live_feed_through_the_port_not_by_importing_it() -> None:

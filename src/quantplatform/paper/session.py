@@ -28,8 +28,9 @@ strategy. None of them require a change here, and none are implemented in this p
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from typing import Protocol, runtime_checkable
 
 from quantplatform.backtesting.config import BacktestConfig
 from quantplatform.backtesting.engine import BacktestEngine, RunState
@@ -51,7 +52,39 @@ from quantplatform.paper.results import (
 )
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 
-__all__ = ["PaperTradingSession"]
+__all__ = ["DayRolloverObserver", "PaperTradingSession"]
+
+
+@runtime_checkable
+class DayRolloverObserver(Protocol):
+    """Notified once when a session crosses from one reporting day into the next.
+
+    Strictly observational: it is handed a finished day and its return value is discarded,
+    so nothing it does can reach a strategy, a risk decision, a broker or the account. That
+    is the whole contract — a reporting layer that could influence trading would make every
+    report a description of itself.
+
+    **Implementations must not raise.** The session contains a failure rather than letting a
+    reporter take down a run that has been going for a week, and counts it in
+    :attr:`~quantplatform.paper.results.RuntimeMetrics.report_failures` so containment is
+    not the same as silence.
+
+    The observer owns the definition of a "day" through :meth:`day_of`. Time-zone policy is
+    a reporting concern, and a session that decided it would be making a reporting decision.
+    """
+
+    def day_of(self, moment: datetime) -> date:
+        """Return the reporting day a UTC instant belongs to."""
+        ...
+
+    def on_day_rollover(self, *, completed_day: date, result: SessionResult) -> None:
+        """Handle a day that has just finished.
+
+        Args:
+            completed_day: The day that ended, as returned by :meth:`day_of`.
+            result: Everything the session has produced up to the rollover.
+        """
+        ...
 
 
 class PaperTradingSession:
@@ -69,6 +102,7 @@ class PaperTradingSession:
         state_repository: PaperStateRepository | None = None,
         close_grace_seconds: int = 0,
         save_every_bar: bool = True,
+        day_rollover_observer: DayRolloverObserver | None = None,
     ) -> None:
         """Wire a session.
 
@@ -83,6 +117,8 @@ class PaperTradingSession:
             close_grace_seconds: Time beyond a bar's close before it counts as final.
             save_every_bar: Persist after each processed bar. Off means a crash loses
                 everything since the last explicit :meth:`save`.
+            day_rollover_observer: Notified when a bar begins a new reporting day. Purely
+                observational and cannot influence the pipeline.
         """
         self._session_id = session_id
         self._engine = engine
@@ -92,6 +128,7 @@ class PaperTradingSession:
         self._clock = SessionClock(clock, close_grace_seconds=close_grace_seconds)
         self._repository = state_repository
         self._save_every_bar = save_every_bar
+        self._rollover_observer = day_rollover_observer
 
         self._state: RunState | None = None
         self._running = False
@@ -239,6 +276,8 @@ class PaperTradingSession:
             self._metrics.bars_rejected += 1
             return None
 
+        self._notify_rollover(bar)
+
         try:
             outcome = self._engine.advance(bar, self._state)
         except DataIntegrityError:
@@ -252,6 +291,30 @@ class PaperTradingSession:
         if self._save_every_bar:
             self.save()
         return outcome
+
+    def _notify_rollover(self, bar: MarketBar) -> None:
+        """Tell the observer a day finished, if this bar starts a new one.
+
+        Called after the bar has been accepted but *before* it is processed, so the day it
+        closes off is reported exactly as it ended. Doing it afterwards would fold the first
+        bar of the new day into the previous day's figures.
+
+        A failure here is contained rather than propagated: the observer is an onlooker, and
+        a broken reporter must not stop a session from trading. The failure is counted, so
+        containment does not become silence.
+        """
+        observer = self._rollover_observer
+        if observer is None or self._last_bar is None:
+            return
+        try:
+            previous_day = observer.day_of(self._last_bar.close_time)
+            if observer.day_of(bar.close_time) == previous_day:
+                return
+            observer.on_day_rollover(completed_day=previous_day, result=self.result())
+        except Exception:
+            # Deliberately broad: an onlooker may fail in any way it likes, and none of them
+            # are the session's problem.
+            self._metrics.report_failures += 1
 
     def _is_actionable(self, bar: MarketBar) -> bool:
         """Return whether a bar may be acted on now."""
@@ -383,6 +446,7 @@ class _MutableMetrics:
         self.fills_received = 0
         self.state_saves = 0
         self.restarts = 0
+        self.report_failures = 0
         self.last_bar_close_time: datetime | None = None
         self.last_processed_at: datetime | None = None
 
@@ -400,6 +464,7 @@ class _MutableMetrics:
             fills_received=self.fills_received,
             state_saves=self.state_saves,
             restarts=self.restarts,
+            report_failures=self.report_failures,
             last_bar_close_time=self.last_bar_close_time,
             last_processed_at=self.last_processed_at,
         )

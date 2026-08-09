@@ -191,6 +191,7 @@ import fails the build rather than being caught in review.
 | `portfolio` | Balances, positions, PnL, immutable snapshots |
 | `execution` | Simulated, paper, shadow and live execution adapters |
 | `backtesting` | Deterministic, look-ahead-free simulation |
+| `reporting` | Daily reports, health scoring, alerts, charts — observation only |
 | `research` | Offline parameter and robustness studies |
 | `storage` | SQLAlchemy models, repositories, Alembic migrations |
 | `orchestration` | Composition root and the runtime pipeline |
@@ -569,6 +570,60 @@ and behave exactly as they would over a real hour.
 **Still simulated: execution.** Bars flow into the same simulated broker and virtual portfolio
 as ever. This phase makes the market data real and nothing else.
 
+### Phase 7B: daily reporting and monitoring
+
+`quantplatform.reporting` observes. It reads a finished day out of a `SessionResult` and
+writes value objects, files and pictures. It holds no reference to a strategy, a risk engine,
+a broker or a portfolio, and there is no path from anything in it back into a trading
+decision — an architecture test asserts that no package the platform trades with may import
+`reporting` at all, so "observability cannot influence trading" is a property of the import
+graph rather than a promise.
+
+**One seam into the session.** `PaperTradingSession` gained a single optional
+`DayRolloverObserver`, called when an accepted bar starts a new reporting day and *before*
+that bar is processed, so the day it closes off is reported exactly as it ended. The observer
+owns the definition of a day, because time-zone policy is a reporting concern. A failure in
+the observer is contained and counted in `RuntimeMetrics.report_failures`: a session that has
+been trading for a week must not die because a disk filled at midnight, and containing a
+failure silently would be worse than the crash.
+
+**Two questions, kept apart.** *How did it trade* — PnL, win rate, drawdown, Sharpe, Sortino,
+expectancy, profit factor, commission, slippage — and *is the output worth believing* — feed
+stability, gaps, reconnects, heartbeat failures, rejection ratios, clock drift. A profitable
+day that dropped a third of its candles is graded **red**, because the profit was earned on a
+history the strategy never fully saw. A single blended score would let that pass.
+
+**The same formulas as the run.** Daily Sharpe, Sortino, drawdown and return are computed by
+`compute_performance` — the very function the run-level metrics use — over the day's own
+equity curve, with drawdown recomputed against the *day's* peak rather than the run's. A
+second implementation for the daily case would be two definitions that must agree forever and
+eventually would not. A metric that could not be computed is `None`, never zero.
+
+**Round trips, not fills.** A trade is a position lifecycle that ended, reconstructed from
+fills at average cost to match the portfolio engine's own basis, and attributed to the day it
+*closed*. An entry still open has no outcome to be right or wrong about. An integration test
+asserts the reconstruction agrees with the engine's own `realized_pnl`.
+
+**Health and alerts.** Nine independent checks (feed stability, gaps, heartbeat failures,
+runtime exceptions, reconnects, order-rejection ratio, missing bars, session interruptions,
+clock drift) grade GREEN/YELLOW/RED, and the day takes the worst. A check with nothing to
+measure reports itself *skipped* rather than passing — clock drift is the standing example,
+since nothing measures it yet. Eleven alert conditions cover drawdown, large loss, gaps,
+reconnects, missing data, rejection spikes, runtime exceptions, low acceptance and abnormal
+slippage or commission.
+
+**Output.** `reports/YYYY/MM/DD/` holding `daily.json`, `daily.csv`, `daily.md` and six PNG
+charts (equity, drawdown, returns, PnL by trade, trade distribution, exposure). JSON is the
+canonical form and the only one read back, because it is the only one that round-trips. Charts
+are drawn through matplotlib's object-oriented `Figure`/Agg API — no pyplot, no global backend
+state, no GUI. Retention is **opt-in and never automatic**: deleting an audit trail is not
+something a write should do as a side effect.
+
+**Operational observations only.** The summary says what a process did and what an operator
+might check. It never says what to trade, how much to hold, or whether a strategy is worth
+running — those are investment opinions a reporting layer is in no position to offer. A test
+enforces the vocabulary.
+
 ### Execution modes
 
 | Mode | Market data | Orders |
@@ -638,6 +693,24 @@ supports it, and be distinct from paper or testnet credentials.
 - **No historical backfill on connect.** A feed starts from the next candle the venue
   publishes. Warming a strategy's history from a REST endpoint before streaming begins is not
   implemented, so a session must accumulate its own warm-up bars.
+- **Some report counters are session-cumulative, not daily.** The session records a rejected
+  bar without attributing it to a day, so `bars_rejected`, `acceptance_rate`,
+  `session_interruptions` and `report_failures` describe the session as of the rollover.
+  Feed counters cover whatever window the caller measured. Each field says which it is;
+  inventing day-scoped values would read better and be less true.
+- **Feed diagnostics are supplied, not derived.** The session cannot see its own data source
+  — the property Phase 7A exists to preserve — so reconnects, gaps and heartbeat failures
+  reach a report only if a composition root passes them in. Nothing wires
+  `marketdata.FeedMetrics` to `reporting.FeedDiagnostics` yet.
+- **Out-of-order candles, unknown symbols and runtime exceptions have no counters.** The feed
+  raises on those rather than counting them, so those report fields are non-zero only if an
+  error handler further out recorded them.
+- **Clock drift is never measured.** Nothing in the platform compares local time to the
+  venue's, so that health check always reports itself skipped.
+- **A report is only as timely as the next bar.** Rollover is detected when a bar arrives, so
+  a session that stops receiving candles at 23:00 emits nothing for that day until it does.
+- **Charts are rendered at write time, single-threaded.** Six PNGs per day is fine at daily
+  cadence and would not be at bar cadence.
 - **Backtests hold no state between runs.** A `BacktestResult` is returned, never persisted,
   and the engine cannot resume an interrupted run.
 - **One strategy per run.** Portfolio-level allocation across several strategies is not

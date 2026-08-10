@@ -38,3 +38,7 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# Paper-trading runtime artefacts: reports, session state and logs.
+# Operational output of a run, never source; a 7-day session writes here continuously.
+var/

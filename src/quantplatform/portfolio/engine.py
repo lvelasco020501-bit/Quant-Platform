@@ -39,6 +39,7 @@ from quantplatform.core.ids import deterministic_uuid
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.orders import Fill
 from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
+from quantplatform.core.symbol_rules import as_symbol_rules_store
 
 __all__ = ["FillApplicationResult", "SpotPortfolioEngine"]
 
@@ -159,7 +160,11 @@ class SpotPortfolioEngine:
             quote_asset: The single asset every position's cost basis, realised PnL and fees
                 are denominated in. A fill for a symbol whose quote asset differs is rejected.
             symbols: Identity metadata (base asset, quote asset, market type) for every
-                symbol this engine may be asked to account for.
+                symbol this engine may be asked to account for. A shared
+                :class:`~quantplatform.core.symbol_rules.SymbolRulesStore` is held by
+                reference, so a refresh reaches this component; any other mapping is copied
+                into one, so a caller mutating its own dictionary cannot alter what is
+                traded against.
             execution_mode: Mode recorded on every snapshot this engine produces.
             initial_balances: Starting asset balances, for example seed cash. Every base-asset
                 balance among these must have zero total.
@@ -169,7 +174,7 @@ class SpotPortfolioEngine:
             InconsistentSeedStateError: If a base-asset balance has a nonzero total.
         """
         self._quote_asset = quote_asset
-        self._symbols = dict(symbols)
+        self._symbols = as_symbol_rules_store(symbols)
         self._execution_mode = execution_mode
         self._source = source
         self._balances: dict[str, Balance] = {

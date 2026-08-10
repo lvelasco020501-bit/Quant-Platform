@@ -13,8 +13,14 @@ from __future__ import annotations
 
 from quantplatform.features.pipeline import (
     CompositeFeaturePipeline,
+    ExponentialMovingAverageFeatures,
     MovingAverageFeatures,
     NullFeaturePipeline,
 )
 
-__all__ = ["CompositeFeaturePipeline", "MovingAverageFeatures", "NullFeaturePipeline"]
+__all__ = [
+    "CompositeFeaturePipeline",
+    "ExponentialMovingAverageFeatures",
+    "MovingAverageFeatures",
+    "NullFeaturePipeline",
+]

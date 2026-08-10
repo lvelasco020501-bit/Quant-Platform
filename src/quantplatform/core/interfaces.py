@@ -33,7 +33,7 @@ from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Posi
 from quantplatform.core.models.risk import RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
-from quantplatform.core.models.telemetry import FeedMetricsSnapshot
+from quantplatform.core.models.telemetry import FeedMetricsSnapshot, SymbolRulesTelemetry
 
 __all__ = [
     "CandleStreamTransport",
@@ -52,6 +52,8 @@ __all__ = [
     "SettlementLedger",
     "Strategy",
     "StreamingMarketDataProvider",
+    "SymbolRulesMaintainer",
+    "SymbolRulesProvider",
 ]
 
 
@@ -180,6 +182,72 @@ class FeedMetricsReader(Protocol):
 
         Cumulative, never reset: a caller wanting a window subtracts two readings. A feed
         that reset its own counters would erase any window nobody had reported yet.
+        """
+        ...
+
+
+@runtime_checkable
+class SymbolRulesProvider(Protocol):
+    """Anything that can read the venue's current trading rules.
+
+    Read-only, and narrowly so. Fetching what a venue will accept requires no credential
+    and touches no account: a public metadata endpoint answers it. Nothing in this protocol
+    can place, cancel or inspect an order, and an implementation that needed an API key to
+    satisfy it would be answering a different question than the one being asked.
+
+    Batched on purpose. Venues publish every instrument's rules in one document and rate
+    limit by request, so asking for six symbols individually costs six times as much as
+    asking once and is six times as likely to be throttled partway through.
+
+    Distinct from :meth:`MarketDataProvider.fetch_symbol_rules`, which is asynchronous and
+    belongs to the historical data path. A paper session's refresh loop is synchronous —
+    the platform runs no event loop — and bridging the two would mean starting one just to
+    make a metadata call.
+    """
+
+    def fetch(self, symbols: Sequence[str]) -> Mapping[str, SymbolRules]:
+        """Return current venue rules for every requested symbol.
+
+        Args:
+            symbols: Canonical symbols to describe.
+
+        Returns:
+            The rules, keyed by canonical symbol, each stamped with the time it was read.
+
+        Raises:
+            DataProviderError: If the venue could not be reached or its answer was
+                unreadable.
+            DataIntegrityError: If the answer was readable but did not describe usable
+                rules. Defaulting a missing limit would size orders against a number the
+                venue never published, so an implementation must raise instead.
+        """
+        ...
+
+
+@runtime_checkable
+class SymbolRulesMaintainer(Protocol):
+    """Whatever keeps the venue's trading rules current during a long run.
+
+    The seam between a loop that pumps bars and a policy that decides when rules have aged
+    enough to re-fetch. The runner calls this and forwards the reading; it never learns what
+    a refresh interval is, and the trading components below it never learn that refreshing
+    happens at all — they read the shared store and see whatever is currently in it.
+
+    One call does both jobs deliberately. Refreshing and reading as separate steps could
+    interleave with a replacement and report an age that belongs to neither the old rules
+    nor the new ones.
+    """
+
+    def maintain(self) -> SymbolRulesTelemetry:
+        """Refresh the rules if they are due, and report the state of the mechanism.
+
+        Must not raise on a failed refresh. A venue that is briefly unreachable is an
+        ordinary event; the previous rules stay in force, the failure is counted, and the
+        risk engine's freshness check remains the thing that decides whether trading may
+        continue.
+
+        Returns:
+            The current reading, whether or not a refresh happened on this call.
         """
         ...
 

@@ -108,6 +108,87 @@ class MovingAverageFeatures:
         return features
 
 
+class ExponentialMovingAverageFeatures:
+    """Exponential moving averages of the closing price, one per configured period.
+
+    Emits ``ema_<period>`` for each period, plus ``close`` for the bar being decided on.
+
+    **Seeded from a simple average, not from the first close.** The recursive form has to
+    start somewhere, and starting from a single price makes the early values depend heavily
+    on one bar. Seeding with the simple mean of the first ``period`` closes and recursing
+    from there is the conventional choice and, more importantly here, a deterministic one:
+    the same window always produces the same number, with no warm-up state carried between
+    calls. A period longer than the window is omitted rather than approximated.
+    """
+
+    def __init__(self, periods: Sequence[int]) -> None:
+        """Configure the periods to compute.
+
+        Args:
+            periods: Strictly positive lookbacks, in bars.
+
+        Raises:
+            ConfigurationError: If a period is not strictly positive, or none were given.
+        """
+        if not periods:
+            raise ConfigurationError("an exponential-average pipeline needs at least one period")
+        if any(period <= 0 for period in periods):
+            raise ConfigurationError(
+                "exponential-average periods must be strictly positive", periods=list(periods)
+            )
+        self._periods = tuple(sorted(set(periods)))
+
+    @property
+    def periods(self) -> tuple[int, ...]:
+        """Return the configured periods, ascending and deduplicated."""
+        return self._periods
+
+    @property
+    def feature_names(self) -> Sequence[str]:
+        """Return ``close`` followed by one ``ema_<period>`` name per period."""
+        return ("close", *(f"ema_{period}" for period in self._periods))
+
+    @property
+    def required_history(self) -> int:
+        """Return the longest configured period: the shortest window computing every feature."""
+        return self._periods[-1]
+
+    def compute(self, bars: Sequence[MarketBar]) -> Mapping[str, Decimal]:
+        """Return the closing price and every computable exponential average.
+
+        Args:
+            bars: Closed bars in ascending open-time order.
+
+        Returns:
+            ``close`` plus one entry per period the window is long enough to support.
+        """
+        if not bars:
+            return {}
+        closes = [bar.close for bar in bars]
+        features: dict[str, Decimal] = {"close": closes[-1]}
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            for period in self._periods:
+                if len(closes) < period:
+                    continue
+                features[f"ema_{period}"] = _exponential_average(closes, period)
+        return features
+
+
+def _exponential_average(closes: Sequence[Decimal], period: int) -> Decimal:
+    """Return the exponential moving average of a close series.
+
+    Seeded with the simple mean of the first ``period`` closes, then recursed forward with
+    a smoothing factor of ``2 / (period + 1)``. Caller is responsible for the local decimal
+    context; every operation here is exact decimal arithmetic.
+    """
+    smoothing = Decimal(2) / Decimal(period + 1)
+    average = sum(closes[:period], start=ZERO) / Decimal(period)
+    for close in closes[period:]:
+        average = (close - average) * smoothing + average
+    return average
+
+
 class CompositeFeaturePipeline:
     """Runs several pipelines and merges their output.
 

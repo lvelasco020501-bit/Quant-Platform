@@ -12,7 +12,7 @@ figures are computed through the same function so the two can never drift apart.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Self
@@ -89,6 +89,9 @@ class HealthCheckName(StrEnum):
     MISSING_BARS = "missing_bars"
     SESSION_INTERRUPTIONS = "session_interruptions"
     CLOCK_DRIFT = "clock_drift"
+    SESSION_BAR_ACCEPTANCE = "session_bar_acceptance"
+    SYMBOL_RULES_FRESHNESS = "symbol_rules_freshness"
+    SYMBOL_RULES_REFRESH = "symbol_rules_refresh"
 
 
 _FEED_CHECKS: frozenset[HealthCheckName] = frozenset(
@@ -100,7 +103,16 @@ _FEED_CHECKS: frozenset[HealthCheckName] = frozenset(
         HealthCheckName.MISSING_BARS,
     }
 )
-"""The checks that describe the data stream rather than the process around it."""
+"""The checks that describe the data stream rather than the process around it.
+
+Deliberately excludes :attr:`HealthCheckName.SESSION_BAR_ACCEPTANCE`: that one asks whether
+the *session* used what the feed delivered, which is a different question with a different
+answer. A feed can be flawless while the session downstream discards everything.
+
+Equally excludes the two symbol-rules checks. They describe the venue's *rulebook* and the
+loop that re-reads it, not the candle stream — a feed can deliver every bar perfectly while
+the rules behind it expire and the risk engine quietly refuses every order.
+"""
 
 
 class AlertCode(StrEnum):
@@ -115,6 +127,9 @@ class AlertCode(StrEnum):
     BROKER_REJECTION_SPIKE = "broker_rejection_spike"
     RUNTIME_EXCEPTION = "runtime_exception"
     LOW_ACCEPTANCE_RATE = "low_acceptance_rate"
+    SESSION_REJECTING_BARS = "session_rejecting_bars"
+    SYMBOL_RULES_STALE = "symbol_rules_stale"
+    SYMBOL_RULES_REFRESH_FAILING = "symbol_rules_refresh_failing"
     ABNORMAL_SLIPPAGE = "abnormal_slippage"
     ABNORMAL_COMMISSION = "abnormal_commission"
 
@@ -376,6 +391,62 @@ class DailyStatistics(DomainModel):
 
     Recomputed from the daily counts, never differenced: the change in a ratio is not the
     ratio of the change. ``None`` when the feed delivered nothing today.
+    """
+
+    # --- Session, daily -------------------------------------------------------------------------
+    daily_session_bars_received: int = Field(default=0, ge=0)
+    """Day-scoped: bars the feed handed to the session."""
+
+    daily_session_bars_processed: int = Field(default=0, ge=0)
+    """Day-scoped: bars that reached the pipeline."""
+
+    daily_session_acceptance_rate: Money | None = None
+    """Today's processed bars over today's received bars.
+
+    The metric whose absence let a session reject every candle for a week while the feed
+    reported perfect health. ``None`` when the session received nothing today, because a
+    rate over zero observations is undefined rather than zero.
+    """
+
+    # --- Venue rules, session-cumulative ---------------------------------------------------------
+    # Not daily deltas, and deliberately not: these answer "is the refresh loop working *now*",
+    # which a difference between two days cannot express. The counters are the run's audit
+    # trail, `symbol_rules_consecutive_failures` is the current condition, and
+    # `symbol_rules_age_seconds` is what the risk engine will actually judge.
+    symbol_rules_refresh_attempts: int = Field(default=0, ge=0)
+    symbol_rules_refresh_successes: int = Field(default=0, ge=0)
+    symbol_rules_refresh_failures: int = Field(default=0, ge=0)
+    symbol_rules_consecutive_failures: int = Field(default=0, ge=0)
+    symbol_rules_changes: int = Field(default=0, ge=0)
+    """Refreshes that arrived carrying limits different from the ones in force."""
+
+    symbol_rules_working_order_conflicts: int = Field(default=0, ge=0)
+    """Working orders observed to breach the rules that replaced the ones they were placed
+    under. Reported only; nothing rewrites a live order from a metadata refresh."""
+
+    symbol_rules_last_refresh_at: datetime | None = None
+    """When the rules were last successfully re-read. Failures never advance it."""
+
+    symbol_rules_age_seconds: Money | None = None
+    """How old the oldest rules were when the day was reported.
+
+    ``None`` means nothing was refreshing them, which is not the same as fresh: the risk
+    engine still enforces its budget against whatever timestamp the rules carry.
+    """
+
+    symbol_rules_stale_after_seconds: int = Field(default=0, ge=0)
+    """The freshness budget the risk engine enforces, carried alongside the age so this
+    report can grade staleness without importing the risk package."""
+
+    symbol_rules_last_failure_reason: str | None = None
+    """Why the most recent refresh failed, for the summary to quote."""
+
+    symbol_rules_telemetry_available: bool = False
+    """Whether a symbol-rules reading reached this report at all.
+
+    The same distinction ``feed_metrics_available`` draws, for the same reason. A run with
+    no refresh loop wired will stop trading once the rules pass the risk engine's budget,
+    and it must not be reported as healthy on the way there.
     """
 
     feed_metrics_available: bool = False

@@ -12,6 +12,7 @@ signals: the mode, an explicit enable flag and an exact confirmation phrase.
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -29,7 +30,14 @@ from quantplatform.core.enums import (
     Timeframe,
 )
 from quantplatform.core.errors import ConfigurationError, LiveTradingNotAuthorizedError
-from quantplatform.core.models.base import AssetCode, Symbol, UtcDatetime, VenueId
+from quantplatform.core.models.base import (
+    AssetCode,
+    StrategyId,
+    Symbol,
+    Text,
+    UtcDatetime,
+    VenueId,
+)
 from quantplatform.core.numeric import Money, NonNegativeMoney, Rate
 
 __all__ = [
@@ -39,6 +47,7 @@ __all__ = [
     "ExchangeSettings",
     "MarketSettings",
     "MonitoringSettings",
+    "PaperSettings",
     "RiskSettings",
     "Settings",
     "load_settings",
@@ -246,6 +255,96 @@ class BacktestSettings(_SettingsSection):
         return self
 
 
+class PaperSettings(_SettingsSection):
+    """Everything a long-running paper session needs that is not code.
+
+    Deployment configuration only: where artefacts go, which instruments to stream, and how
+    the feed should behave when the network misbehaves. Nothing here influences a trading
+    decision — sizing, limits and execution assumptions live in
+    :class:`RiskSettings` and :class:`BacktestSettings` and are untouched by this section.
+    """
+
+    session_id: Text = "paper-session"
+    """Identity persisted state is stored under. Two sessions sharing one would overwrite
+    each other's accounts, so it doubles as the state file's name."""
+
+    strategy_id: StrategyId | None = None
+    """Registry identifier of the strategy to run.
+
+    No default, because there is no sensible one: the platform ships no strategy, and
+    guessing a name would turn a configuration mistake into a startup that runs something
+    nobody chose. Startup refuses until this is set and resolvable.
+    """
+
+    symbols: tuple[Symbol, ...] = ("BTC/USDT",)
+    timeframe: Timeframe = Timeframe.H1
+
+    reports_directory: Path = Path("var/reports")
+    state_directory: Path = Path("var/state")
+    log_directory: Path = Path("var/logs")
+
+    websocket_url: str = Field(default="wss://stream.binance.com:9443/ws", min_length=1)
+    receive_timeout_seconds: float = Field(default=5.0, gt=0)
+    heartbeat_timeout_seconds: float = Field(default=60.0, gt=0)
+    close_grace_seconds: float = Field(default=2.0, ge=0)
+    """Maximum tolerated lag of the local clock behind the venue's confirmed candle close.
+
+    One meaning, both consumers: the market-data feed and the paper session each treat a
+    candle as final once ``now >= close_time - close_grace_seconds``. It can never make a
+    forming candle actionable, because the venue's own closed flag is checked independently.
+    """
+    reconnect_initial_delay_seconds: float = Field(default=1.0, gt=0)
+    reconnect_max_delay_seconds: float = Field(default=60.0, gt=0)
+    reconnect_backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    max_reconnect_attempts: int = Field(default=5, ge=1)
+
+    symbol_rules_refresh_seconds: float = Field(default=21_600.0, gt=0)
+    """How old the venue's trading rules may get before they are re-fetched.
+
+    Six hours against a twenty-four hour staleness budget, which is four refreshes of margin
+    rather than one. The margin is the point: a single failed refresh is then an event with
+    eighteen hours of slack behind it, not the beginning of an outage. Set too close to the
+    budget and one unreachable endpoint stops the run.
+
+    Must stay strictly below
+    :attr:`~quantplatform.risk.config.RiskConfiguration.stale_symbol_rules_seconds`, which
+    startup enforces — the two are separately configurable and a pair that cannot work is
+    refused at startup rather than discovered a day into a run.
+    """
+
+    report_timezone: str = "UTC"
+    render_charts: bool = True
+    chart_dpi: int = Field(default=150, ge=50, le=600)
+
+    max_bars: int | None = Field(default=None, ge=1)
+    """Stop after this many received bars, or ``None`` to run until stopped. Bounds a smoke
+    run without needing a second code path."""
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        """Check the instrument list and the feed timings.
+
+        Endpoint validation is deliberately not repeated here: it belongs to
+        :class:`~quantplatform.marketdata.config.MarketDataConfiguration`, which refuses
+        anything that is not a public credential-free stream, and duplicating the rule
+        would let the two drift apart.
+
+        Raises:
+            ValueError: If the symbol list is empty or repeats, or the heartbeat budget
+                does not exceed the read timeout.
+        """
+        if not self.symbols:
+            msg = "at least one symbol must be configured"
+            raise ValueError(msg)
+        if len(set(self.symbols)) != len(self.symbols):
+            msg = "symbols must not repeat"
+            raise ValueError(msg)
+        if self.heartbeat_timeout_seconds <= self.receive_timeout_seconds:
+            msg = "heartbeat_timeout_seconds must exceed receive_timeout_seconds"
+            raise ValueError(msg)
+        return self
+
+
 class MonitoringSettings(_SettingsSection):
     """Health monitoring and alerting configuration."""
 
@@ -287,6 +386,7 @@ class Settings(BaseSettings):
     data: DataSettings = Field(default_factory=DataSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
+    paper: PaperSettings = Field(default_factory=PaperSettings)
 
     @model_validator(mode="after")
     def _validate_coherence(self) -> Self:

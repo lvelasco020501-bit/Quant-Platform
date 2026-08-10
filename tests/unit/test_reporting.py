@@ -32,6 +32,7 @@ from quantplatform.reporting.models import (
     DailySeries,
     DailyStatistics,
     FeedDiagnostics,
+    HealthCheck,
     HealthCheckName,
     HealthLevel,
     RoundTrip,
@@ -827,3 +828,341 @@ def test_markdown_names_the_feed_section_daily() -> None:
 
     assert "## Feed health — daily" in text
     assert "| Reconnects | 2 |" in text
+
+
+# --- Session acceptance -------------------------------------------------------------------------
+
+
+def test_a_healthy_session_acceptance_is_green() -> None:
+    health = _health(
+        daily_session_bars_received=24,
+        daily_session_bars_processed=24,
+        daily_session_acceptance_rate=Decimal(1),
+    )
+
+    check = next(c for c in health.checks if c.name is HealthCheckName.SESSION_BAR_ACCEPTANCE)
+    assert check.level is HealthLevel.GREEN
+
+
+def test_a_feed_at_full_health_with_a_session_processing_nothing_is_red() -> None:
+    # The exact failure that stayed green for a week. Feed perfect, session idle.
+    statistics = _statistics(
+        feed_metrics_available=True,
+        daily_feed_acceptance_rate=Decimal(1),
+        daily_candles_received=24,
+        daily_candles_accepted=24,
+        daily_session_bars_received=24,
+        daily_session_bars_processed=0,
+        daily_session_acceptance_rate=Decimal(0),
+    )
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+
+    feed = next(c for c in health.checks if c.name is HealthCheckName.FEED_STABILITY)
+    session = next(c for c in health.checks if c.name is HealthCheckName.SESSION_BAR_ACCEPTANCE)
+    assert feed.level is HealthLevel.GREEN
+    assert session.level is HealthLevel.RED
+    assert health.level is HealthLevel.RED
+
+
+def test_a_partially_rejecting_session_is_yellow() -> None:
+    health = _health(
+        daily_session_bars_received=100,
+        daily_session_bars_processed=90,
+        daily_session_acceptance_rate=Decimal("0.90"),
+    )
+
+    check = next(c for c in health.checks if c.name is HealthCheckName.SESSION_BAR_ACCEPTANCE)
+    assert check.level is HealthLevel.YELLOW
+
+
+def test_a_session_far_below_the_floor_is_red() -> None:
+    health = _health(
+        daily_session_bars_received=100,
+        daily_session_bars_processed=20,
+        daily_session_acceptance_rate=Decimal("0.20"),
+    )
+
+    check = next(c for c in health.checks if c.name is HealthCheckName.SESSION_BAR_ACCEPTANCE)
+    assert check.level is HealthLevel.RED
+
+
+def test_a_session_that_received_nothing_reports_the_check_skipped() -> None:
+    check = next(c for c in _health().checks if c.name is HealthCheckName.SESSION_BAR_ACCEPTANCE)
+
+    assert check.skipped is True
+    assert check.level is HealthLevel.GREEN
+
+
+def test_session_acceptance_is_not_a_feed_check() -> None:
+    # Feed status answers "did the candles arrive"; this answers "were they used".
+    statistics = _statistics(
+        feed_metrics_available=True,
+        daily_feed_acceptance_rate=Decimal(1),
+        daily_session_bars_received=24,
+        daily_session_bars_processed=0,
+        daily_session_acceptance_rate=Decimal(0),
+    )
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+
+    assert health.feed_level is HealthLevel.GREEN
+    assert health.level is HealthLevel.RED
+
+
+def test_a_session_rejecting_everything_raises_a_critical_alert() -> None:
+    alerts = _alerts(
+        daily_session_bars_received=24,
+        daily_session_bars_processed=0,
+        daily_session_acceptance_rate=Decimal(0),
+    )
+
+    alert = alerts.by_code(AlertCode.SESSION_REJECTING_BARS)
+    assert alert is not None
+    assert alert.severity is AlertSeverity.CRITICAL
+
+
+def test_a_session_below_the_floor_raises_an_error_alert() -> None:
+    alerts = _alerts(
+        daily_session_bars_received=100,
+        daily_session_bars_processed=80,
+        daily_session_acceptance_rate=Decimal("0.80"),
+    )
+
+    alert = alerts.by_code(AlertCode.SESSION_REJECTING_BARS)
+    assert alert is not None
+    assert alert.severity is AlertSeverity.ERROR
+
+
+def test_a_healthy_session_raises_no_acceptance_alert() -> None:
+    alerts = _alerts(
+        daily_session_bars_received=24,
+        daily_session_bars_processed=24,
+        daily_session_acceptance_rate=Decimal(1),
+    )
+
+    assert alerts.by_code(AlertCode.SESSION_REJECTING_BARS) is None
+
+
+def test_both_acceptances_are_reported_side_by_side() -> None:
+    text = render_markdown(
+        _report(
+            statistics=_statistics(
+                feed_metrics_available=True,
+                daily_feed_acceptance_rate=Decimal(1),
+                daily_session_bars_received=24,
+                daily_session_bars_processed=24,
+                daily_session_acceptance_rate=Decimal(1),
+            )
+        )
+    )
+
+    assert "Feed acceptance (daily)" in text
+    assert "Session acceptance (daily)" in text
+    assert "| Session bars received (day) | 24 |" in text
+    assert "| Session bars processed (day) | 24 |" in text
+
+
+def test_the_session_columns_reach_csv_and_json() -> None:
+    original = _report(
+        statistics=_statistics(
+            daily_session_bars_received=24,
+            daily_session_bars_processed=18,
+            daily_session_acceptance_rate=Decimal("0.75"),
+        )
+    )
+    header, row = (line.split(",") for line in render_csv(original).strip().split("\n"))
+    values = dict(zip(header, row, strict=True))
+
+    assert values["daily_session_bars_received"] == "24"
+    assert values["daily_session_bars_processed"] == "18"
+    assert values["daily_session_acceptance_rate"] == "0.75"
+    assert DailyReport.model_validate_json(original.model_dump_json()) == original
+
+
+# --- Venue rules ------------------------------------------------------------------------------
+
+
+def _rules_statistics(**overrides: object) -> DailyStatistics:
+    """Statistics for a day where a refresh loop was reporting."""
+    defaults: dict[str, object] = {
+        "symbol_rules_telemetry_available": True,
+        "symbol_rules_refresh_attempts": 4,
+        "symbol_rules_refresh_successes": 4,
+        "symbol_rules_age_seconds": Decimal(3600),
+        "symbol_rules_stale_after_seconds": 86_400,
+        "symbol_rules_last_refresh_at": ANCHOR,
+    }
+    return _statistics(**{**defaults, **overrides})
+
+
+def _check(statistics: DailyStatistics, name: HealthCheckName) -> HealthCheck:
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+    return next(check for check in health.checks if check.name is name)
+
+
+def test_fresh_rules_and_a_working_refresh_are_green() -> None:
+    statistics = _rules_statistics()
+
+    freshness = _check(statistics, HealthCheckName.SYMBOL_RULES_FRESHNESS)
+    refresh = _check(statistics, HealthCheckName.SYMBOL_RULES_REFRESH)
+
+    assert freshness.level is HealthLevel.GREEN
+    assert refresh.level is HealthLevel.GREEN
+    assert evaluate_health(statistics=statistics, thresholds=AlertThresholds()).level is (
+        HealthLevel.GREEN
+    )
+
+
+def test_rules_past_the_freshness_budget_are_red() -> None:
+    # Red, never yellow: past this point the risk engine is already refusing every intent,
+    # and a report that graded it as degraded would be describing a session that had
+    # silently stopped trading.
+    statistics = _rules_statistics(symbol_rules_age_seconds=Decimal(86_400))
+
+    check = _check(statistics, HealthCheckName.SYMBOL_RULES_FRESHNESS)
+
+    assert check.level is HealthLevel.RED
+    assert "refusing every order" in check.message
+    assert evaluate_health(statistics=statistics, thresholds=AlertThresholds()).level is (
+        HealthLevel.RED
+    )
+
+
+def test_rules_just_inside_the_budget_are_still_green() -> None:
+    statistics = _rules_statistics(symbol_rules_age_seconds=Decimal(86_399))
+
+    assert _check(statistics, HealthCheckName.SYMBOL_RULES_FRESHNESS).level is HealthLevel.GREEN
+
+
+def test_a_failing_refresh_is_visible_while_the_rules_are_still_valid() -> None:
+    # The whole reason for grading the mechanism separately from its result: hours of
+    # warning before anything actually breaks.
+    statistics = _rules_statistics(
+        symbol_rules_refresh_attempts=6,
+        symbol_rules_refresh_successes=4,
+        symbol_rules_refresh_failures=2,
+        symbol_rules_consecutive_failures=2,
+        symbol_rules_last_failure_reason="DataProviderError: venue unreachable",
+        symbol_rules_age_seconds=Decimal(7200),
+    )
+
+    freshness = _check(statistics, HealthCheckName.SYMBOL_RULES_FRESHNESS)
+    refresh = _check(statistics, HealthCheckName.SYMBOL_RULES_REFRESH)
+
+    assert freshness.level is HealthLevel.GREEN
+    assert refresh.level is HealthLevel.YELLOW
+    assert "venue unreachable" in refresh.message
+
+
+def test_a_recovered_refresh_is_green_despite_earlier_failures() -> None:
+    statistics = _rules_statistics(
+        symbol_rules_refresh_attempts=10,
+        symbol_rules_refresh_successes=9,
+        symbol_rules_refresh_failures=1,
+        symbol_rules_consecutive_failures=0,
+    )
+
+    assert _check(statistics, HealthCheckName.SYMBOL_RULES_REFRESH).level is HealthLevel.GREEN
+
+
+def test_both_checks_are_skipped_when_nothing_reported() -> None:
+    # Skipped rather than passed: claiming green would assert something nobody measured.
+    statistics = _statistics()
+
+    freshness = _check(statistics, HealthCheckName.SYMBOL_RULES_FRESHNESS)
+    refresh = _check(statistics, HealthCheckName.SYMBOL_RULES_REFRESH)
+
+    assert freshness.skipped is True
+    assert refresh.skipped is True
+
+
+def test_the_venue_rules_checks_are_not_counted_as_feed_health() -> None:
+    # A flawless feed must not be able to disguise an expired rulebook.
+    statistics = _rules_statistics(symbol_rules_age_seconds=Decimal(200_000))
+    health = evaluate_health(statistics=statistics, thresholds=AlertThresholds())
+
+    assert health.level is HealthLevel.RED
+    assert health.feed_level is HealthLevel.GREEN
+
+
+def test_stale_rules_raise_a_critical_alert() -> None:
+    statistics = _rules_statistics(symbol_rules_age_seconds=Decimal(90_000))
+
+    alerts = evaluate_alerts(statistics=statistics, thresholds=AlertThresholds())
+    raised = {alert.code: alert for alert in alerts.alerts}
+
+    assert AlertCode.SYMBOL_RULES_STALE in raised
+    assert raised[AlertCode.SYMBOL_RULES_STALE].severity is AlertSeverity.CRITICAL
+
+
+def test_a_failing_refresh_raises_a_warning_alert() -> None:
+    statistics = _rules_statistics(
+        symbol_rules_refresh_attempts=5,
+        symbol_rules_refresh_successes=3,
+        symbol_rules_refresh_failures=2,
+        symbol_rules_consecutive_failures=2,
+        symbol_rules_last_failure_reason="OSError: connection reset",
+    )
+
+    raised = {
+        alert.code: alert
+        for alert in evaluate_alerts(statistics=statistics, thresholds=AlertThresholds()).alerts
+    }
+
+    assert AlertCode.SYMBOL_RULES_REFRESH_FAILING in raised
+    assert raised[AlertCode.SYMBOL_RULES_REFRESH_FAILING].severity is AlertSeverity.WARNING
+    assert "connection reset" in raised[AlertCode.SYMBOL_RULES_REFRESH_FAILING].message
+
+
+def test_a_healthy_refresh_raises_no_alert() -> None:
+    alerts = evaluate_alerts(statistics=_rules_statistics(), thresholds=AlertThresholds())
+
+    codes = {alert.code for alert in alerts.alerts}
+    assert AlertCode.SYMBOL_RULES_STALE not in codes
+    assert AlertCode.SYMBOL_RULES_REFRESH_FAILING not in codes
+
+
+def test_the_markdown_reports_the_refresh_mechanism() -> None:
+    text = render_markdown(
+        _report(
+            statistics=_rules_statistics(
+                symbol_rules_refresh_failures=1,
+                symbol_rules_refresh_attempts=5,
+                symbol_rules_changes=1,
+                symbol_rules_working_order_conflicts=2,
+            )
+        )
+    )
+
+    assert "## Venue rules — session" in text
+    assert "| Refresh attempts | 5 |" in text
+    assert "| Refresh failures | 1 |" in text
+    assert "| Venue rule changes | 1 |" in text
+    assert "| Working orders in conflict | 2 |" in text
+    assert "| Rules age | 1.0h |" in text
+    assert "| Staleness budget | 24.0h |" in text
+
+
+def test_the_markdown_says_so_when_nothing_is_refreshing() -> None:
+    # Zeros would read as a healthy loop. An unwired one will stop the run on a schedule.
+    text = render_markdown(_report(statistics=_statistics()))
+
+    assert "No symbol-rules telemetry was supplied" in text
+
+
+def test_the_refresh_counters_reach_csv_and_json() -> None:
+    original = _report(
+        statistics=_rules_statistics(
+            symbol_rules_refresh_attempts=7,
+            symbol_rules_refresh_failures=1,
+            symbol_rules_consecutive_failures=1,
+            symbol_rules_refresh_successes=6,
+        )
+    )
+    header, row = (line.split(",") for line in render_csv(original).strip().split("\n"))
+    values = dict(zip(header, row, strict=True))
+
+    assert values["symbol_rules_refresh_attempts"] == "7"
+    assert values["symbol_rules_refresh_failures"] == "1"
+    assert values["symbol_rules_consecutive_failures"] == "1"
+    assert values["symbol_rules_age_seconds"] == "3600"
+    assert DailyReport.model_validate_json(original.model_dump_json()) == original

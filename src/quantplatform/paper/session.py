@@ -42,7 +42,11 @@ from quantplatform.core.interfaces import PaperStateRepository
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import PortfolioSnapshot
-from quantplatform.core.models.telemetry import ZERO_FEED_METRICS, FeedMetricsSnapshot
+from quantplatform.core.models.telemetry import (
+    ZERO_FEED_METRICS,
+    FeedMetricsSnapshot,
+    SymbolRulesTelemetry,
+)
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.paper.clock import SessionClock
 from quantplatform.paper.results import (
@@ -118,7 +122,7 @@ class PaperTradingSession:
         config: BacktestConfig,
         clock: Clock,
         state_repository: PaperStateRepository | None = None,
-        close_grace_seconds: int = 0,
+        close_grace_seconds: float = 0.0,
         save_every_bar: bool = True,
         day_rollover_observer: DayRolloverObserver | None = None,
     ) -> None:
@@ -132,7 +136,9 @@ class PaperTradingSession:
             config: Run configuration, shared with the engine.
             clock: Injected time source; no wall clock is read anywhere below.
             state_repository: Where to persist snapshots, or ``None`` to run without.
-            close_grace_seconds: Time beyond a bar's close before it counts as final.
+            close_grace_seconds: Maximum tolerated lag of the local clock behind the
+                venue's confirmed candle close. Subtracted from the close, matching the
+                feed exactly, so the two layers never disagree about the same candle.
             save_every_bar: Persist after each processed bar. Off means a crash loses
                 everything since the last explicit :meth:`save`.
             day_rollover_observer: Notified when a bar begins a new reporting day. Purely
@@ -156,6 +162,7 @@ class PaperTradingSession:
         self._metrics = _MutableMetrics()
         self._feed_metrics: FeedMetricsSnapshot | None = None
         self._feed_baseline: FeedMetricsSnapshot = ZERO_FEED_METRICS
+        self._symbol_rules_telemetry: SymbolRulesTelemetry | None = None
 
     # --- Lifecycle --------------------------------------------------------------------------
 
@@ -278,8 +285,9 @@ class PaperTradingSession:
         failure: a feed that re-sends a candle, or sends one still forming, must not stop a
         session that has been running for a week.
 
-        A bar is refused when it is still open, has not yet passed its close plus the grace
-        period on this session's clock, or does not follow the last bar already processed.
+        A bar is refused when it is still open, has not yet reached its close on this
+        session's clock (within the configured tolerance), or does not follow the last bar
+        already processed.
         Acting on a forming candle means deciding from a price that has not settled; acting on
         a bar the account already lived through means trading the same minute twice.
 
@@ -333,6 +341,25 @@ class PaperTradingSession:
             snapshot: The feed's counters at this instant.
         """
         self._feed_metrics = snapshot
+
+    def record_symbol_rules_telemetry(self, snapshot: SymbolRulesTelemetry) -> None:
+        """Accept the latest reading of how the venue's trading rules are being kept current.
+
+        Carried, not consulted. The session never reads a field of this and never acts on
+        it: whether the rules are fresh is the risk engine's judgement to make, on the rules
+        themselves, at the moment an intent is evaluated. A session that started skipping
+        bars because refresh looked unhealthy would be making a second, unaudited risk
+        decision in the wrong place.
+
+        Args:
+            snapshot: The refresh mechanism's counters and the rules' current age.
+        """
+        self._symbol_rules_telemetry = snapshot
+
+    @property
+    def symbol_rules_telemetry(self) -> SymbolRulesTelemetry | None:
+        """Return the most recent symbol-rules reading, or ``None`` if none was supplied."""
+        return self._symbol_rules_telemetry
 
     @property
     def feed_metrics(self) -> FeedMetricsSnapshot | None:
@@ -495,6 +522,7 @@ class PaperTradingSession:
             fills=detail.fills if detail is not None else (),
             orders=detail.orders if detail is not None else (),
             detail=detail,
+            symbol_rules=self._symbol_rules_telemetry,
         )
 
     def _portfolio_snapshot(self) -> PortfolioSnapshot | None:

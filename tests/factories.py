@@ -69,6 +69,9 @@ def make_symbol_rules(
     min_quantity: Decimal | None = None,
     min_notional: Decimal = Decimal(10),
     max_quantity: Decimal | None = None,
+    max_notional: Decimal | None = None,
+    updated_at: datetime = ANCHOR,
+    source: str = "test",
 ) -> SymbolRules:
     return SymbolRules(
         symbol=symbol,
@@ -80,9 +83,9 @@ def make_symbol_rules(
         min_quantity=min_quantity if min_quantity is not None else quantity_step,
         max_quantity=max_quantity,
         min_notional=min_notional,
-        max_notional=None,
-        source="test",
-        updated_at=ANCHOR,
+        max_notional=max_notional,
+        source=source,
+        updated_at=updated_at,
     )
 
 
@@ -336,6 +339,8 @@ def make_order(
     avg_fill_price: Decimal | None = None,
     reject_reason: str | None = None,
     cancel_reason: str | None = None,
+    limit_price: Decimal | None = None,
+    order_type: OrderType | None = None,
 ) -> Order:
     intent = make_intent()
     decision = make_decision(intent=intent)
@@ -350,14 +355,14 @@ def make_order(
         symbol=intent.symbol,
         market_type=intent.market_type,
         side=intent.side,
-        order_type=intent.order_type,
+        order_type=order_type if order_type is not None else intent.order_type,
         time_in_force=intent.time_in_force,
         execution_mode=intent.execution_mode,
         status=status,
         quantity=quantity,
         filled_quantity=filled_quantity,
         avg_fill_price=avg_fill_price,
-        limit_price=None,
+        limit_price=limit_price,
         stop_price=None,
         fees_paid=Decimal(0),
         reject_reason=reject_reason,

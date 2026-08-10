@@ -22,13 +22,13 @@ __all__ = ["SessionClock"]
 class SessionClock:
     """The clock a paper session reads, plus the questions it asks of one."""
 
-    def __init__(self, clock: Clock, *, close_grace_seconds: int = 0) -> None:
+    def __init__(self, clock: Clock, *, close_grace_seconds: float = 0.0) -> None:
         """Wrap an injected clock.
 
         Args:
             clock: The platform clock; real in production, simulated in tests.
-            close_grace_seconds: Extra time beyond a bar's close before it counts as final,
-                absorbing the small delay between a candle ending and a venue publishing it.
+            close_grace_seconds: Maximum tolerated lag of this clock behind the venue's
+                confirmed candle close. Subtracted, never added — see :meth:`is_bar_final`.
         """
         self._clock = clock
         self._grace = timedelta(seconds=close_grace_seconds)
@@ -84,18 +84,37 @@ class SessionClock:
         return max(0.0, self._clock.monotonic() - self._started_monotonic)
 
     def is_bar_final(self, bar: MarketBar) -> bool:
-        """Return whether a bar has closed far enough in the past to be acted on.
+        """Return whether a bar's interval has elapsed on this session's clock.
+
+        **The grace period is subtracted, not added.** ``close_grace_seconds`` is the
+        maximum tolerated lag of the local clock behind the venue's confirmed candle close,
+        so a candle the venue has already closed is accepted even if our clock has not quite
+        reached its close timestamp. This is the same rule
+        :meth:`~quantplatform.marketdata.clock.FeedClock.is_bar_final` applies, and the two
+        must agree: a feed that delivers a candle and a session that refuses the same candle
+        is a session that trades nothing.
+
+        Adding the grace instead is what the session used to do, and it was wrong in a way
+        that only appeared once both layers were wired together. A venue publishes each
+        closed candle once, moments after its close. Requiring ``now >= close + grace``
+        rejects it, the refusal leaves the continuity anchor untouched, and the next candle
+        is refused on the same arithmetic — so every bar is refused, for ever, while the
+        feed reports perfect health.
+
+        Safety does not depend on this margin. A forming candle is refused by
+        :attr:`~quantplatform.core.models.market.MarketBar.is_closed`, which is checked
+        independently; grace only ever forgives clock skew on a candle the venue has already
+        declared closed.
 
         Args:
             bar: The bar in question.
 
         Returns:
-            ``True`` once the clock has passed the bar's exclusive close time plus the
-            configured grace period.
+            ``True`` once the clock has reached the bar's close, within tolerance.
         """
-        return self.now() >= bar.close_time + self._grace
+        return self.now() >= bar.close_time - self._grace
 
     def seconds_until_final(self, bar: MarketBar) -> float:
         """Return how long remains before a bar may be acted on, zero if it already may."""
-        remaining = (bar.close_time + self._grace - self.now()).total_seconds()
+        remaining = (bar.close_time - self._grace - self.now()).total_seconds()
         return max(0.0, remaining)

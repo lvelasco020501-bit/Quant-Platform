@@ -14,7 +14,7 @@ log. There is a test that keeps it that way.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
@@ -228,6 +228,12 @@ def render_markdown(report: DailyReport) -> str:
         "## Process",
         (
             ("Bars processed (day)", str(statistics.bars_processed)),
+            ("Session bars received (day)", str(statistics.daily_session_bars_received)),
+            ("Session bars processed (day)", str(statistics.daily_session_bars_processed)),
+            (
+                "Session acceptance (daily)",
+                _optional_percent(statistics.daily_session_acceptance_rate),
+            ),
             ("Bars rejected (session)", str(statistics.bars_rejected)),
             ("Bar acceptance (session)", _optional_percent(statistics.acceptance_rate)),
             ("Runtime span (s)", _money(statistics.runtime_seconds)),
@@ -245,11 +251,71 @@ def render_markdown(report: DailyReport) -> str:
         ),
     )
     lines += _feed_health_section(report)
+    lines += _symbol_rules_section(report)
     lines += _health_section(report)
     lines += _alert_section(report)
     lines += _comparison_section(report)
     lines += _recommendation_section(report)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _symbol_rules_section(report: DailyReport) -> list[str]:
+    """Render whether the venue's rulebook is still being re-read.
+
+    Session-cumulative, and labelled as such. Unlike the feed section above, these are not
+    daily deltas: the question is not "how often did refresh fail today" but "is refresh
+    working right now, and how old are the rules the risk engine is about to judge". A
+    difference between two days answers neither.
+
+    An unwired refresh loop is called out rather than shown as zeros, for the same reason
+    the feed section does it. A run nobody is keeping current will have every order refused
+    once the rules pass the freshness budget, and printing a tidy set of zeros on the way
+    there would make the last healthy-looking report the most misleading one.
+    """
+    statistics = report.statistics
+    lines = ["## Venue rules — session", ""]
+    if not statistics.symbol_rules_telemetry_available:
+        lines += [
+            "No symbol-rules telemetry was supplied, so nothing here is measured. If no "
+            "refresh loop is running, the venue's rules will pass the risk engine's "
+            "freshness budget and every order intent will be refused from that point on.",
+            "",
+        ]
+    age = statistics.symbol_rules_age_seconds
+    budget = statistics.symbol_rules_stale_after_seconds
+    rows = (
+        ("Refresh attempts", str(statistics.symbol_rules_refresh_attempts)),
+        ("Refresh successes", str(statistics.symbol_rules_refresh_successes)),
+        ("Refresh failures", str(statistics.symbol_rules_refresh_failures)),
+        ("Consecutive failures", str(statistics.symbol_rules_consecutive_failures)),
+        ("Last refresh", _optional_time(statistics.symbol_rules_last_refresh_at)),
+        ("Rules age", _optional_hours(age)),
+        ("Staleness budget", _optional_hours(Decimal(budget) if budget > 0 else None)),
+        ("Venue rule changes", str(statistics.symbol_rules_changes)),
+        (
+            "Working orders in conflict",
+            str(statistics.symbol_rules_working_order_conflicts),
+        ),
+        ("Last failure", statistics.symbol_rules_last_failure_reason or "—"),
+    )
+    lines += ["| Metric | Value |", "| --- | --- |"]
+    lines += [f"| {name} | {value} |" for name, value in rows]
+    lines.append("")
+    return lines
+
+
+def _optional_hours(seconds: Decimal | None) -> str:
+    """Render an age in hours, or an em dash when nothing measured it."""
+    if seconds is None:
+        return "—"
+    return f"{seconds / Decimal(3600):.1f}h"
+
+
+def _optional_time(moment: datetime | None) -> str:
+    """Render an instant, or an em dash when it never happened."""
+    if moment is None:
+        return "—"
+    return moment.isoformat()
 
 
 def _markdown_table(heading: str, rows: tuple[tuple[str, str], ...]) -> list[str]:
@@ -295,7 +361,7 @@ def _feed_health_section(report: DailyReport) -> list[str]:
         ("Candles accepted", str(statistics.daily_candles_accepted)),
         ("Candles rejected", str(statistics.daily_candles_rejected)),
         ("Duplicate candles", str(statistics.daily_duplicate_candles)),
-        ("Acceptance rate", _optional_percent(statistics.daily_feed_acceptance_rate)),
+        ("Feed acceptance (daily)", _optional_percent(statistics.daily_feed_acceptance_rate)),
         ("Overall feed status", _feed_status(report)),
     )
     lines += ["| Metric | Value |", "| --- | --- |"]

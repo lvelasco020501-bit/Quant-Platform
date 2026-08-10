@@ -18,6 +18,7 @@ from quantplatform.core.interfaces import (
     FeedMetricsReader,
     PaperMarketDataFeed,
     StreamingMarketDataProvider,
+    SymbolRulesMaintainer,
 )
 from quantplatform.core.models.market import MarketBar
 from quantplatform.paper.results import SessionResult
@@ -37,6 +38,7 @@ class PaperTradingRunner:
         max_bars: int | None = None,
         on_bar: Callable[[MarketBar], None] | None = None,
         feed_metrics: FeedMetricsReader | None = None,
+        symbol_rules: SymbolRulesMaintainer | None = None,
     ) -> None:
         """Wire a runner.
 
@@ -54,6 +56,11 @@ class PaperTradingRunner:
                 :class:`~quantplatform.core.interfaces.PaperMarketDataFeed`, because a
                 deterministic replay has no health to report and forcing it to invent
                 counters would put fiction where a report expects measurement.
+            symbol_rules: Whatever keeps the venue's trading rules current, driven once per
+                bar. The runner does not know what a refresh interval is and does not decide
+                when one is due — it performs maintenance and forwards the reading to the
+                session, exactly as it does for feed metrics. Omitted for a replay, whose
+                rules are fixed by the recording and cannot go stale against a live venue.
 
         Raises:
             TelemetryNotConfiguredError: If ``feed`` is a live streaming provider and no
@@ -66,6 +73,7 @@ class PaperTradingRunner:
         self._max_bars = max_bars
         self._on_bar = on_bar
         self._feed_metrics = feed_metrics
+        self._symbol_rules = symbol_rules
         self._stopping = False
         self._require_telemetry_for_live_feeds()
 
@@ -117,6 +125,7 @@ class PaperTradingRunner:
             if self._stopping:
                 break
             self._refresh_feed_metrics()
+            self._maintain_symbol_rules()
             self._session.submit_bar(bar)
             if self._on_bar is not None:
                 self._on_bar(bar)
@@ -158,6 +167,22 @@ class PaperTradingRunner:
             return
         self._session.record_feed_metrics(self._feed_metrics.read_feed_metrics())
 
+    def _maintain_symbol_rules(self) -> None:
+        """Keep the venue's trading rules current, and tell the session how that is going.
+
+        Before the bar, for the same reason feed metrics are refreshed before the bar: a day
+        rollover is detected inside ``submit_bar``, so a reading taken afterwards would
+        describe the new day in the closing report of the old one.
+
+        Ordering also matters for a second reason here. The rules this call may replace are
+        the ones the bar about to be submitted will be sized against, so refreshing first is
+        what makes a decision use the newest limits the venue has published rather than the
+        ones that happened to be in force when the previous candle arrived.
+        """
+        if self._symbol_rules is None:
+            return
+        self._session.record_symbol_rules_telemetry(self._symbol_rules.maintain())
+
     def run_once(self, bar: MarketBar) -> None:
         """Offer a single bar without owning the loop.
 
@@ -172,4 +197,5 @@ class PaperTradingRunner:
                 "session is not running", session_id=self._session.session_id
             )
         self._refresh_feed_metrics()
+        self._maintain_symbol_rules()
         self._session.submit_bar(bar)

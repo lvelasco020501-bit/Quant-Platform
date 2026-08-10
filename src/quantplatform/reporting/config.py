@@ -65,6 +65,15 @@ class AlertThresholds(BaseModel):
     max_risk_rejection_ratio: Rate = Decimal("0.5")
     max_broker_rejection_ratio: Rate = Decimal("0.1")
     min_acceptance_rate: Rate = Decimal("0.95")
+    """Floor on the share of candles the *feed* delivered of what it parsed."""
+
+    minimum_session_acceptance_rate: Rate = Decimal("0.95")
+    """Floor on the share of delivered bars the *session* actually processed.
+
+    A separate limit because it answers a separate question. A feed can deliver every
+    candle flawlessly while the session downstream refuses all of them — which is exactly
+    what a contradictory grace period once did, for a week, under a green report.
+    """
 
     max_slippage_ratio: Rate = Decimal("0.02")
     """Slippage as a share of the day's traded notional, beyond which execution looks wrong."""

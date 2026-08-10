@@ -44,6 +44,7 @@ from quantplatform.core.ids import deterministic_uuid
 from quantplatform.core.interfaces import SettlementLedger
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order
+from quantplatform.core.symbol_rules import as_symbol_rules_store
 from quantplatform.execution.config import ExecutionConfig
 
 __all__ = [
@@ -160,6 +161,11 @@ class SimulatedBroker:
 
         Args:
             symbols: Venue rules per symbol, used for identity, lot sizes and minimums.
+            A shared
+            :class:`~quantplatform.core.symbol_rules.SymbolRulesStore` is held by
+            reference, so a refresh reaches this component; any other mapping is copied
+            into one, so a caller mutating its own dictionary cannot alter what is traded
+            against.
             portfolio: The accounting authority fills are handed to, and the ledger
                 reservations move funds within.
             execution_mode: Mode stamped on every order and fill this broker produces.
@@ -168,7 +174,7 @@ class SimulatedBroker:
             venue: Identifier recorded as the simulated venue.
             source: Value recorded as ``source`` on every emitted event.
         """
-        self._symbols = dict(symbols)
+        self._symbols = as_symbol_rules_store(symbols)
         self._portfolio = portfolio
         self._execution_mode = execution_mode
         self._config = config if config is not None else ExecutionConfig()

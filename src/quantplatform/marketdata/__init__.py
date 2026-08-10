@@ -36,19 +36,29 @@ from quantplatform.marketdata.models import (
     StreamSubscription,
 )
 from quantplatform.marketdata.reconnect import BackoffSchedule, ReconnectPolicy
+from quantplatform.marketdata.symbol_rules import (
+    DEFAULT_EXCHANGE_INFO_URL,
+    BinanceSpotSymbolRulesProvider,
+    ExchangeInfoTransport,
+    HttpExchangeInfoTransport,
+)
 from quantplatform.marketdata.validation import CandleParser, CandleSequenceValidator
 
 __all__ = [
+    "DEFAULT_EXCHANGE_INFO_URL",
     "BackoffSchedule",
     "BinanceSpotMarketDataFeed",
+    "BinanceSpotSymbolRulesProvider",
     "CandleAdmission",
     "CandleOutcome",
     "CandleParser",
     "CandleSequenceValidator",
+    "ExchangeInfoTransport",
     "FeedClock",
     "FeedMetrics",
     "FeedMetricsSnapshot",
     "GapReport",
+    "HttpExchangeInfoTransport",
     "MarketDataConfiguration",
     "ReconnectPolicy",
     "RejectedCandle",

@@ -255,6 +255,8 @@ def evaluate_alerts(*, statistics: DailyStatistics, thresholds: AlertThresholds)
     )
     _add_rejection_spikes(raised, statistics, thresholds)
     _add_acceptance(raised, statistics, thresholds)
+    _add_session_rejection(raised, statistics, thresholds)
+    _add_symbol_rules(raised, statistics)
     _add_cost_ratios(raised, statistics, thresholds)
     return DailyAlerts(alerts=tuple(raised))
 
@@ -384,6 +386,76 @@ def _add_acceptance(
             threshold=thresholds.min_acceptance_rate,
         )
     )
+
+
+def _add_session_rejection(
+    raised: list[Alert], statistics: DailyStatistics, thresholds: AlertThresholds
+) -> None:
+    """Flag a session discarding the bars its feed delivered.
+
+    Critical when it processed none of them: a session that received work and did none of
+    it is not degraded, it is not running, and the difference matters at 3am.
+    """
+    observed = statistics.daily_session_acceptance_rate
+    minimum = thresholds.minimum_session_acceptance_rate
+    if observed is None or observed >= minimum:
+        return
+    raised.append(
+        Alert(
+            code=AlertCode.SESSION_REJECTING_BARS,
+            severity=AlertSeverity.CRITICAL if observed <= ZERO else AlertSeverity.ERROR,
+            message=(
+                f"the session processed {_percent(observed)} of the "
+                f"{statistics.daily_session_bars_received} bar(s) the feed delivered, "
+                f"against a floor of {_percent(minimum)}"
+            ),
+            observed=observed,
+            threshold=minimum,
+        )
+    )
+
+
+def _add_symbol_rules(raised: list[Alert], statistics: DailyStatistics) -> None:
+    """Flag venue rules that have expired, and a refresh loop that has stopped working.
+
+    Two alerts because they need to arrive at different times. The refresh warning fires
+    while the rules in force are still valid and orders are still flowing — hours of notice,
+    which is the whole point of watching the mechanism rather than only its result. The
+    staleness alert fires once the risk engine is already refusing everything, by which time
+    it is a report of an outage rather than a warning about one.
+    """
+    if not statistics.symbol_rules_telemetry_available:
+        return
+    age = statistics.symbol_rules_age_seconds
+    limit = statistics.symbol_rules_stale_after_seconds
+    if age is not None and limit > 0 and age >= limit:
+        raised.append(
+            Alert(
+                code=AlertCode.SYMBOL_RULES_STALE,
+                severity=AlertSeverity.CRITICAL,
+                message=(
+                    "venue trading rules have outlived the risk engine's freshness budget; "
+                    "every order intent is being refused for symbol_rules_freshness"
+                ),
+                observed=age,
+                threshold=Decimal(limit),
+            )
+        )
+    consecutive = statistics.symbol_rules_consecutive_failures
+    if consecutive > 0:
+        reason = statistics.symbol_rules_last_failure_reason or "no reason recorded"
+        raised.append(
+            Alert(
+                code=AlertCode.SYMBOL_RULES_REFRESH_FAILING,
+                severity=AlertSeverity.WARNING,
+                message=(
+                    f"{consecutive} consecutive symbol-rules refresh failure(s); the last "
+                    f"known-good rules remain in force ({reason})"
+                ),
+                observed=Decimal(consecutive),
+                threshold=ZERO,
+            )
+        )
 
 
 def _add_cost_ratios(
@@ -691,6 +763,15 @@ class DailyReportBuilder:
     ) -> DailyStatistics:
         """Fold every source into the day's counted figures."""
         flow = _OrderFlow.of(outcomes)
+        # Bars handed to the session today. Derived from the feed's daily accepted count
+        # rather than a separate counter, because the runner submits every emitted bar to
+        # the session exactly once — so the feed's "delivered" is the session's "received",
+        # and one number cannot drift from the other.
+        session_received = feed_metrics.candles_accepted if feed_metrics is not None else 0
+        # Carried through the session untouched, exactly as the feed's counters are. Not a
+        # daily delta: these say whether the refresh loop is working *now*, and a difference
+        # between two days cannot express that.
+        rules = result.symbol_rules
         costs = _Costs.of(outcomes)
         closing = performance.final_equity
         runtime = result.runtime
@@ -771,7 +852,23 @@ class DailyReportBuilder:
             daily_feed_acceptance_rate=(
                 feed_metrics.acceptance_rate if feed_metrics is not None else None
             ),
+            daily_session_bars_received=session_received,
+            daily_session_bars_processed=len(outcomes),
+            daily_session_acceptance_rate=_ratio(len(outcomes), session_received),
             feed_metrics_available=feed_metrics is not None,
+            symbol_rules_refresh_attempts=rules.refresh_attempts if rules else 0,
+            symbol_rules_refresh_successes=rules.refresh_successes if rules else 0,
+            symbol_rules_refresh_failures=rules.refresh_failures if rules else 0,
+            symbol_rules_consecutive_failures=rules.consecutive_failures if rules else 0,
+            symbol_rules_changes=rules.rule_changes if rules else 0,
+            symbol_rules_working_order_conflicts=(rules.working_order_conflicts if rules else 0),
+            symbol_rules_last_refresh_at=rules.last_refresh_at if rules else None,
+            symbol_rules_age_seconds=(
+                Decimal(str(rules.age_seconds)) if rules is not None else None
+            ),
+            symbol_rules_stale_after_seconds=rules.stale_after_seconds if rules else 0,
+            symbol_rules_last_failure_reason=rules.last_failure_reason if rules else None,
+            symbol_rules_telemetry_available=rules is not None,
         )
 
     def _series(
@@ -877,6 +974,19 @@ class _Costs:
                     costs.entry_notional += value
                     costs.entry_fills += 1
         return costs
+
+
+def _ratio(numerator: int, denominator: int) -> Decimal | None:
+    """Return a share, or ``None`` when there were no observations to take it over.
+
+    A rate over zero observations is undefined, not zero; reporting zero would read as
+    total failure on a day the session simply had nothing to do.
+    """
+    if denominator <= 0:
+        return None
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        return Decimal(numerator) / Decimal(denominator)
 
 
 def _span_seconds(outcomes: Sequence[BarOutcome]) -> Decimal:

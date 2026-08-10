@@ -21,6 +21,7 @@ from quantplatform.core.enums import ExecutionMode
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.orders import Fill, Order
 from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
+from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 
 __all__ = ["RuntimeMetrics", "SessionResult", "SessionSnapshot", "SessionStatus"]
 
@@ -127,6 +128,15 @@ class SessionResult:
     fills: tuple[Fill, ...] = ()
     orders: tuple[Order, ...] = ()
     detail: BacktestResult | None = None
+    symbol_rules: SymbolRulesTelemetry | None = None
+    """How the venue's trading rules are being kept current, or ``None`` when nothing is
+    refreshing them.
+
+    ``None`` is meaningful rather than merely absent: it is what a replay looks like, and
+    what a live session looks like if its refresh loop was never wired. Reporting
+    distinguishes the two cases from a refresh that is failing, because a run nobody is
+    keeping current will stop trading on a schedule and should not be reported as healthy
+    until it does."""
     """The full pipeline record — signals, intents, decisions, events, equity curve.
 
     A paper session runs the identical chain a backtest does, so it produces the identical

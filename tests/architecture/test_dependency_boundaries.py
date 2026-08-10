@@ -734,6 +734,104 @@ def test_the_telemetry_contract_carries_counters_not_connections() -> None:
             assert token not in field.lower(), f"telemetry field {field!r} names a transport"
 
 
+# --- Deployment boundaries ---------------------------------------------------------------------
+
+
+def test_the_production_strategy_reaches_nothing_but_the_domain() -> None:
+    # Re-stated for the built-in strategy specifically, now that one exists: it may not see
+    # the account it trades, the engine that executes it, or the limits that constrain it.
+    strategy = PACKAGE_ROOT / "strategies" / "ema_trend.py"
+    assert strategy.is_file()
+    assert _imported_domains(strategy) <= {"core", "strategies"}
+
+    # Checked on identifiers rather than raw text: the module's docstring names a broker and
+    # a balance precisely to say it never touches one, and a text scan cannot tell the
+    # difference between a promise and a violation.
+    tree = ast.parse(strategy.read_text(encoding="utf-8"), filename=str(strategy))
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    forbidden = {
+        "SimulatedBroker",
+        "SpotPortfolioEngine",
+        "StandardRiskEngine",
+        "balances",
+        "apply_fill",
+        "submit",
+        "api_key",
+        "api_secret",
+    }
+    assert not used & forbidden, f"the strategy reaches for {sorted(used & forbidden)}"
+
+
+def test_the_platform_ships_exactly_one_builtin_strategy() -> None:
+    # More than one invites a comparison this platform is not set up to make honestly.
+    registry = PACKAGE_ROOT / "strategies" / "registry.py"
+    assert "BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy,)" in (
+        registry.read_text(encoding="utf-8")
+    )
+
+
+def test_the_metadata_provider_cannot_reach_execution_or_sign_a_request() -> None:
+    # A REST client now exists in the tree. It reads public metadata and must stay unable to
+    # do anything else — the same guarantee the candle feed carries.
+    provider = PACKAGE_ROOT / "marketdata" / "symbol_rules.py"
+    assert provider.is_file()
+    assert _imported_domains(provider) <= {"core", "config", "marketdata"}
+    tree = ast.parse(provider.read_text(encoding="utf-8"), filename=str(provider))
+    for node in ast.walk(tree):
+        roots = _imported_root_modules(node)
+        assert not roots & {"hmac", "hashlib", "base64", "requests", "httpx", "ccxt"}, (
+            "the metadata provider may not sign a request"
+        )
+    assert not _defined_names(provider) & _TRADING_OPERATIONS
+
+
+def test_the_composition_root_is_the_only_place_that_wires_everything() -> None:
+    # Orchestration and the CLI are the only packages permitted to see the whole platform.
+    # A second one would mean two answers to "how is this assembled".
+    wiring = {"marketdata", "paper", "reporting", "storage"}
+    composers: set[str] = set()
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain is None:
+            continue
+        if wiring <= _imported_domains(path):
+            composers.add(domain)
+    assert composers <= {"orchestration", "cli"}, f"more than one composition root: {composers}"
+
+
+def test_the_composition_root_holds_no_trading_vocabulary() -> None:
+    # Wiring only. If the deployment layer ever defines a pipeline step, the step is in the
+    # wrong place and a change to trading behaviour could hide in a deployment commit.
+    forbidden = {
+        "generate",
+        "evaluate",
+        "apply_fill",
+        "reserve",
+        "release",
+        "submit",
+        "advance",
+        "summarise",
+        "compute",
+    }
+    for path in _source_files():
+        if _domain_of(path) != "orchestration":
+            continue
+        offenders = sorted(_defined_names(path) & forbidden)
+        assert not offenders, f"{path.name} defines {offenders}"
+
+
+def test_the_durable_state_repository_lives_in_storage() -> None:
+    # Paper may not import storage, so the persistent implementation cannot live beside the
+    # in-memory one; a composition root injects it through the port.
+    assert (PACKAGE_ROOT / "storage" / "paper_state.py").is_file()
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        assert "storage" not in _imported_domains(path), path
+
+
 def test_the_daily_delta_is_computed_in_the_shared_contract() -> None:
     # Subtracting two readings is the whole of "daily", and it belongs beside the type it
     # subtracts. Putting it in reporting would mean paper could not check a regression, and
@@ -771,3 +869,93 @@ def test_paper_consumes_the_live_feed_through_the_port_not_by_importing_it() -> 
         if _domain_of(path) != "paper":
             continue
         assert "marketdata" not in _imported_domains(path), path
+
+
+def _imported_root_modules_in(tree: ast.AST) -> set[str]:
+    """Return every top-level module imported anywhere in a parsed source tree."""
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        roots |= _imported_root_modules(node)
+    return roots
+
+
+_RULES_REPLACEMENT_OWNERS: Final[frozenset[str]] = frozenset({"core", "orchestration"})
+
+
+def test_only_a_composition_root_may_replace_the_venue_rules() -> None:
+    # Reading the store is every trading component's business; replacing what is in it is
+    # not. A risk engine or broker that refreshed its own rules would be deciding when the
+    # numbers it is judged against may change, and the schedule would stop being auditable
+    # from one place. Structural rather than textual: the check is for a call to `.replace(`
+    # on an identifier, so prose mentioning the word cannot trip it and a real call cannot
+    # hide behind one.
+    offenders: list[str] = []
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain is None or domain in _RULES_REPLACEMENT_OWNERS:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "replace":
+                target = func.value
+                if isinstance(target, ast.Attribute) and "symbol" in target.attr.lower():
+                    offenders.append(f"{path.relative_to(PACKAGE_ROOT)}:{node.lineno}")
+    assert not offenders, f"venue rules replaced outside a composition root: {offenders}"
+
+
+def test_the_symbol_rules_store_lives_in_core_and_depends_on_nothing() -> None:
+    # It has to be importable by risk, execution, portfolio, backtesting and orchestration
+    # alike. Anywhere but core and one of them would be importing another.
+    path = PACKAGE_ROOT / "core" / "symbol_rules.py"
+    assert path.exists()
+    assert _imported_domains(path) <= {"core"}
+
+
+def test_the_symbol_rules_provider_is_a_core_port() -> None:
+    # Orchestration schedules refreshes without importing a venue client, exactly as paper
+    # demands feed telemetry without importing a socket.
+    interfaces = (PACKAGE_ROOT / "core" / "interfaces.py").read_text(encoding="utf-8")
+    assert "class SymbolRulesProvider" in interfaces
+    assert "class SymbolRulesMaintainer" in interfaces
+    refresher = PACKAGE_ROOT / "orchestration" / "symbol_rules.py"
+    assert "marketdata" not in _imported_domains(refresher)
+
+
+def test_the_refresh_loop_never_reaches_an_order_or_account_endpoint() -> None:
+    # The refresher's whole job is reading public metadata. Nothing in it may acquire the
+    # ability to place, cancel or inspect an order, and nothing may need a credential.
+    refresher = PACKAGE_ROOT / "orchestration" / "symbol_rules.py"
+    tree = ast.parse(refresher.read_text(encoding="utf-8"), filename=str(refresher))
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    forbidden = called & _TRADING_OPERATIONS
+    assert not forbidden, f"the refresh loop calls trading operations: {sorted(forbidden)}"
+    assert not _imported_root_modules_in(tree) & _NETWORK_CLIENTS
+
+
+def test_paper_schedules_no_refresh_of_its_own() -> None:
+    # Orchestration owns the schedule. The runner performs maintenance through a port and
+    # forwards the reading; if it learned what a refresh interval was, there would be two
+    # places deciding when the venue gets called.
+    for path in _source_files():
+        if _domain_of(path) != "paper":
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "SymbolRulesRefresher" not in source, path
+        assert "refresh_interval_seconds" not in source, path
+
+
+def test_the_symbol_rules_telemetry_crosses_domains_through_core() -> None:
+    # Same road the feed's counters travel, and for the same reason: reporting may not
+    # import orchestration, and orchestration may not import reporting.
+    source = (PACKAGE_ROOT / "core" / "models" / "telemetry.py").read_text(encoding="utf-8")
+    assert "class SymbolRulesTelemetry" in source
+    for domain, module in (("reporting", "daily.py"), ("paper", "session.py")):
+        path = PACKAGE_ROOT / domain / module
+        assert "orchestration" not in _imported_domains(path), path

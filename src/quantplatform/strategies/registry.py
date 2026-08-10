@@ -20,11 +20,16 @@ from quantplatform.core.errors import (
 )
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.ema_trend import EmaTrendStrategy
 
 __all__ = ["BUILTIN_STRATEGIES", "StrategyRegistry", "build_default_registry"]
 
-BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = ()
-"""Strategies shipped with the platform. Populated from phase 6 onwards."""
+BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy,)
+"""Strategies shipped with the platform.
+
+One, deliberately. A paper run needs a strategy to exercise the chain, and more than one
+would invite a comparison this platform is not yet set up to make honestly.
+"""
 
 
 class StrategyRegistry:

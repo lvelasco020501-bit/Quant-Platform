@@ -80,16 +80,40 @@ def test_a_bar_is_not_final_until_the_clock_passes_its_close() -> None:
     assert session_clock.seconds_until_final(bar) == 0.0
 
 
-def test_a_grace_period_delays_when_a_bar_counts_as_final() -> None:
+def test_the_grace_period_forgives_a_clock_running_behind_the_venue() -> None:
+    # One platform-wide rule: `now >= close_time - grace`. The grace is subtracted, so a
+    # candle the venue has already closed is accepted even if our clock lags. Adding it
+    # instead rejected every live candle for ever, because a venue publishes each closed
+    # candle once and a refusal never advances the anchor.
     clock = SimulatedClock(ANCHOR)
     session_clock = SessionClock(clock, close_grace_seconds=30)
     bar = make_bar(index=0)
 
-    clock.set_time(bar.close_time)
-    assert session_clock.is_bar_final(bar) is False
-
-    clock.advance(timedelta(seconds=30))
+    clock.set_time(bar.close_time - timedelta(seconds=30))
     assert session_clock.is_bar_final(bar) is True
+    assert session_clock.seconds_until_final(bar) == 0.0
+
+
+def test_a_candle_arriving_before_the_tolerance_window_is_still_refused() -> None:
+    # Grace widens the window; it does not remove it.
+    clock = SimulatedClock(ANCHOR)
+    session_clock = SessionClock(clock, close_grace_seconds=30)
+    bar = make_bar(index=0)
+
+    clock.set_time(bar.close_time - timedelta(seconds=31))
+
+    assert session_clock.is_bar_final(bar) is False
+    assert session_clock.seconds_until_final(bar) == pytest.approx(1.0)
+
+
+def test_raising_the_grace_can_never_hide_a_valid_candle() -> None:
+    # The regression that mattered: a larger tolerance must only ever accept more, never
+    # fewer. Any grace at which a venue-closed candle stops being final is a broken rule.
+    bar = make_bar(index=0)
+    for grace in (0, 1, 2, 5, 30, 3_600):
+        clock = SimulatedClock(ANCHOR)
+        clock.set_time(bar.close_time)
+        assert SessionClock(clock, close_grace_seconds=grace).is_bar_final(bar) is True
 
 
 # --- State repository -------------------------------------------------------------------------

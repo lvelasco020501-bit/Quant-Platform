@@ -190,9 +190,13 @@ def test_position_state_carries_no_account_financials() -> None:
 # --- Registry ------------------------------------------------------------------------------------
 
 
-def test_default_registry_is_empty_before_phase_six() -> None:
-    assert BUILTIN_STRATEGIES == ()
-    assert len(build_default_registry()) == 0
+def test_the_default_registry_carries_the_one_builtin_strategy() -> None:
+    # Was "empty before phase six". The platform now ships exactly one strategy, so a paper
+    # run has something to execute; more than one would invite a comparison this platform is
+    # not yet set up to make honestly.
+    assert len(BUILTIN_STRATEGIES) == 1
+    assert len(build_default_registry()) == 1
+    assert "ema_trend" in build_default_registry()
 
 
 def test_registry_registers_and_resolves() -> None:

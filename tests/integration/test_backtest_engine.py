@@ -15,11 +15,14 @@ from typing import ClassVar
 import pytest
 from pydantic import BaseModel
 
+from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.enums import (
     CommissionModel,
     MarketType,
     OrderSide,
     PositionState,
+    RiskCheckCode,
+    RiskCheckStatus,
     SignalAction,
     Timeframe,
 )
@@ -33,8 +36,13 @@ from quantplatform.core.events import FillReceived, OrderStatusChanged, RiskDeci
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
-from quantplatform.features import MovingAverageFeatures, NullFeaturePipeline
+from quantplatform.features import (
+    ExponentialMovingAverageFeatures,
+    MovingAverageFeatures,
+    NullFeaturePipeline,
+)
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.registry import build_default_registry
 from tests.factories import (
     SYMBOL,
     make_backtest,
@@ -586,3 +594,80 @@ def test_strict_risk_without_a_spread_assumption_fails_before_the_run() -> None:
 
     with pytest.raises(ConfigurationError, match="spread"):
         engine.run(_flat_bars(2))
+
+
+# --- The production strategy through the real pipeline -------------------------------------------
+
+
+def _trend_bars() -> tuple[MarketBar, ...]:
+    """Flat warm-up, a sustained rise, then a sustained fall — one crossing each way."""
+    closes = (
+        [Decimal(50_000)] * 60
+        + [Decimal(50_000) + Decimal(300) * index for index in range(1, 61)]
+        + [Decimal(68_000) - Decimal(400) * index for index in range(1, 81)]
+    )
+    return make_bars(closes)
+
+
+def _production_engine() -> BacktestEngine:
+    engine, _, _ = make_backtest(
+        strategy=build_default_registry().create("ema_trend", {}),
+        features=ExponentialMovingAverageFeatures([20, 50]),
+    )
+    return engine
+
+
+def test_the_builtin_strategy_runs_the_whole_chain_deterministically() -> None:
+    # The production strategy against the production engine. Asserts the run happens and
+    # repeats exactly; it asserts nothing about whether the rule makes money.
+    bars = _trend_bars()
+
+    first = _production_engine().run(bars)
+    second = _production_engine().run(bars)
+
+    assert first.bars_processed == len(bars)
+    assert first.signals != ()
+    assert [signal.action for signal in first.signals] == [
+        signal.action for signal in second.signals
+    ]
+    assert [signal.signal_id for signal in first.signals] == [
+        signal.signal_id for signal in second.signals
+    ]
+
+
+def test_the_builtin_strategy_signals_an_entry_once_the_fast_average_leads() -> None:
+    result = _production_engine().run(_trend_bars())
+
+    assert SignalAction.ENTER_LONG in [signal.action for signal in result.signals]
+
+
+def test_the_builtin_strategy_stays_silent_through_a_flat_market() -> None:
+    result = _production_engine().run(make_bars([Decimal(50_000)] * 120))
+
+    assert result.signals == ()
+    assert result.fills == ()
+
+
+def test_symbol_rules_older_than_a_day_stop_every_order() -> None:
+    # The risk engine refuses an intent once the venue's rules are more than
+    # `stale_symbol_rules_seconds` old, and this fixture's rules are stamped at the first bar
+    # and never refreshed. A run spanning more than a day therefore trades nothing.
+    #
+    # Kept deliberately, as the control case for the refresh mechanism rather than as an open
+    # defect. Orchestration now re-fetches the rules on a schedule
+    # (`tests/integration/test_symbol_rules_refresh.py` runs seven simulated days without a
+    # single staleness refusal); this asserts the check it relies on is still doing its job
+    # when nothing refreshes. Weakening the check would make both tests meaningless — this
+    # one by removing the refusal, that one by proving nothing.
+    result = _production_engine().run(_trend_bars())
+
+    assert result.signals != ()
+    assert result.fills == ()
+    stale = [
+        check
+        for decision in result.rejected_decisions
+        for check in decision.checks
+        if check.code is RiskCheckCode.SYMBOL_RULES_FRESHNESS
+        and check.status is RiskCheckStatus.FAILED
+    ]
+    assert stale, "expected the staleness check to be the refusal reason"

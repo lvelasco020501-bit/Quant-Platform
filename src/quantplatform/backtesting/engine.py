@@ -58,6 +58,7 @@ from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIn
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
+from quantplatform.core.symbol_rules import as_symbol_rules_store
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.risk.engine import StandardRiskEngine
@@ -137,6 +138,11 @@ class BacktestEngine:
             broker: Deterministic simulated venue.
             portfolio: Sole accounting authority; the broker settles into it.
             symbols: Venue rules per traded symbol.
+            A shared
+            :class:`~quantplatform.core.symbol_rules.SymbolRulesStore` is held by
+            reference, so a refresh reaches this component; any other mapping is copied
+            into one, so a caller mutating its own dictionary cannot alter what is traded
+            against.
         """
         self._config = config
         self._strategy = strategy
@@ -144,7 +150,7 @@ class BacktestEngine:
         self._risk = risk_engine
         self._broker = broker
         self._portfolio = portfolio
-        self._symbols = dict(symbols)
+        self._symbols = as_symbol_rules_store(symbols)
 
     @property
     def strategy_id(self) -> str:

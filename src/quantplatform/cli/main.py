@@ -12,7 +12,7 @@ import json
 import typer
 
 from quantplatform import __version__
-from quantplatform.cli import data
+from quantplatform.cli import data, paper
 from quantplatform.config.settings import Settings, load_settings
 from quantplatform.core.errors import QuantPlatformError
 
@@ -25,6 +25,7 @@ app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(data.app)
+app.add_typer(paper.app)
 
 _EXIT_CONFIGURATION_ERROR = 2
 

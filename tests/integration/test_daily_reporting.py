@@ -28,6 +28,7 @@ from quantplatform.core.models.telemetry import (
     ADDITIVE_FEED_COUNTERS,
     ZERO_FEED_METRICS,
     FeedMetricsSnapshot,
+    SymbolRulesTelemetry,
 )
 from quantplatform.marketdata.feed import BinanceSpotMarketDataFeed
 from quantplatform.paper import (
@@ -49,6 +50,7 @@ from quantplatform.reporting import (
     ReportingConfiguration,
     reconstruct_round_trips,
 )
+from quantplatform.reporting.summary import render_markdown
 from tests.factories import ANCHOR, make_backtest, make_bars
 from tests.integration.test_backtest_engine import (
     BuyOnce,
@@ -1255,3 +1257,116 @@ def test_a_replay_feed_still_runs_without_telemetry(tmp_path: Path) -> None:
     result = PaperTradingRunner(session=session, feed=replay, max_bars=4).run()
 
     assert result.runtime.bars_processed == 4
+
+
+# --- Venue rules reach the report -----------------------------------------------------------
+
+
+def _telemetry(**overrides: object) -> SymbolRulesTelemetry:
+    defaults: dict[str, object] = {
+        "refresh_attempts": 4,
+        "refresh_successes": 4,
+        "last_refresh_at": ANCHOR,
+        "age_seconds": 3600.0,
+        "stale_after_seconds": 86_400,
+    }
+    return SymbolRulesTelemetry(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def _reported_with(tmp_path: Path, telemetry: SymbolRulesTelemetry | None) -> DailyReportRecorder:
+    """Run a two-day session that carries one symbol-rules reading throughout."""
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, observer=recorder)
+    session.start()
+    for bar in _two_day_bars():
+        clock.set_time(bar.close_time)
+        if telemetry is not None:
+            session.record_symbol_rules_telemetry(telemetry)
+        session.submit_bar(bar)
+    session.stop()
+    return recorder
+
+
+def test_a_refresh_reading_reaches_the_daily_report(tmp_path: Path) -> None:
+    recorder = _reported_with(tmp_path, _telemetry(rule_changes=1))
+
+    statistics = recorder.reports[0].statistics
+
+    assert statistics.symbol_rules_telemetry_available is True
+    assert statistics.symbol_rules_refresh_attempts == 4
+    assert statistics.symbol_rules_refresh_successes == 4
+    assert statistics.symbol_rules_changes == 1
+    assert statistics.symbol_rules_age_seconds == Decimal("3600.0")
+    assert statistics.symbol_rules_stale_after_seconds == 86_400
+
+
+def test_a_healthy_refresh_leaves_the_day_green(tmp_path: Path) -> None:
+    recorder = _reported_with(tmp_path, _telemetry())
+
+    report = recorder.reports[0]
+
+    assert report.health.level is HealthLevel.GREEN
+    assert AlertCode.SYMBOL_RULES_STALE not in {a.code for a in report.alerts.alerts}
+
+
+def test_a_failing_refresh_is_visible_in_the_report(tmp_path: Path) -> None:
+    # Visible while the rules in force are still valid — the warning arrives with hours of
+    # slack, not after trading has already stopped.
+    recorder = _reported_with(
+        tmp_path,
+        _telemetry(
+            refresh_attempts=6,
+            refresh_successes=4,
+            refresh_failures=2,
+            consecutive_failures=2,
+            last_failure_reason="DataProviderError: venue unreachable",
+        ),
+    )
+
+    report = recorder.reports[0]
+
+    assert report.health.level is HealthLevel.YELLOW
+    assert AlertCode.SYMBOL_RULES_REFRESH_FAILING in {a.code for a in report.alerts.alerts}
+    assert "venue unreachable" in render_markdown(report)
+
+
+def test_stale_rules_make_the_day_red(tmp_path: Path) -> None:
+    recorder = _reported_with(
+        tmp_path,
+        _telemetry(
+            refresh_attempts=8,
+            refresh_successes=1,
+            refresh_failures=7,
+            consecutive_failures=7,
+            age_seconds=200_000.0,
+            last_failure_reason="OSError: connection reset",
+        ),
+    )
+
+    report = recorder.reports[0]
+
+    assert report.health.level is HealthLevel.RED
+    assert AlertCode.SYMBOL_RULES_STALE in {a.code for a in report.alerts.alerts}
+
+
+def test_a_session_with_no_refresh_loop_reports_it_as_unmeasured(tmp_path: Path) -> None:
+    recorder = _reported_with(tmp_path, None)
+
+    report = recorder.reports[0]
+
+    assert report.statistics.symbol_rules_telemetry_available is False
+    assert "No symbol-rules telemetry was supplied" in render_markdown(report)
+
+
+def test_the_venue_rules_section_survives_a_write_and_read(tmp_path: Path) -> None:
+    writer = DailyReportWriter(config=_config(tmp_path))
+    recorder = _reported_with(tmp_path, _telemetry(refresh_failures=1, refresh_attempts=5))
+    report = recorder.reports[0]
+
+    writer.write(report)
+    restored = writer.read_previous(report.day + timedelta(days=1))
+
+    assert restored is not None
+    assert restored.statistics.symbol_rules_refresh_failures == 1
+    assert restored.statistics.symbol_rules_refresh_attempts == 5

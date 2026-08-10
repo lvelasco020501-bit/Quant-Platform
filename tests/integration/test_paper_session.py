@@ -17,6 +17,7 @@ import pytest
 from quantplatform.core.clock import SimulatedClock
 from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 from quantplatform.paper import (
     InMemoryPaperStateRepository,
     PaperTradingRunner,
@@ -484,3 +485,92 @@ def test_run_once_refuses_when_the_session_is_not_running() -> None:
 
     with pytest.raises(PaperSessionStateError, match="not running"):
         runner.run_once(make_bar(index=0))
+
+
+# --- Venue rules maintenance ------------------------------------------------------------------
+
+
+class _Maintainer:
+    """Records that it was asked, and answers with whatever reading it was given."""
+
+    def __init__(self, reading: SymbolRulesTelemetry | None = None) -> None:
+        self.calls = 0
+        self.reading = reading if reading is not None else SymbolRulesTelemetry()
+
+    def maintain(self) -> SymbolRulesTelemetry:
+        self.calls += 1
+        return self.reading
+
+
+def test_the_runner_maintains_the_venue_rules_once_per_bar() -> None:
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock)
+    maintainer = _Maintainer()
+    runner = PaperTradingRunner(
+        session=session, feed=_ReplayFeed(_flat_bars(5), clock), symbol_rules=maintainer
+    )
+
+    runner.run()
+
+    assert maintainer.calls == 5
+
+
+def test_the_reading_reaches_the_session_and_its_result() -> None:
+    # Carried, never consulted. It exists so a daily report can say whether the rulebook is
+    # still being re-read; the session itself must not act on it.
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock)
+    reading = SymbolRulesTelemetry(
+        refresh_attempts=3,
+        refresh_successes=3,
+        last_refresh_at=ANCHOR,
+        age_seconds=1800.0,
+        stale_after_seconds=86_400,
+    )
+    runner = PaperTradingRunner(
+        session=session,
+        feed=_ReplayFeed(_flat_bars(3), clock),
+        symbol_rules=_Maintainer(reading),
+    )
+
+    result = runner.run()
+
+    assert session.symbol_rules_telemetry == reading
+    assert result.symbol_rules == reading
+
+
+def test_a_session_without_maintenance_reports_nothing_rather_than_zeros() -> None:
+    # The distinction reporting depends on: nobody refreshing is not the same as refreshing
+    # successfully, and a run with no loop will stop trading once the budget expires.
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock)
+    runner = PaperTradingRunner(session=session, feed=_ReplayFeed(_flat_bars(3), clock))
+
+    result = runner.run()
+
+    assert result.symbol_rules is None
+
+
+def test_maintenance_happens_before_the_bar_is_submitted() -> None:
+    # A refresh landing after the bar would size that bar's order against the rules the
+    # previous candle happened to see, and a day rollover would report the new day's reading
+    # in the old day's closing report.
+    order: list[str] = []
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock)
+
+    class _Recording(_Maintainer):
+        def maintain(self) -> SymbolRulesTelemetry:
+            order.append("maintain")
+            return super().maintain()
+
+    runner = PaperTradingRunner(
+        session=session,
+        feed=_ReplayFeed(_flat_bars(2), clock),
+        on_bar=lambda _: order.append("bar"),
+        symbol_rules=_Recording(),
+    )
+
+    runner.run()
+
+    assert order == ["maintain", "bar", "maintain", "bar"]

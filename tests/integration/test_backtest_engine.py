@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.enums import (
     CommissionModel,
+    ExecutionMode,
     MarketType,
     OrderSide,
     PositionState,
@@ -41,6 +42,7 @@ from quantplatform.features import (
     MovingAverageFeatures,
     NullFeaturePipeline,
 )
+from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.registry import build_default_registry
 from tests.factories import (
@@ -671,3 +673,92 @@ def test_symbol_rules_older_than_a_day_stop_every_order() -> None:
         and check.status is RiskCheckStatus.FAILED
     ]
     assert stale, "expected the staleness check to be the refusal reason"
+
+
+# --- The account is the only source of opening equity --------------------------------------
+#
+# `BacktestConfig.initial_capital` used to anchor the drawdown while the portfolio held
+# whatever it had actually been seeded with. When a composition root declared ten thousand
+# and seeded nothing, `_record_equity` kept `max(peak, equity)` at ten thousand against a
+# real equity of zero, and day one of a paper run published a 100% drawdown and a
+# ten-thousand loss that never happened. The run now reads the account.
+
+
+def _engine_with(cash: Decimal) -> tuple[BacktestEngine, SpotPortfolioEngine]:
+    engine, _, portfolio = make_backtest(strategy=Silent(_Params()), cash=cash)
+    return engine, portfolio
+
+
+def test_the_run_opens_from_the_account_not_from_configuration() -> None:
+    engine, portfolio = _engine_with(Decimal(25_000))
+
+    state = engine.begin()
+
+    assert state.initial_equity == Decimal(25_000)
+    assert state.peak_equity == Decimal(25_000)
+    assert state.day_start_equity == Decimal(25_000)
+    assert portfolio.balances()[0].total == Decimal(25_000)
+
+
+def test_an_untouched_run_reports_no_drawdown_and_no_loss() -> None:
+    engine, _ = _engine_with(Decimal(10_000))
+
+    result = engine.run(_flat_bars(5))
+
+    assert result.performance is not None
+    assert result.performance.initial_equity == Decimal(10_000)
+    assert result.performance.final_equity == Decimal(10_000)
+    assert result.performance.total_return == Decimal(0)
+    assert result.performance.max_drawdown == Decimal(0)
+    assert all(point.drawdown == Decimal(0) for point in result.equity_curve)
+
+
+def test_the_first_bar_can_never_show_a_drawdown() -> None:
+    # The peak is anchored to what the account actually held, so the opening bar compares
+    # equity against itself. A peak taken from configuration could exceed it from the start.
+    engine, _ = _engine_with(Decimal(10_000))
+
+    result = engine.run(_flat_bars(1))
+
+    assert result.equity_curve[0].drawdown == Decimal(0)
+
+
+def test_a_run_against_an_unfunded_account_is_refused_rather_than_going_quiet() -> None:
+    # Configuration cannot express this — `initial_capital` is validated strictly positive
+    # in both `BacktestConfig` and settings. The failure was a declared capital that never
+    # reached the account, so the account is what has to be starved to reproduce it.
+    #
+    # Silence was the real damage: no intent, no decision, no rejection reason, and a report
+    # with nothing to show but green checks.
+    rules = {SYMBOL: make_symbol_rules()}
+    reference, broker, _ = make_backtest(strategy=Silent(_Params()))
+    starved = SpotPortfolioEngine(
+        quote_asset=_USDT,
+        symbols=rules,
+        execution_mode=ExecutionMode.BACKTEST,
+        initial_balances=(),
+    )
+    engine = BacktestEngine(
+        config=make_backtest_config(),
+        strategy=Silent(_Params()),
+        features=NullFeaturePipeline(),
+        risk_engine=reference._risk,
+        broker=broker,
+        portfolio=starved,
+        symbols=rules,
+    )
+
+    with pytest.raises(ConfigurationError, match="holds no equity"):
+        engine.begin()
+
+
+def test_moving_the_configured_capital_moves_the_reported_opening_equity() -> None:
+    # The two are one number. If they could drift, this would pass with either value.
+    for cash in (Decimal(5_000), Decimal(50_000)):
+        engine, _ = _engine_with(cash)
+
+        result = engine.run(_flat_bars(3))
+
+        assert result.performance is not None
+        assert result.performance.initial_equity == cash
+        assert result.config.initial_capital == cash

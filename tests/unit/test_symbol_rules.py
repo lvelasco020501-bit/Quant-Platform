@@ -8,6 +8,7 @@ cases can be exercised on demand.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -159,14 +160,43 @@ def test_an_absent_ceiling_is_none_rather_than_zero() -> None:
     assert rules.max_quantity is None
 
 
-def test_rules_are_cached_for_the_process() -> None:
+def test_every_fetch_actually_reads_the_venue() -> None:
+    # The replacement for a test that used to assert the opposite. Memoising made this
+    # class unusable as a refresh source: a loop calling fetch every six hours got the
+    # first answer back for ever, still carrying its original timestamp, so the rules aged
+    # without limit while the refresher counted success after success.
     provider, transport = _provider(_document())
 
     provider.fetch(["BTC/USDT"])
     provider.fetch(["BTC/USDT"])
+    provider.fetch(["BTC/USDT"])
 
-    assert transport.calls == 1
-    assert provider.cached_symbols == ("BTC/USDT",)
+    assert transport.calls == 3
+
+
+def test_each_read_is_stamped_with_the_time_it_happened() -> None:
+    # The property the refresh loop depends on: a new read must produce a newer
+    # ``updated_at``, because that timestamp is the whole basis of the staleness budget.
+    clock = SimulatedClock(ANCHOR)
+    provider = BinanceSpotSymbolRulesProvider(clock=clock, transport=_StaticTransport(_document()))
+
+    first = provider.fetch(["BTC/USDT"])["BTC/USDT"]
+    clock.advance(timedelta(hours=6))
+    second = provider.fetch(["BTC/USDT"])["BTC/USDT"]
+
+    assert first.updated_at == ANCHOR
+    assert second.updated_at == ANCHOR + timedelta(hours=6)
+    assert second.updated_at > first.updated_at
+
+
+def test_the_provider_holds_no_state_between_reads() -> None:
+    # Statelessness is the guarantee. An object that remembers nothing cannot serve a stale
+    # answer, which is a stronger promise than any expiry policy could make.
+    provider, _ = _provider(_document())
+
+    provider.fetch(["BTC/USDT"])
+
+    assert not [name for name in vars(provider) if name.endswith("cache")]
 
 
 # --- Refusals -----------------------------------------------------------------------------------

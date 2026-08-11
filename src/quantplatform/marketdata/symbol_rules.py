@@ -14,9 +14,14 @@ order endpoint. It is the same guarantee the candle feed carries, for the same r
 straight into :class:`~decimal.Decimal`; no value passes through a float, because a tick size
 of ``0.01`` that becomes ``0.010000000000000000208`` is a tick size that rounds wrongly.
 
-**Cached for the process, never on disk.** Rules change rarely but they do change, and a
-cache that outlived the process would let a restart pick up last month's minimum notional
-without anyone choosing that.
+**Stateless: every call reads the venue.** This module once memoised its answers for the
+life of the process, which quietly disabled the mechanism that keeps rules current — a
+refresh loop got the first answer back every time, complete with its original timestamp,
+while the rules aged past the risk engine's budget and the refresher counted success after
+success. Rules change rarely, but "rarely" is not "never", and an object that remembers
+nothing cannot serve a stale answer. How often to ask is
+:class:`~quantplatform.orchestration.symbol_rules.SymbolRulesRefresher`'s decision, and it
+is the only place that decision lives.
 """
 
 from __future__ import annotations
@@ -154,17 +159,11 @@ class BinanceSpotSymbolRulesProvider:
         self._clock = clock
         self._transport = transport if transport is not None else HttpExchangeInfoTransport()
         self._url = url
-        self._cache: dict[str, SymbolRules] = {}
 
     @property
     def url(self) -> str:
         """Return the metadata endpoint in use."""
         return self._url
-
-    @property
-    def cached_symbols(self) -> tuple[str, ...]:
-        """Return the canonical symbols already fetched in this process, sorted."""
-        return tuple(sorted(self._cache))
 
     def fetch(self, symbols: Sequence[str]) -> dict[str, SymbolRules]:
         """Fetch and validate the venue's rules for a set of canonical symbols.
@@ -172,11 +171,29 @@ class BinanceSpotSymbolRulesProvider:
         One request covers every symbol: the document describes the whole venue, and asking
         for it once per instrument would multiply the failure modes for no benefit.
 
+        **Every call reads the venue.** This class once memoised its answers for the life of
+        the process, and that quietly broke the thing it exists for. A refresh loop calling
+        ``fetch`` every six hours got the first answer back every time, still carrying its
+        original ``updated_at``; the store replaced identical rules with identical rules, the
+        refresher counted a success, and the age of the rules climbed without limit until the
+        risk engine began refusing every order for ``symbol_rules_freshness``. The mechanism
+        reported perfect health throughout — six successes, zero failures — while performing
+        exactly one HTTP request in two days.
+
+        So there is no cache, and deliberately not a shorter-lived one either. A time-to-live
+        would be a *second* opinion about how fresh venue rules must be, sitting next to the
+        refresh interval and the risk engine's staleness budget, free to disagree with both.
+        This object answers one question — *what does the venue say right now* — and a
+        stateless answer is the only kind that cannot be wrong. Deciding how often to ask is
+        the caller's business, and
+        :class:`~quantplatform.orchestration.symbol_rules.SymbolRulesRefresher` is where
+        that decision lives.
+
         Args:
             symbols: Canonical platform symbols, ``BTC/USDT`` form.
 
         Returns:
-            Validated rules per canonical symbol.
+            Validated rules per canonical symbol, stamped with the time of *this* read.
 
         Raises:
             DataProviderError: If the document cannot be fetched or parsed.
@@ -185,10 +202,6 @@ class BinanceSpotSymbolRulesProvider:
             DataIntegrityError: If a symbol's filters are missing or unparseable.
         """
         wanted = {_venue_symbol(symbol): symbol for symbol in symbols}
-        missing = [symbol for symbol in symbols if symbol not in self._cache]
-        if not missing:
-            return {symbol: self._cache[symbol] for symbol in symbols}
-
         document = self._load()
         fetched_at = ensure_utc(self._clock.now())
         found: dict[str, SymbolRules] = {}
@@ -204,8 +217,7 @@ class BinanceSpotSymbolRulesProvider:
             raise MarketDataSubscriptionError(
                 "the venue does not list these symbols", symbols=absent, url=self._url
             )
-        self._cache.update(found)
-        return {symbol: self._cache[symbol] for symbol in symbols}
+        return {symbol: found[symbol] for symbol in symbols}
 
     def _load(self) -> list[dict[str, Any]]:
         """Fetch the document and return its symbol entries.

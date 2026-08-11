@@ -18,14 +18,17 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.cli.main import app
 from quantplatform.cli.paper import _overrides, _settings_with
 from quantplatform.config.settings import Settings, load_settings
 from quantplatform.core.clock import SimulatedClock
+from quantplatform.core.constants import ZERO
 from quantplatform.core.enums import ExecutionMode, LogFormat
 from quantplatform.core.errors import ConfigurationError, StorageError
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.symbol_rules import SymbolRulesStore
+from quantplatform.features import NullFeaturePipeline
 from quantplatform.marketdata.symbol_rules import BinanceSpotSymbolRulesProvider
 from quantplatform.orchestration.logging_setup import (
     LOG_STREAMS,
@@ -38,15 +41,24 @@ from quantplatform.orchestration.paper import (
     validate_startup,
 )
 from quantplatform.orchestration.shutdown import ShutdownSignal, shutdown_on_signals
+from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.reporting import (
     DailyReportBuilder,
     DailyReportWriter,
     ReportingConfiguration,
 )
+from quantplatform.risk.engine import StandardRiskEngine
 from quantplatform.storage.paper_state import FilePaperStateRepository
 from quantplatform.strategies.registry import StrategyRegistry, build_default_registry
-from tests.factories import ANCHOR, SYMBOL, make_bar, make_bars, make_symbol_rules
-from tests.integration.test_backtest_engine import Silent
+from tests.factories import (
+    ANCHOR,
+    SYMBOL,
+    make_bar,
+    make_bars,
+    make_risk_config,
+    make_symbol_rules,
+)
+from tests.integration.test_backtest_engine import Silent, _Params
 from tests.integration.test_marketdata_feed import _bar_steps, _feed
 
 _EXIT_CONFIGURATION_ERROR = 2
@@ -999,3 +1011,116 @@ def test_the_default_schedule_leaves_four_refreshes_of_margin(
     assert settings.paper.symbol_rules_refresh_seconds == 21_600.0
     assert budget == 86_400
     assert budget / settings.paper.symbol_rules_refresh_seconds == 4
+
+
+# --- Opening capital ----------------------------------------------------------------------------
+#
+# The defect these pin down cost a day of observation. The composition root declared ten
+# thousand of capital in the run configuration and seeded the account with nothing. Signals
+# were generated and then discarded inside `build_intent`, which returns None when equity is
+# zero — so no intent, no risk decision, no rejection reason, nothing for a report to show.
+# Meanwhile the run state anchored its drawdown to the declared capital, and day one
+# published a 100% drawdown and a ten-thousand loss that never happened.
+
+
+def test_the_account_is_seeded_with_the_capital_the_run_declares(
+    directories: dict[str, Path],
+) -> None:
+    settings = _settings(directories)
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=SimulatedClock(ANCHOR)
+    )
+
+    balances = deployment.session._portfolio.balances()
+
+    assert len(balances) == 1
+    assert balances[0].asset == settings.market.quote_asset
+    assert balances[0].free == settings.backtest.initial_capital
+    assert balances[0].locked == ZERO
+    assert balances[0].total == settings.backtest.initial_capital
+
+
+def test_the_declared_capital_and_the_seeded_account_are_one_number(
+    directories: dict[str, Path],
+) -> None:
+    # Not "they happen to be equal" but "they come from the same place". Changing the
+    # configured capital must move both, or the two can drift apart again.
+    settings = _settings(directories)
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=SimulatedClock(ANCHOR)
+    )
+    engine = deployment.session._engine
+    account = deployment.session._portfolio.balances()[0].total
+
+    assert engine._config.initial_capital == account
+    assert account == settings.backtest.initial_capital
+
+
+def test_a_run_against_an_unfunded_account_is_refused_at_the_first_step(
+    directories: dict[str, Path],
+) -> None:
+    # Configuration alone cannot express this: `initial_capital` is already validated as
+    # strictly positive. The failure was a *declared* capital that never reached the
+    # account, so the check belongs where the two meet — opening the run.
+    settings = _settings(directories)
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=SimulatedClock(ANCHOR)
+    )
+    starved = SpotPortfolioEngine(
+        quote_asset=settings.market.quote_asset,
+        symbols=deployment.symbol_rules,
+        execution_mode=ExecutionMode.PAPER,
+        initial_balances=(),
+        source="starved",
+    )
+    engine = BacktestEngine(
+        config=deployment.session._engine._config,
+        strategy=Silent(_Params()),
+        features=NullFeaturePipeline(),
+        risk_engine=StandardRiskEngine(config=make_risk_config()),
+        broker=deployment.session._broker,
+        portfolio=starved,
+        symbols=deployment.symbol_rules,
+    )
+
+    with pytest.raises(ConfigurationError, match="holds no equity"):
+        engine.begin()
+
+
+def test_a_fresh_run_opens_flat_with_nothing_lost(directories: dict[str, Path]) -> None:
+    settings = _settings(directories)
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=SimulatedClock(ANCHOR)
+    )
+    deployment.session.start()
+
+    result = deployment.session.result()
+    performance = result.performance
+
+    assert performance is not None
+    assert performance.initial_equity == settings.backtest.initial_capital
+    assert performance.final_equity == settings.backtest.initial_capital
+    assert performance.total_return == ZERO
+    assert performance.max_drawdown == ZERO
+
+
+def test_an_untraded_day_cannot_report_a_loss(directories: dict[str, Path]) -> None:
+    # The precise shape of the fabricated report: a day that traded nothing must show a flat
+    # account, not a wiped-out one.
+    clock = SimulatedClock(ANCHOR)
+    settings = _settings(directories)
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=clock
+    )
+    deployment.session.start()
+    for bar in make_bars([Decimal(50_000)] * 6):
+        clock.set_time(bar.close_time)
+        deployment.session.submit_bar(bar)
+
+    snapshot = deployment.session.snapshot()
+    performance = deployment.session.result().performance
+
+    assert snapshot.equity == settings.backtest.initial_capital
+    assert performance is not None
+    assert performance.max_drawdown == ZERO
+    assert performance.total_return == ZERO

@@ -100,6 +100,16 @@ class RunState:
     positions: dict[str, Position]
     approved_by_id: dict[str, ApprovedOrder]
     approval_times: list[datetime]
+    initial_equity: Decimal
+    """The equity the account genuinely held when the run opened.
+
+    Read from the portfolio, never from configuration. The two used to be separate numbers:
+    ``BacktestConfig.initial_capital`` anchored the drawdown while the portfolio held
+    whatever it had actually been seeded with, and a paper deployment that seeded nothing
+    produced a report claiming a 100% drawdown and a ten-thousand loss that never happened.
+    One number, taken from the account itself, makes that unrepresentable.
+    """
+
     peak_equity: Decimal
     day_start_equity: Decimal
     day_started_at: date | None
@@ -198,10 +208,12 @@ class BacktestEngine:
             Fresh bookkeeping for a run that has processed no bars.
 
         Raises:
-            ConfigurationError: If the risk engine demands a metric this run cannot supply.
+            ConfigurationError: If the risk engine demands a metric this run cannot
+                supply, or the account holds no equity to trade with.
             StrategyContextError: If the pipeline cannot produce a required feature.
         """
         self._validate_contract()
+        self._validate_funded()
         return self._initial_state()
 
     def advance(self, bar: MarketBar, state: RunState) -> BarOutcome:
@@ -606,10 +618,58 @@ class BacktestEngine:
                 open_time=bar.open_time.isoformat(),
             )
 
+    def _validate_funded(self) -> None:
+        """Refuse to open a run against an account holding nothing.
+
+        A run with no equity does not fail — it goes quiet, which is far worse. Sizing an
+        entry asks for a share of equity, a share of nothing is nothing, and ``build_intent``
+        discards the signal before it ever becomes an order intent. There is no rejection, no
+        reason recorded, and nothing for a report to describe: the risk engine is never even
+        consulted. A week of that produces immaculate green reports for a session that never
+        placed a single order, which is exactly what happened.
+
+        Declaring capital in the run configuration is not evidence that the account was
+        seeded with it. This is where the two meet, so this is where they are checked.
+
+        Raises:
+            ConfigurationError: If the account holds no equity in the quote asset.
+        """
+        equity = self._opening_equity()
+        if equity > ZERO:
+            return
+        raise ConfigurationError(
+            "the account holds no equity, so every signal would be discarded before it "
+            "became an order intent and the run would report perfect health while trading "
+            "nothing; seed the portfolio with the capital the run configuration declares",
+            run_id=self._config.run_id,
+            quote_asset=self._config.quote_asset,
+            declared_capital=str(self._config.initial_capital),
+            account_equity=str(equity),
+        )
+
+    def _opening_equity(self) -> Decimal:
+        """Return the equity the account holds as the run opens.
+
+        Taken from the portfolio, which is the only thing that knows what the account is
+        actually worth. ``BacktestConfig.initial_capital`` is the value a composition root
+        *seeds* with; it is not evidence that the seeding happened, and treating it as such
+        is what let a paper session report losing money it never had.
+
+        Positions are always empty at this point — the portfolio engine is flat-start by
+        construction and refuses a seeded base-asset balance — so the quote-asset total is
+        the whole of the account's worth and no mark prices are needed to value it.
+        """
+        quote = self._config.quote_asset
+        return sum(
+            (balance.total for balance in self._portfolio.balances() if balance.asset == quote),
+            ZERO,
+        )
+
     def _initial_state(self) -> RunState:
         """Build the bookkeeping for a fresh run."""
-        equity = self._config.initial_capital
+        equity = self._opening_equity()
         return RunState(
+            initial_equity=equity,
             curve=[],
             snapshots=[],
             outcomes=[],
@@ -645,7 +705,7 @@ class BacktestEngine:
         """Summarise a run over no data: an untouched account and nothing computable."""
         return compute_performance(
             curve=(),
-            initial_equity=self._config.initial_capital,
+            initial_equity=self._opening_equity(),
             realized_pnl=ZERO,
             unrealized_pnl=ZERO,
             commission_paid=ZERO,
@@ -661,7 +721,7 @@ class BacktestEngine:
         final = state.snapshots[-1]
         performance = compute_performance(
             curve=tuple(state.curve),
-            initial_equity=self._config.initial_capital,
+            initial_equity=state.initial_equity,
             realized_pnl=final.realized_pnl,
             unrealized_pnl=final.unrealized_pnl,
             commission_paid=state.commission,

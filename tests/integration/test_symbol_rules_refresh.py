@@ -35,9 +35,11 @@ from quantplatform.core.models.risk import RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.symbol_rules import SymbolRulesStore
+from quantplatform.marketdata.symbol_rules import BinanceSpotSymbolRulesProvider
 from quantplatform.orchestration.symbol_rules import SymbolRulesRefresher
 from quantplatform.strategies.base import BaseStrategy
 from tests.factories import ANCHOR, SYMBOL, make_backtest, make_bars, make_symbol_rules
+from tests.unit.test_symbol_rules import _document as _exchange_info_document
 
 _SIX_HOURS = 6 * 3600
 _ONE_DAY = 24 * 3600
@@ -345,3 +347,138 @@ def test_no_run_length_reintroduces_the_stale_rejection(hours: int) -> None:
     week = _Week(refresh=True, hours=hours).run()
 
     assert week.stale_rejections() == ()
+
+
+# --- The real provider inside the refresh loop --------------------------------------------------
+#
+# Everything above drives the refresher with a venue double. That is what let the original
+# defect through: the double always answered with freshly stamped rules, so the loop looked
+# correct while the real provider was memoising its first answer for the life of the process.
+# These tests close that gap by wiring the production provider itself.
+
+
+class _CountingTransport:
+    """The real provider's transport, counting how often the venue is actually read."""
+
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def fetch(self, url: str) -> str:
+        self.calls += 1
+        _ = url
+        return self.payload
+
+
+def _real_provider(
+    clock: SimulatedClock,
+) -> tuple[BinanceSpotSymbolRulesProvider, _CountingTransport]:
+    transport = _CountingTransport(_exchange_info_document())
+    return BinanceSpotSymbolRulesProvider(clock=clock, transport=transport), transport
+
+
+def test_the_real_provider_reads_the_venue_on_every_refresh() -> None:
+    # The exact scenario that failed in production: one HTTP request in two days, eight
+    # "successful" refreshes, and rules that never got any younger.
+    clock = SimulatedClock(ANCHOR)
+    provider, transport = _real_provider(clock)
+    store = SymbolRulesStore(provider.fetch([SYMBOL]))
+    refresher = SymbolRulesRefresher(
+        store=store,
+        provider=provider,
+        clock=clock,
+        refresh_interval_seconds=_SIX_HOURS,
+        stale_after_seconds=_ONE_DAY,
+    )
+
+    for hour in range(6, 49, 6):
+        clock.set_time(ANCHOR + timedelta(hours=hour))
+        refresher.maintain()
+
+    assert transport.calls == 1 + 8
+
+
+def test_a_successful_refresh_moves_updated_at_forward() -> None:
+    clock = SimulatedClock(ANCHOR)
+    provider, _ = _real_provider(clock)
+    store = SymbolRulesStore(provider.fetch([SYMBOL]))
+    refresher = SymbolRulesRefresher(
+        store=store,
+        provider=provider,
+        clock=clock,
+        refresh_interval_seconds=_SIX_HOURS,
+        stale_after_seconds=_ONE_DAY,
+    )
+    before = store.current(SYMBOL).updated_at
+
+    clock.set_time(ANCHOR + timedelta(hours=7))
+    refresher.maintain()
+
+    assert store.current(SYMBOL).updated_at == ANCHOR + timedelta(hours=7)
+    assert store.current(SYMBOL).updated_at > before
+
+
+def test_a_successful_refresh_returns_the_age_to_zero() -> None:
+    # The measurement that was climbing without limit in the aborted run.
+    clock = SimulatedClock(ANCHOR)
+    provider, _ = _real_provider(clock)
+    store = SymbolRulesStore(provider.fetch([SYMBOL]))
+    refresher = SymbolRulesRefresher(
+        store=store,
+        provider=provider,
+        clock=clock,
+        refresh_interval_seconds=_SIX_HOURS,
+        stale_after_seconds=_ONE_DAY,
+    )
+
+    clock.set_time(ANCHOR + timedelta(hours=7))
+    reading = refresher.maintain()
+
+    assert reading.age_seconds == 0.0
+    assert store.age_seconds(clock.now()) == 0.0
+
+
+def test_the_age_never_reaches_the_budget_across_seven_real_days() -> None:
+    clock = SimulatedClock(ANCHOR)
+    provider, _ = _real_provider(clock)
+    store = SymbolRulesStore(provider.fetch([SYMBOL]))
+    refresher = SymbolRulesRefresher(
+        store=store,
+        provider=provider,
+        clock=clock,
+        refresh_interval_seconds=_SIX_HOURS,
+        stale_after_seconds=_ONE_DAY,
+    )
+
+    worst = 0.0
+    for hour in range(1, _WEEK_OF_HOURS + 1):
+        clock.set_time(ANCHOR + timedelta(hours=hour))
+        reading = refresher.maintain()
+        worst = max(worst, reading.age_seconds)
+        assert reading.is_stale is False
+
+    # Bars arrive hourly and the interval is six hours, so the rules are never older than
+    # one bar past the interval. Well inside the twenty-four hour budget.
+    assert worst <= _SIX_HOURS + 3600
+
+
+def test_risk_never_refuses_for_stale_rules_across_a_week_on_the_real_provider() -> None:
+    # The end-to-end statement: production provider, production refresher, production risk
+    # engine, seven days of bars, and not one refusal for symbol_rules_freshness.
+    week = _Week(refresh=False)
+    provider, _ = _real_provider(week.clock)
+    week.store.replace(provider.fetch([SYMBOL]))
+    week.refresher = SymbolRulesRefresher(
+        store=week.store,
+        provider=provider,
+        clock=week.clock,
+        refresh_interval_seconds=_SIX_HOURS,
+        stale_after_seconds=_ONE_DAY,
+        open_orders=week.broker.open_orders,
+    )
+
+    week.run()
+
+    assert week.decisions != ()
+    assert week.stale_rejections() == ()
+    assert week.fills_after(hour=_WEEK_OF_HOURS - 24) > 0

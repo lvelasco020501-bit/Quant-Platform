@@ -21,12 +21,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from quantplatform.backtesting.config import BacktestConfig
 from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.config.settings import Settings
 from quantplatform.core.clock import Clock, SystemClock
+from quantplatform.core.constants import ZERO
 from quantplatform.core.enums import CommissionModel, ExecutionMode, SlippageModel
 from quantplatform.core.errors import ConfigurationError, StorageError
 from quantplatform.core.interfaces import (
@@ -37,6 +39,7 @@ from quantplatform.core.interfaces import (
 from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.execution_policy import ExecutionPolicy, FeePolicy, SlippagePolicy
 from quantplatform.core.models.market import SymbolRules
+from quantplatform.core.models.portfolio import Balance
 from quantplatform.core.symbol_rules import SymbolRulesStore
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
@@ -295,11 +298,17 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
     # Read once and shared: the refresher's schedule is validated against the very same
     # freshness budget the risk engine will enforce, so the two cannot drift apart.
     risk = _risk_configuration(settings, policy)
+    # One number, used twice and never converted. It is the opening balance the account is
+    # *actually* seeded with, and the capital the run configuration declares. Passing an
+    # empty balance tuple here while declaring capital there is precisely what produced a
+    # session that could not place an order and a report claiming a loss of the whole
+    # (non-existent) account.
+    starting_capital = settings.backtest.initial_capital
     portfolio = SpotPortfolioEngine(
         quote_asset=settings.market.quote_asset,
         symbols=rules,
         execution_mode=ExecutionMode.PAPER,
-        initial_balances=(),
+        initial_balances=(_opening_balance(settings, starting_capital, resolved_clock),),
         source=paper.session_id,
     )
     broker = SimulatedBroker(
@@ -430,6 +439,26 @@ def _reporting_configuration(settings: Settings) -> ReportingConfiguration:
         timezone=paper.report_timezone,
         render_charts=paper.render_charts,
         chart_dpi=paper.chart_dpi,
+    )
+
+
+def _opening_balance(settings: Settings, capital: Decimal, clock: Clock) -> Balance:
+    """Build the account's opening cash balance.
+
+    Args:
+        settings: Effective configuration, for the quote asset the account is denominated in.
+        capital: The starting capital, the same value handed to the run configuration.
+        clock: Injected time source for the balance's timestamp.
+
+    Returns:
+        A single free quote-asset balance. Nothing is locked, and no base asset is seeded —
+        the portfolio engine is flat-start and refuses a nonzero base balance outright.
+    """
+    return Balance(
+        asset=settings.market.quote_asset,
+        free=capital,
+        locked=ZERO,
+        updated_at=clock.now(),
     )
 
 

@@ -1370,3 +1370,39 @@ def test_the_venue_rules_section_survives_a_write_and_read(tmp_path: Path) -> No
     assert restored is not None
     assert restored.statistics.symbol_rules_refresh_failures == 1
     assert restored.statistics.symbol_rules_refresh_attempts == 5
+
+
+# --- A report cannot invent a loss --------------------------------------------------------
+
+
+def test_a_day_that_traded_nothing_reports_a_flat_account(tmp_path: Path) -> None:
+    # Day one of the aborted run published `drawdown_exceeded: 100.0%` and
+    # `large_loss: the day lost 10000` for a session that never placed an order. The peak
+    # equity came from configuration while the account held nothing, so the two disagreed
+    # and the report believed the larger number.
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, _ = _session(clock=clock, strategy=Silent(_Params()), observer=recorder)
+
+    _run(session, clock, _two_day_bars())
+
+    report = recorder.reports[0]
+    statistics = report.statistics
+    raised = {alert.code for alert in report.alerts.alerts}
+
+    assert statistics.max_drawdown == Decimal(0)
+    assert statistics.daily_pnl == Decimal(0)
+    assert statistics.opening_equity == statistics.daily_equity
+    assert AlertCode.DRAWDOWN_EXCEEDED not in raised
+    assert AlertCode.LARGE_LOSS not in raised
+
+
+def test_opening_equity_matches_the_account_the_session_actually_holds(tmp_path: Path) -> None:
+    clock = SimulatedClock(ANCHOR)
+    recorder = _recorder(_config(tmp_path), clock)
+    session, portfolio = _session(clock=clock, strategy=Silent(_Params()), observer=recorder)
+    opening = portfolio.balances()[0].total  # type: ignore[attr-defined]
+
+    _run(session, clock, _two_day_bars())
+
+    assert recorder.reports[0].statistics.opening_equity == opening

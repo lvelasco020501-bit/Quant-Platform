@@ -50,6 +50,7 @@ from quantplatform.orchestration.symbol_rules import SymbolRulesRefresher
 from quantplatform.paper.results import SessionResult
 from quantplatform.paper.runner import PaperTradingRunner
 from quantplatform.paper.session import PaperTradingSession
+from quantplatform.paper.watchdog import StallWatchdog
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.reporting.config import ReportingConfiguration
 from quantplatform.reporting.daily import DailyReportBuilder, DailyReportRecorder
@@ -84,6 +85,7 @@ class PaperDeployment:
     repository: PaperStateRepository
     symbol_rules: SymbolRulesStore
     refresher: SymbolRulesRefresher | None = None
+    watchdog: StallWatchdog | None = None
     log_paths: tuple[Path, ...] = ()
 
     def run(self, *, resume: bool = False) -> SessionResult:
@@ -103,9 +105,13 @@ class PaperDeployment:
                 "resume": resume,
             },
         )
+        if self.watchdog is not None:
+            self.watchdog.start()
         try:
             return self.runner.run(resume=resume)
         finally:
+            if self.watchdog is not None:
+                self.watchdog.stop()
             _LOGGER.info(
                 "paper session stopped",
                 extra={
@@ -374,6 +380,13 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
         feed_metrics=feed,
         symbol_rules=refresher,
     )
+    watchdog = StallWatchdog(
+        clock=resolved_clock,
+        threshold_seconds=paper.timeframe.seconds + paper.stall_alert_margin_seconds,
+        session_metrics=session.runtime_metrics,
+        feed_metrics=lambda: session.feed_metrics,
+        session_id=paper.session_id,
+    )
     return PaperDeployment(
         settings=settings,
         clock=resolved_clock,
@@ -385,6 +398,7 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
         repository=resolved_repository,
         symbol_rules=rules,
         refresher=refresher,
+        watchdog=watchdog,
         log_paths=log_paths,
     )
 

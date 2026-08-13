@@ -1124,3 +1124,68 @@ def test_an_untraded_day_cannot_report_a_loss(directories: dict[str, Path]) -> N
     assert performance is not None
     assert performance.max_drawdown == ZERO
     assert performance.total_return == ZERO
+
+
+# --- Stall watchdog -------------------------------------------------------------------------
+
+
+def test_a_watchdog_is_always_wired(directories: dict[str, Path]) -> None:
+    # Unlike the symbol-rules refresher, the watchdog needs nothing external to be useful
+    # -- it only reads state the deployment already produces -- so it is never optional.
+    deployment = build_paper_deployment(
+        _settings(directories),
+        symbol_rules=_rules(),
+        registry=_registry(),
+        clock=SimulatedClock(ANCHOR),
+    )
+
+    assert deployment.watchdog is not None
+
+
+def test_the_watchdog_threshold_is_the_timeframe_plus_the_configured_margin(
+    directories: dict[str, Path],
+) -> None:
+    settings = _settings(directories, stall_alert_margin_seconds=90.0)
+
+    deployment = build_paper_deployment(
+        settings, symbol_rules=_rules(), registry=_registry(), clock=SimulatedClock(ANCHOR)
+    )
+
+    assert deployment.watchdog is not None
+    expected = settings.paper.timeframe.seconds + 90.0
+    assert deployment.watchdog._threshold == expected
+
+
+def test_the_watchdog_reads_the_session_it_was_built_for(
+    directories: dict[str, Path],
+) -> None:
+    # Wired to the real session's own accessors, not a copy -- so an alert reflects what
+    # the running session actually did, not a snapshot frozen at composition time.
+    deployment = build_paper_deployment(
+        _settings(directories),
+        symbol_rules=_rules(),
+        registry=_registry(),
+        clock=SimulatedClock(ANCHOR),
+    )
+    assert deployment.watchdog is not None
+
+    assert deployment.watchdog._session_metrics() == deployment.session.runtime_metrics()
+
+
+def test_run_starts_and_stops_the_watchdog(directories: dict[str, Path]) -> None:
+    # No real socket: a scripted transport is swapped into the real feed, exactly as the
+    # grace-period test above does, so this exercises PaperDeployment.run()'s own
+    # start/finally wrapping without reaching the network.
+    clock = SimulatedClock(ANCHOR)
+    deployment = build_paper_deployment(
+        _settings(directories), symbol_rules=_rules(), registry=_registry(), clock=clock
+    )
+    assert deployment.watchdog is not None
+    bars = make_bars([Decimal(50_000)] * 2)
+    scripted, _, _ = _feed(_bar_steps(bars), clock=clock)
+    deployment.feed._transport = scripted._transport
+    deployment.runner._max_bars = len(bars)
+
+    deployment.run(resume=False)
+
+    assert deployment.watchdog._thread is None

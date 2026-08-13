@@ -312,6 +312,16 @@ class PaperSettings(_SettingsSection):
     refused at startup rather than discovered a day into a run.
     """
 
+    stall_alert_margin_seconds: float = Field(default=120.0, gt=0)
+    """Grace period added to one candle interval before a silent pipeline is an alert.
+
+    A session that has processed nothing for exactly one timeframe has not necessarily
+    stalled — the next bar may simply not have closed yet, or one delivery cycle may be
+    running a little behind. Past ``timeframe.seconds + stall_alert_margin_seconds`` with
+    still nothing processed is past any ordinary explanation, and
+    :class:`~quantplatform.paper.watchdog.StallWatchdog` raises a critical alert.
+    """
+
     report_timezone: str = "UTC"
     render_charts: bool = True
     chart_dpi: int = Field(default=150, ge=50, le=600)

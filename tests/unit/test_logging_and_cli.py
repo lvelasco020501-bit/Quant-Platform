@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from quantplatform.cli.main import app
 from quantplatform.core.constants import REDACTED_PLACEHOLDER
 from quantplatform.core.enums import LogFormat
+from quantplatform.core.errors import ConfigurationError, DataGapError, QuantPlatformError
 from quantplatform.core.logging_config import configure_logging, get_logger, log_context
 
 
@@ -223,3 +224,92 @@ def test_check_config_fails_on_unsafe_configuration(
     result = runner.invoke(app, ["check-config"])
     assert result.exit_code == 2
     assert "live_trading_not_authorized" in result.stderr
+
+
+# --- QuantPlatformError.log_extra() ------------------------------------------------------------
+#
+# The incident this section pins: a DataGapError, correctly raised by the market-data feed
+# on a genuine gap, reached the CLI's top-level handler, which tried to report it via
+# `_LOGGER.error("paper session failed", extra=exc.to_dict())`. `to_dict()`'s top-level
+# "message" key collides with the reserved attribute stdlib `logging` sets on every record
+# it builds, and `Logger.makeRecord` raises `KeyError` rather than silently overwriting it.
+# The process died on the handler meant to report why it died, and the original error was
+# never logged at all. `log_extra()` is the fix; these tests hold it to the incident exactly.
+
+
+def test_to_dict_still_collides_with_the_reserved_message_attribute(
+    stream: io.StringIO,
+) -> None:
+    # Pinned deliberately, not as the desired behaviour but as the documented hazard that
+    # makes log_extra() necessary. If a future stdlib release ever stopped raising here,
+    # this test would fail and the rationale in log_extra()'s docstring would need revisiting
+    # -- it would not mean the fix could be removed, since every other Python version this
+    # platform runs on still raises.
+    configure_logging(level="INFO", log_format=LogFormat.JSON, stream=stream)
+    exc = DataGapError("2 missing 1h candle(s) for BTC/USDT", feed="binance_spot_ws")
+
+    with pytest.raises(KeyError, match="message"):
+        get_logger("test").error("paper session failed", extra=exc.to_dict())
+
+
+def test_log_extra_never_collides_for_any_registered_error(stream: io.StringIO) -> None:
+    # Every QuantPlatformError subclass in the platform, not just the one that crashed.
+    # The fix has to hold for errors nobody has hit yet, which is exactly why it nests
+    # unconditionally instead of special-casing "message".
+    configure_logging(level="INFO", log_format=LogFormat.JSON, stream=stream)
+    logger = get_logger("test")
+    subclasses = _all_error_subclasses(QuantPlatformError)
+    assert len(subclasses) > 30, "sanity check: the error hierarchy should be well populated"
+
+    for error_type in subclasses:
+        exc = error_type("boundary condition", symbol="BTC/USDT", observed=1, limit=2)
+        logger.error("failed", extra=exc.log_extra())  # must not raise for any subclass
+
+
+def test_log_extra_reaches_the_gap_error_that_crashed_the_process(
+    stream: io.StringIO,
+) -> None:
+    configure_logging(level="INFO", log_format=LogFormat.JSON, stream=stream)
+    exc = DataGapError(
+        "2 missing 1h candle(s) for BTC/USDT: expected 2026-08-13T02:00:00+00:00, "
+        "received 2026-08-13T04:00:00+00:00",
+        feed="binance_spot_ws",
+        missing_bars=2,
+    )
+
+    get_logger("test").error("paper session failed", extra=exc.log_extra())
+
+    record = _emitted(stream)[0]
+    assert record["message"] == "paper session failed"
+    reported = record["extra"]["error"]
+    assert reported["code"] == "data_gap_error"
+    assert "2 missing 1h candle(s)" in reported["message"]
+    assert reported["details"] == {"feed": "binance_spot_ws", "missing_bars": 2}
+
+
+def test_log_extra_preserves_every_field_to_dict_carries() -> None:
+    exc = ConfigurationError("bad config", setting="risk.max_open_orders", value=-1)
+
+    assert exc.log_extra() == {"error": exc.to_dict()}
+    assert exc.log_extra()["error"]["details"] == {
+        "setting": "risk.max_open_orders",
+        "value": -1,
+    }
+
+
+def test_log_extra_key_is_never_a_reserved_record_attribute() -> None:
+    # The whole guarantee in one assertion: whatever `log_extra()` returns must be safe to
+    # merge into a LogRecord's __dict__ unconditionally.
+    exc = ConfigurationError("bad config")
+
+    assert set(exc.log_extra()) == {"error"}
+    assert "error" not in logging.makeLogRecord({}).__dict__
+
+
+def _all_error_subclasses(base: type[Exception]) -> list[type[Exception]]:
+    """Return every QuantPlatformError subclass currently registered, recursively."""
+    found: list[type[Exception]] = []
+    for subclass in base.__subclasses__():
+        found.append(subclass)
+        found.extend(_all_error_subclasses(subclass))
+    return found

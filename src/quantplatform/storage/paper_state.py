@@ -27,9 +27,12 @@ from typing import Final
 from pydantic import ValidationError
 
 from quantplatform.core.errors import StorageError
+from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.paper import PaperSessionState
 
 __all__ = ["FilePaperStateRepository"]
+
+_LOGGER = get_logger(__name__)
 
 _SUFFIX: Final[str] = ".json"
 _TEMP_SUFFIX: Final[str] = ".tmp"
@@ -157,6 +160,14 @@ class FilePaperStateRepository:
             self._sync_directory()
         except OSError as exc:
             temporary.unlink(missing_ok=True)
+            _LOGGER.error(
+                "session state could not be written",
+                extra={
+                    "session_id": state.session_id,
+                    "path": str(path),
+                    "error": type(exc).__name__,
+                },
+            )
             raise StorageError(
                 "paper session state could not be written",
                 session_id=state.session_id,

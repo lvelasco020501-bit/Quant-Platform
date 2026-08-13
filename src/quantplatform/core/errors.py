@@ -92,6 +92,30 @@ class QuantPlatformError(Exception):
         """Return a serialisable representation for logging and API responses."""
         return {"code": self.code, "message": self.message, "details": dict(self.details)}
 
+    def log_extra(self) -> dict[str, object]:
+        """Return a representation safe to pass as ``extra=`` to the stdlib logger.
+
+        :meth:`to_dict` is for callers that serialise or return the error, and its
+        top-level ``"message"`` key is exactly what makes it unsafe to hand to
+        ``logging.Logger.error(..., extra=...)`` directly: ``logging`` raises
+        ``KeyError`` when ``extra`` carries any key already set on the record it is
+        building, and every record's own message is computed under that exact name. A
+        caller that logged ``extra=exc.to_dict()`` to report a caught error crashed
+        instead, on the handler meant to report it -- with the caught error never
+        reaching a log at all.
+
+        Nesting everything under one key that can never be a reserved ``LogRecord``
+        attribute is what makes this safe *unconditionally*: nothing inside
+        :meth:`to_dict` -- present, or added by a subclass yet to be written -- is ever
+        inspected by ``makeRecord``, because only this method's own top-level key is.
+        No information is dropped; ``to_dict()``'s full output is still there, one level
+        down.
+
+        Returns:
+            ``{"error": self.to_dict()}``.
+        """
+        return {"error": self.to_dict()}
+
 
 # --- Configuration ---------------------------------------------------------------------
 

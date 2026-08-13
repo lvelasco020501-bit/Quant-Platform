@@ -39,6 +39,7 @@ from quantplatform.core.clock import Clock
 from quantplatform.core.constants import ZERO
 from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
 from quantplatform.core.interfaces import PaperStateRepository
+from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import PortfolioSnapshot
@@ -58,6 +59,8 @@ from quantplatform.paper.results import (
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 
 __all__ = ["DayRolloverObserver", "PaperTradingSession"]
+
+_LOGGER = get_logger(__name__)
 
 
 @runtime_checkable
@@ -308,6 +311,15 @@ class PaperTradingSession:
 
         if not self._is_actionable(bar):
             self._metrics.bars_rejected += 1
+            _LOGGER.debug(
+                "bar rejected",
+                extra={
+                    "session_id": self._session_id,
+                    "symbol": bar.symbol,
+                    "close_time": bar.close_time.isoformat(),
+                    "is_closed": bar.is_closed,
+                },
+            )
             return None
 
         self._notify_rollover(bar)
@@ -318,10 +330,30 @@ class PaperTradingSession:
             # Ordering and closure are already screened above, so what remains is an unknown
             # symbol: a wiring mistake, not a transient feed problem, and it must surface.
             self._metrics.bars_rejected += 1
+            _LOGGER.error(
+                "bar rejected: unknown symbol",
+                extra={
+                    "session_id": self._session_id,
+                    "symbol": bar.symbol,
+                    "close_time": bar.close_time.isoformat(),
+                },
+            )
             raise
 
         self._last_bar = bar
         self._record(outcome)
+        _LOGGER.info(
+            "bar processed",
+            extra={
+                "session_id": self._session_id,
+                "symbol": bar.symbol,
+                "close_time": bar.close_time.isoformat(),
+                "signals": len(outcome.signals),
+                "intents": len(outcome.intents),
+                "decisions": len(outcome.decisions),
+                "fills": len(outcome.fills),
+            },
+        )
         if self._save_every_bar:
             self.save()
         return outcome
@@ -446,8 +478,20 @@ class PaperTradingSession:
         if self._repository is None:
             return None
         state = self.capture()
+        _LOGGER.debug(
+            "persisting session state",
+            extra={"session_id": self._session_id, "bars_processed": state.bars_processed},
+        )
         self._repository.save(state)
         self._metrics.state_saves += 1
+        _LOGGER.debug(
+            "session state persisted",
+            extra={
+                "session_id": self._session_id,
+                "bars_processed": state.bars_processed,
+                "saved_at": state.saved_at.isoformat(),
+            },
+        )
         return state
 
     def capture(self) -> PaperSessionState:

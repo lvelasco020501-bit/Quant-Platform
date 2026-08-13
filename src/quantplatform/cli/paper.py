@@ -249,7 +249,7 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
     try:
         _drive(deployment, resume=resume)
     except QuantPlatformError as exc:
-        _LOGGER.error("paper session failed", extra=exc.to_dict())
+        _LOGGER.error("paper session failed", extra=exc.log_extra())
         typer.echo(json.dumps(exc.to_dict(), default=str, indent=2), err=True)
         raise typer.Exit(code=EXIT_RUNTIME_ERROR) from exc
     finally:

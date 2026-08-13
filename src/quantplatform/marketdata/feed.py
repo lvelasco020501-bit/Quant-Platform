@@ -39,6 +39,7 @@ from quantplatform.core.errors import (
     MarketDataSubscriptionError,
 )
 from quantplatform.core.interfaces import CandleStreamTransport
+from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.marketdata.clock import FeedClock
@@ -54,6 +55,8 @@ from quantplatform.marketdata.reconnect import BackoffSchedule, ReconnectPolicy
 from quantplatform.marketdata.validation import CandleParser, CandleSequenceValidator
 
 __all__ = ["BinanceSpotMarketDataFeed", "WebSocketCandleTransport"]
+
+_LOGGER = get_logger(__name__)
 
 _SUBSCRIBE: Final[str] = "SUBSCRIBE"
 _UNSUBSCRIBE: Final[str] = "UNSUBSCRIBE"
@@ -138,14 +141,21 @@ class WebSocketCandleTransport:
         try:
             message = connection.recv(timeout=timeout_seconds)
         except TimeoutError:
+            # The overwhelmingly common outcome, once per poll interval whenever the venue
+            # has nothing new: logged at DEBUG so it documents the polling cadence during a
+            # diagnosis without adding a line to every production log at INFO.
+            _LOGGER.debug("receive timed out", extra={"timeout_seconds": timeout_seconds})
             return None
         except (WebSocketException, OSError) as exc:
+            _LOGGER.warning(
+                "receive failed", extra={"error": type(exc).__name__, "detail": str(exc)}
+            )
             raise MarketDataConnectionError(
                 "market-data stream failed while receiving", error=type(exc).__name__
             ) from exc
-        if isinstance(message, bytes):
-            return message.decode("utf-8", errors="replace")
-        return message
+        text = message.decode("utf-8", errors="replace") if isinstance(message, bytes) else message
+        _LOGGER.debug("frame received", extra={"bytes": len(text)})
+        return text
 
     def close(self) -> None:
         """Release the channel. Safe to call repeatedly, and never raises.
@@ -236,6 +246,23 @@ class BinanceSpotMarketDataFeed:
 
     # --- Identity and observation -----------------------------------------------------------
 
+    def _transition(self, new_state: MarketDataFeedState) -> None:
+        """Change the feed's state. The only place this ever happens.
+
+        A stall investigation starts with "what state was the feed last known to be in,
+        and when did it last change" — a question a scattered set of bare assignments
+        cannot answer without reading the whole file. Routing every change through here
+        both answers it (one INFO line per transition) and guarantees no future change
+        site is added without being observed.
+        """
+        previous = self._state
+        self._state = new_state
+        if previous is not new_state:
+            _LOGGER.info(
+                "feed state transition",
+                extra={"feed": self.name, "from": previous.value, "to": new_state.value},
+            )
+
     @property
     def name(self) -> str:
         """Return the provenance identifier recorded on every bar."""
@@ -300,14 +327,14 @@ class BinanceSpotMarketDataFeed:
         self._transport.close()
         self._clock.forget_frames()
         if self._state is not MarketDataFeedState.STOPPED:
-            self._state = MarketDataFeedState.DISCONNECTED
+            self._transition(MarketDataFeedState.DISCONNECTED)
 
     def close(self) -> None:
         """Release everything and refuse further streaming. Safe to call repeatedly."""
         self._stopping = True
         self._transport.close()
         self._clock.forget_frames()
-        self._state = MarketDataFeedState.STOPPED
+        self._transition(MarketDataFeedState.STOPPED)
 
     def request_stop(self) -> None:
         """Ask the delivery loop to finish after the candle it is handling.
@@ -398,6 +425,14 @@ class BinanceSpotMarketDataFeed:
             self._metrics = self._metrics.record(candles_parsed=1)
             admitted = self._apply(self._sequence.admit(bar))
             if admitted is not None:
+                _LOGGER.info(
+                    "closed bar emitted",
+                    extra={
+                        "feed": self.name,
+                        "symbol": admitted.symbol,
+                        "close_time": admitted.close_time.isoformat(),
+                    },
+                )
                 yield admitted
 
     def resynchronize(self, symbol: str | None = None) -> None:
@@ -446,10 +481,10 @@ class BinanceSpotMarketDataFeed:
             MarketDataConnectionError: If the stream cannot be opened.
             MarketDataSubscriptionError: If the subscription cannot be sent.
         """
-        self._state = MarketDataFeedState.CONNECTING
+        self._transition(MarketDataFeedState.CONNECTING)
         self._metrics = self._metrics.record(connection_attempts=1)
         self._transport.connect(self._config.websocket_url)
-        self._state = MarketDataFeedState.CONNECTED
+        self._transition(MarketDataFeedState.CONNECTED)
         # The handshake itself counts as liveness, so the heartbeat window starts now
         # rather than at the first candle — a venue that accepts a connection and then
         # says nothing is exactly the failure the heartbeat exists to catch.
@@ -492,12 +527,23 @@ class BinanceSpotMarketDataFeed:
         """
         try:
             frame = self._transport.receive(self._config.receive_timeout_seconds)
-        except MarketDataConnectionError:
+        except MarketDataConnectionError as exc:
+            _LOGGER.warning(
+                "transport failed while receiving; reconnecting",
+                extra={"feed": self.name, "error": type(exc).__name__},
+            )
             self._reconnect()
             return None
         if frame is None:
             if self._clock.is_heartbeat_expired(self._config.heartbeat_timeout_seconds):
                 self._metrics = self._metrics.record(heartbeat_timeouts=1)
+                _LOGGER.warning(
+                    "heartbeat expired; reconnecting",
+                    extra={
+                        "feed": self.name,
+                        "heartbeat_timeout_seconds": (self._config.heartbeat_timeout_seconds),
+                    },
+                )
                 self._reconnect()
             return None
         self._clock.mark_frame()
@@ -514,20 +560,52 @@ class BinanceSpotMarketDataFeed:
         Raises:
             MarketDataConnectionError: If the attempt budget is exhausted.
         """
-        self._state = MarketDataFeedState.RECONNECTING
+        _LOGGER.warning(
+            "reconnecting",
+            extra={
+                "feed": self.name,
+                "max_attempts": self._policy.schedule.max_attempts,
+            },
+        )
+        self._transition(MarketDataFeedState.RECONNECTING)
         self._transport.close()
         self._clock.forget_frames()
         while True:
-            delay = self._policy.next_delay()
+            try:
+                delay = self._policy.next_delay()
+            except MarketDataConnectionError:
+                _LOGGER.error(
+                    "reconnect budget exhausted; giving up",
+                    extra={"feed": self.name, "attempts": self._policy.attempts},
+                )
+                raise
+            _LOGGER.debug(
+                "reconnect attempt",
+                extra={
+                    "feed": self.name,
+                    "attempt": self._policy.attempts,
+                    "delay_seconds": delay,
+                },
+            )
             self._sleep(delay)
             try:
                 self._open()
-            except (MarketDataConnectionError, MarketDataSubscriptionError):
+            except (MarketDataConnectionError, MarketDataSubscriptionError) as exc:
+                _LOGGER.warning(
+                    "reconnect attempt failed",
+                    extra={
+                        "feed": self.name,
+                        "attempt": self._policy.attempts,
+                        "error": type(exc).__name__,
+                    },
+                )
                 self._transport.close()
-                self._state = MarketDataFeedState.RECONNECTING
+                self._transition(MarketDataFeedState.RECONNECTING)
                 continue
+            attempts_used = self._policy.attempts
             self._policy.reset()
             self._metrics = self._metrics.record(reconnects=1)
+            _LOGGER.info("reconnected", extra={"feed": self.name, "attempts_used": attempts_used})
             return
 
     def _parse(self, frame: str) -> MarketBar | None:
@@ -544,10 +622,25 @@ class BinanceSpotMarketDataFeed:
             MarketDataSubscriptionError: If the candle names an unsubscribed instrument.
         """
         try:
-            return self._parser.parse(frame)
-        except (DataProviderError, DataIntegrityError):
+            bar = self._parser.parse(frame)
+        except (DataProviderError, DataIntegrityError) as exc:
             self._metrics = self._metrics.record(malformed_frames=1)
+            _LOGGER.warning(
+                "malformed frame",
+                extra={"feed": self.name, "error": type(exc).__name__, "detail": str(exc)},
+            )
             raise
+        if bar is not None:
+            _LOGGER.debug(
+                "kline parsed",
+                extra={
+                    "feed": self.name,
+                    "symbol": bar.symbol,
+                    "close_time": bar.close_time.isoformat(),
+                    "is_closed": bar.is_closed,
+                },
+            )
+        return bar
 
     def _apply(self, admission: CandleAdmission) -> MarketBar | None:
         """Account for one verdict and return the bar to deliver, if any.
@@ -557,14 +650,22 @@ class BinanceSpotMarketDataFeed:
         """
         if admission.outcome is CandleOutcome.FORMING:
             self._metrics = self._metrics.record(forming_suppressed=1)
+            _LOGGER.debug(
+                "candle still forming; suppressed",
+                extra={"feed": self.name, "symbol": admission.bar.symbol},
+            )
             return None
         if admission.outcome is CandleOutcome.DUPLICATE:
             self._metrics = self._metrics.record(duplicates_suppressed=1)
+            _LOGGER.debug(
+                "duplicate candle suppressed",
+                extra={"feed": self.name, "symbol": admission.bar.symbol},
+            )
             return None
         if admission.outcome is CandleOutcome.GAP:
             self._pause(admission.gap)
         self._metrics = self._metrics.record(bars_emitted=1)
-        self._state = MarketDataFeedState.STREAMING
+        self._transition(MarketDataFeedState.STREAMING)
         return admission.bar
 
     def _pause(self, gap: GapReport | None) -> None:
@@ -574,9 +675,17 @@ class BinanceSpotMarketDataFeed:
             DataGapError: Always. Detecting a hole and continuing anyway would be the one
                 outcome worse than stopping.
         """
-        self._state = MarketDataFeedState.PAUSED
+        self._transition(MarketDataFeedState.PAUSED)
         self._pending_gap = gap
         self._metrics = self._metrics.record(gaps_detected=1)
+        _LOGGER.error(
+            "candle gap detected; feed paused",
+            extra={
+                "feed": self.name,
+                "gap": gap.describe() if gap is not None else None,
+                "missing_bars": gap.missing_bars if gap is not None else None,
+            },
+        )
         raise DataGapError(
             gap.describe() if gap is not None else "market-data continuity break",
             feed=self.name,

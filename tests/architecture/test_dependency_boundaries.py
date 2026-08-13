@@ -961,19 +961,27 @@ def test_the_symbol_rules_telemetry_crosses_domains_through_core() -> None:
         assert "orchestration" not in _imported_domains(path), path
 
 
-_THREADING_ALLOWLIST: Final[frozenset[str]] = frozenset({"paper/watchdog.py"})
-"""The one module allowed to spawn a thread.
+_THREADING_ALLOWLIST: Final[frozenset[str]] = frozenset({"paper/watchdog.py", "marketdata/feed.py"})
+"""The only modules allowed to spawn a thread, each for the same structural reason.
 
 Everything else in this platform is deliberately synchronous — the paper runner's own
-docstring calls concurrency "the fastest way to lose" reproducibility. The stall watchdog
-is a narrow, justified exception: it exists specifically to detect the one failure mode a
-synchronous loop cannot detect about itself (the loop failing to return control at all),
-and it is read-only with respect to every trading decision. This test is what stops that
-exception from spreading by habit into a second module that assumed it was fine too.
+docstring calls concurrency "the fastest way to lose" reproducibility. Both entries here
+exist to bound or observe a blocking call *from outside it*, which is impossible from
+inside the call itself:
+
+* ``paper/watchdog.py`` detects a pump loop that has stopped returning control, which a
+  check placed inside that same loop could never notice about itself.
+* ``marketdata/feed.py`` forces a socket closed if the vendored websockets library's own
+  close does not return within a hard ceiling — the eight-hour incident this module's
+  socket-timeout fix and hard-close backstop exist to answer.
+
+Neither touches a trading decision; both are read-only or shutdown-only. This test is
+what stops the exception from spreading by habit into a third module that assumed it was
+fine too.
 """
 
 
-def test_only_the_stall_watchdog_uses_threading() -> None:
+def test_only_the_allowlisted_modules_use_threading() -> None:
     offenders: list[str] = []
     for path in _source_files():
         relative = str(path.relative_to(PACKAGE_ROOT))

@@ -21,6 +21,7 @@ something about live behaviour.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
@@ -64,8 +65,49 @@ _MAX_FRAME_BYTES: Final[int] = 1 << 20
 """One megabyte. A candle frame is a few hundred bytes; anything approaching this is not
 market data, and an unbounded reader is how a stream becomes a memory exhaustion bug."""
 
+_SOCKET_TIMEOUT_MARGIN_SECONDS: Final[float] = 10.0
+"""How much longer the raw socket's own read timeout is set than the per-call polling
+timeout passed to :meth:`WebSocketCandleTransport.receive`.
+
+The root cause of an eight-hour stall traced to exactly one line in the vendored
+``websockets`` library: its background reader thread calls the underlying
+``socket.recv()`` with **no timeout at all** while a connection is in ordinary
+operation — a deadline is only armed once a close handshake has already begun. On a
+connection that goes silent without a clean TCP close (no FIN, no RST — a "black hole",
+plausible after a network path change), that raw call can block for as long as the
+operating system's own dead-peer detection eventually takes, which is not bounded in any
+useful sense.
+
+The margin exists so the library's own, already-correct polling timeout is what fires
+under every ordinary condition — a real timeout every ``receive_timeout_seconds`` with
+nothing wrong at all — and this is purely a backstop that should, in practice, never be
+the first thing to trigger. It is not a duplicate of that timeout with a different name;
+it bounds a different call, on a different thread, that the polling timeout cannot reach.
+"""
+
+_HARD_CLOSE_TIMEOUT_SECONDS: Final[float] = 20.0
+"""Absolute ceiling on how long :meth:`WebSocketCandleTransport.close` may take.
+
+Independent of the socket-timeout fix above, and deliberately so: that fix is reasoned
+from reading the vendored library's current source, and a future version of it — or a
+platform quirk this analysis did not anticipate — could invalidate the reasoning without
+announcing itself. This is the structural guarantee that survives that possibility: a
+close is handed to a watcher thread, and if it has not finished within this ceiling, the
+raw socket is shut down and closed directly, bypassing the library's own close path
+entirely. "Bounded" is then a fact about elapsed wall-clock time, not an inference about
+what a dependency's internals are expected to do.
+"""
+
 _SYMBOL_PARTS: Final[int] = 2
 """A canonical symbol is exactly ``BASE/QUOTE``."""
+
+_SHUT_RDWR: Final[int] = 2
+"""The standard POSIX value of ``socket.SHUT_RDWR`` (also used on Windows), inlined so
+this package never imports the :mod:`socket` module. An architecture test forbids it here
+deliberately — it is how a raw client bypassing the one sanctioned ``websockets``
+connection would be built — and the one legitimate use in this module, forcing shut the
+*existing*, already-authorised connection's own socket on a hard-close timeout, needs
+only this one well-known constant, not the ability to open a new one."""
 
 
 class WebSocketCandleTransport:
@@ -78,19 +120,39 @@ class WebSocketCandleTransport:
     Holds no market-data logic whatsoever, which is what keeps the untestable part of this
     phase — the part that needs an actual network — down to opening a socket and reading
     text off it.
+
+    **Hardened against an indefinite block, two ways.** The raw socket the library reads
+    from is kept under an explicit timeout for the whole life of the connection — see
+    :data:`_SOCKET_TIMEOUT_MARGIN_SECONDS` for why that is necessary at all — and closing
+    that connection is handed to a watcher with a hard ceiling — see
+    :data:`_HARD_CLOSE_TIMEOUT_SECONDS`. Together they are what let :meth:`close` and, by
+    extension, every reconnect built on it, be a *proven* bound rather than a hoped-for
+    one.
     """
 
     def __init__(
-        self, *, open_timeout_seconds: float = 10.0, close_timeout_seconds: float = 5.0
+        self,
+        *,
+        open_timeout_seconds: float = 10.0,
+        close_timeout_seconds: float = 5.0,
+        hard_close_timeout_seconds: float = _HARD_CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         """Create a transport.
 
         Args:
             open_timeout_seconds: How long to wait for the handshake.
-            close_timeout_seconds: How long to wait for a graceful close.
+            close_timeout_seconds: How long to wait for a graceful close before the
+                backstop forces the socket shut. Handed to the library as its own
+                ``close_timeout``, so its first attempt already respects this; the
+                backstop exists for what happens if that attempt does not return at all.
+            hard_close_timeout_seconds: Absolute ceiling on :meth:`close`, independent of
+                whether the library's own close completes. Deliberately looser than
+                ``close_timeout_seconds`` — this is the ceiling of last resort, not the
+                ordinary path.
         """
         self._open_timeout = open_timeout_seconds
         self._close_timeout = close_timeout_seconds
+        self._hard_close_timeout = hard_close_timeout_seconds
         self._connection: ClientConnection | None = None
 
     @property
@@ -116,6 +178,27 @@ class WebSocketCandleTransport:
             raise MarketDataConnectionError(
                 "could not open the market-data stream", error=type(exc).__name__
             ) from exc
+        # Bound the raw socket from the instant the connection exists, closing the gap
+        # between this call returning and the first receive() — the background reader
+        # thread is already running by the time connect() hands control back here.
+        self._bound_socket(self._open_timeout + _SOCKET_TIMEOUT_MARGIN_SECONDS)
+
+    def _bound_socket(self, timeout_seconds: float) -> None:
+        """Set a hard timeout on the connection's underlying raw socket.
+
+        This is the fix for the actual defect: the vendored library's background reader
+        thread calls ``socket.recv()`` with no timeout of its own during ordinary
+        operation, so a connection that goes silent without a clean TCP close can block
+        that thread — and, transitively, any later close waiting on it — for as long as
+        the operating system takes to notice on its own. A socket-level timeout is
+        enforced by the OS underneath the library, and does not depend on any cooperation
+        from it.
+
+        Safe to call repeatedly; ``socket.settimeout`` only affects reads issued after it
+        runs, which is why :meth:`receive` calls this on every poll rather than once.
+        """
+        if self._connection is not None:
+            self._connection.socket.settimeout(timeout_seconds)
 
     def send(self, payload: str) -> None:
         """Send one text frame.
@@ -138,6 +221,7 @@ class WebSocketCandleTransport:
             MarketDataConnectionError: If the channel failed while waiting.
         """
         connection = self._require_connection()
+        self._bound_socket(timeout_seconds + _SOCKET_TIMEOUT_MARGIN_SECONDS)
         try:
             message = connection.recv(timeout=timeout_seconds)
         except TimeoutError:
@@ -163,12 +247,48 @@ class WebSocketCandleTransport:
         A failure while closing a socket that is already being abandoned carries no
         information worth propagating, and letting it escape would mean a shutdown path
         that fails during shutdown.
+
+        **Bounded by :data:`_HARD_CLOSE_TIMEOUT_SECONDS`, provably.** The graceful close
+        the library performs is handed to a watcher thread; if it has not finished by the
+        deadline, the raw socket is shut down and closed directly here, in this thread,
+        without waiting on the watcher any further. This call therefore always returns
+        within the ceiling, regardless of what the library's own close path is doing.
         """
         connection, self._connection = self._connection, None
         if connection is None:
             return
-        with suppress(WebSocketException, OSError):
-            connection.close()
+        self._close_bounded(connection)
+
+    def _close_bounded(self, connection: ClientConnection) -> None:
+        """Run a graceful close on a watcher thread, forcing the socket shut on timeout.
+
+        The one deliberate use of a background thread in this module, for the same
+        reason :class:`~quantplatform.paper.watchdog.StallWatchdog` is the one in its own:
+        bounding a call from outside is impossible from inside the call itself. The
+        watcher is a daemon and is never joined if it overruns — if the library's close
+        is itself the thing stuck, forcing the socket shut here lets *this* thread return
+        the moment the ceiling is reached; the watcher thread is simply abandoned; it
+        holds no lock this module depends on and cannot block interpreter shutdown.
+        """
+        finished = threading.Event()
+
+        def _graceful_close() -> None:
+            with suppress(WebSocketException, OSError):
+                connection.close()
+            finished.set()
+
+        threading.Thread(target=_graceful_close, name="transport-close", daemon=True).start()
+        if finished.wait(self._hard_close_timeout):
+            return
+        _LOGGER.error(
+            "graceful close did not finish within the hard ceiling; forcing the socket "
+            "shut directly",
+            extra={"hard_close_timeout_seconds": self._hard_close_timeout},
+        )
+        with suppress(OSError):
+            connection.socket.shutdown(_SHUT_RDWR)
+        with suppress(OSError):
+            connection.socket.close()
 
     def _require_connection(self) -> ClientConnection:
         """Return the open connection.

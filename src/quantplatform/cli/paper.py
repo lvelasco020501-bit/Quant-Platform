@@ -31,6 +31,7 @@ from quantplatform.orchestration.paper import (
     validate_startup,
 )
 from quantplatform.orchestration.shutdown import ShutdownSignal, shutdown_on_signals
+from quantplatform.storage.session_lock import SessionLock
 from quantplatform.strategies.registry import build_default_registry
 
 __all__ = ["app"]
@@ -218,6 +219,7 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
         strategy=strategy,
         max_bars=max_bars,
     )
+    lock: SessionLock | None = None
     try:
         settings = _settings_with(overrides)
         log_paths = configure_file_logging(
@@ -226,6 +228,15 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
             log_format=settings.log_format,
             secrets=settings.secret_values(),
         )
+        # Claimed before anything expensive is built, and before a socket is opened: a
+        # second session must be refused at the cheapest possible moment, not after it has
+        # already fetched venue rules and connected. Two sessions sharing one state
+        # directory interleave their logs and collide on daily reports — an eighteen-hour
+        # incident, not a hypothetical.
+        lock = SessionLock(
+            directory=settings.paper.state_directory, session_id=settings.paper.session_id
+        )
+        lock.acquire(now=SystemClock().now())
         # The same provider seeds the store and keeps it current. Rules fetched once at
         # startup expire against the risk engine's freshness budget partway through a
         # multi-day run, and every intent is refused from that point on.
@@ -239,10 +250,12 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
         )
     except QuantPlatformError as exc:
         typer.echo(json.dumps(exc.to_dict(), default=str, indent=2), err=True)
+        _release_lock(lock)
         close_file_logging()
         raise typer.Exit(code=EXIT_CONFIGURATION_ERROR) from exc
     except ValueError as exc:
         typer.echo(json.dumps({"code": "invalid_configuration", "message": str(exc)}), err=True)
+        _release_lock(lock)
         close_file_logging()
         raise typer.Exit(code=EXIT_CONFIGURATION_ERROR) from exc
 
@@ -253,7 +266,19 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
         typer.echo(json.dumps(exc.to_dict(), default=str, indent=2), err=True)
         raise typer.Exit(code=EXIT_RUNTIME_ERROR) from exc
     finally:
+        _release_lock(lock)
         close_file_logging()
+
+
+def _release_lock(lock: SessionLock | None) -> None:
+    """Release the session lock if one was ever claimed.
+
+    ``lock`` is ``None`` when startup failed before the claim — a bad configuration, an
+    unusable directory — and releasing nothing is the correct response to that. Releasing
+    is never allowed to raise, so a shutdown path cannot fail during shutdown.
+    """
+    if lock is not None:
+        lock.release()
 
 
 def _drive(deployment: PaperDeployment, *, resume: bool) -> None:

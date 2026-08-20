@@ -8,7 +8,7 @@ real feed from a replayed one; if it could, the mode would prove nothing about l
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,6 +17,7 @@ import pytest
 from quantplatform.core.clock import SimulatedClock
 from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.portfolio import Balance
 from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 from quantplatform.paper import (
     InMemoryPaperStateRepository,
@@ -574,3 +575,184 @@ def test_maintenance_happens_before_the_bar_is_submitted() -> None:
     runner.run()
 
     assert order == ["maintain", "bar", "maintain", "bar"]
+
+
+# --- Resume: financial continuity (SEV-1, incident of 2026-08-20) ------------------------------
+#
+# The contract these pin down was stated at the very bottom of the stack and never fully
+# enforced at the top of it. SpotPortfolioEngine's docstring says seeding anything other than
+# flat "is out of scope ... this engine does not invent one", and the README repeats it for the
+# open-position case. But the engine is rebuilt from configured starting capital on every
+# resume, so *every* financial figure that engine owns — balances, reservations, realised PnL,
+# fees — is silently reset, while the session's own counters (bars_processed, restarts,
+# last_bar) are faithfully restored and go on claiming this is the same run.
+#
+# The incident: a session was interrupted holding 9509.13 USDT reserved against a working GTC
+# buy that had been approved but never filled. Nothing about that state is recoverable — the
+# order lived only in the broker's memory — and nothing refused to resume from it either.
+#
+# Each test below asserts the *only* two acceptable outcomes: exact restoration, or a loud
+# refusal before a single bar is processed. "Resumes, but quietly loses money" is the third
+# option that must not exist.
+
+
+def _stored_with(
+    repository: InMemoryPaperStateRepository,
+    session_id: str = "paper-1",
+    **overrides: object,
+) -> None:
+    """Rewrite the stored snapshot with a hand-built financial state.
+
+    Building the state directly is what lets a test describe an interruption that is
+    genuinely hard to reach through the pipeline — a crash between an order being reserved
+    and its fill — without staging an elaborate scenario whose own machinery could be what
+    the assertion ends up proving.
+    """
+    stored = repository.load(session_id)
+    assert stored is not None
+    repository.save(stored.model_copy(update=overrides))
+
+
+def _quote_balance(free: str, locked: str, at: datetime | None = None) -> Balance:
+    return Balance(
+        asset="USDT",
+        free=Decimal(free),
+        locked=Decimal(locked),
+        updated_at=at if at is not None else ANCHOR,
+    )
+
+
+def test_resuming_a_flat_untouched_account_is_allowed() -> None:
+    # The one case the flat-start engine can rebuild exactly: nothing financial has happened,
+    # so a fresh engine and the stored snapshot describe the same account.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    status = second.resume()
+
+    assert status.running is True
+    assert second.runtime_metrics().bars_processed == 3
+
+
+def test_resuming_after_realised_pnl_is_refused() -> None:
+    # A closed round trip leaves realised PnL the rebuilt engine starts at zero. Resuming
+    # would report a fresh account while the counters insist it is the same week-old session.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, realized_pnl=Decimal("125.50"))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError, match="realised pnl"):
+        second.resume()
+
+
+def test_resuming_after_fees_is_refused() -> None:
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, total_fees=Decimal("3.75"))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError, match="fees"):
+        second.resume()
+
+
+def test_resuming_with_reserved_balance_is_refused() -> None:
+    # The incident's exact shape: funds held against a working order the broker no longer
+    # remembers, because a broker's order book is process memory and nothing persists it.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, balances=(_quote_balance("490.8673953283", "9509.1326046717"),))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError, match="reserved"):
+        second.resume()
+
+
+def test_the_week4_incident_state_is_refused_rather_than_resumed() -> None:
+    # Regression, from the persisted state of paper-7c-week4 at 2026-08-20T16:14:46Z:
+    # 490.8673953283 free, 9509.1326046717 locked against an approved GTC buy that never
+    # filled, no open position, no realised PnL, no fees. Before this guard the session
+    # resumed cleanly and silently traded a rebuilt 10 000 USDT account instead.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(
+        repository,
+        balances=(_quote_balance("490.8673953283", "9509.1326046717"),),
+        positions=(),
+        realized_pnl=Decimal(0),
+        total_fees=Decimal(0),
+    )
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError) as caught:
+        second.resume()
+
+    # The refusal must name what it found, so an operator is not left guessing which of the
+    # several irrecoverable conditions applies to their session.
+    assert "9509.1326046717" in str(caught.value.details)
+    assert second.runtime_metrics().bars_processed == 0
+
+
+def test_a_refused_resume_processes_no_bars_at_all() -> None:
+    # Fail-closed means closed before anything happens, not after the first bar reveals it.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    bars = _flat_bars(5)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, bars[:3])
+    first.stop()
+    _stored_with(repository, realized_pnl=Decimal("10"))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError):
+        second.resume()
+
+    assert second.is_running is False
+    with pytest.raises(PaperSessionStateError, match="session is not running"):
+        second.submit_bar(bars[3])
+
+
+def test_a_refusal_leaves_the_stored_state_untouched() -> None:
+    # The snapshot is the only surviving record of the interrupted session. A refusal that
+    # damaged it would destroy the evidence an operator needs to decide what to do next.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, balances=(_quote_balance("100", "900"),))
+    before = repository.load("paper-1")
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    with pytest.raises(PaperSessionStateError):
+        second.resume()
+
+    assert repository.load("paper-1") == before

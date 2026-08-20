@@ -253,17 +253,10 @@ class PaperTradingSession:
         """Restore session bookkeeping from a stored snapshot.
 
         Raises:
-            PaperSessionStateError: If the snapshot holds an open position, which the
-                flat-start portfolio engine cannot be seeded with.
+            PaperSessionStateError: If the snapshot carries financial state the flat-start
+                portfolio engine cannot be seeded with. See :meth:`_require_restorable`.
         """
-        open_positions = [position for position in stored.positions if position.is_open]
-        if open_positions:
-            raise PaperSessionStateError(
-                "cannot resume a session holding an open position: the portfolio engine is "
-                "flat-start, and seeding one would bypass its reconciliation invariant",
-                session_id=self._session_id,
-                symbols=[position.symbol for position in open_positions],
-            )
+        self._require_restorable(stored)
         self._clock.adopt_start(stored.started_at)
         self._last_bar = stored.last_bar
         self._metrics.bars_processed = stored.bars_processed
@@ -278,6 +271,68 @@ class PaperTradingSession:
         )
         if self._state is None:
             self._state = self._engine.begin()
+
+    def _require_restorable(self, stored: PaperSessionState) -> None:
+        """Refuse to resume a snapshot whose money this session cannot put back.
+
+        **Resume restores bookkeeping, never an account.** The account lives in
+        :class:`~quantplatform.portfolio.engine.SpotPortfolioEngine` and the working orders
+        live in the broker, and a resumed process builds both from configuration — the
+        engine is flat-start by construction and its own docstring says seeding it otherwise
+        "is out of scope ... this engine does not invent one". So there are exactly two
+        honest outcomes for a stored snapshot: it describes an account a fresh engine
+        already matches, or resuming it is refused. A third — resuming while quietly
+        substituting a rebuilt account for the stored one — is the failure this exists to
+        make impossible, and it is not hypothetical: a session was interrupted holding
+        9509.13 USDT reserved against an approved buy that never filled, and nothing
+        anywhere refused to carry on as though that money had been there all along.
+
+        Four conditions are irrecoverable, and each is checked for the same reason:
+
+        * **an open position** — the reconciliation invariant ties ``Position.quantity`` to
+          the base balance, and seeding either would break it. Refused since Phase 6.
+        * **reserved balance** — funds held against a working order the broker no longer
+          has. Nothing persists an order book, so the reservation could never be matched to
+          the order that justified it even in principle.
+        * **realised PnL** and **fees** — cumulative figures the engine restarts at zero. A
+          resumed session would report a profitable week as flat, and every downstream
+          number computed from them would be wrong in the same direction.
+
+        The refusal names every condition it found rather than the first, because an
+        operator deciding what to do next needs the whole picture, and it happens before any
+        state is mutated, so a refused resume leaves the snapshot exactly as it was — that
+        file is the only surviving record of the interrupted session.
+
+        Raises:
+            PaperSessionStateError: If any irrecoverable financial state is present.
+        """
+        open_positions = [position for position in stored.positions if position.is_open]
+        reserved = {
+            balance.asset: str(balance.locked)
+            for balance in stored.balances
+            if balance.locked > ZERO
+        }
+        blocking: list[str] = []
+        if open_positions:
+            blocking.append("an open position")
+        if reserved:
+            blocking.append("balance reserved against a working order")
+        if stored.realized_pnl != ZERO:
+            blocking.append("realised pnl")
+        if stored.total_fees != ZERO:
+            blocking.append("fees paid")
+        if not blocking:
+            return
+        raise PaperSessionStateError(
+            "cannot resume a session carrying financial state: the portfolio engine is "
+            "flat-start and the broker holds no persisted orders, so a resumed process "
+            f"would silently trade a rebuilt account instead of this one ({', '.join(blocking)})",
+            session_id=self._session_id,
+            symbols=[position.symbol for position in open_positions],
+            reserved_balances=reserved,
+            realized_pnl=str(stored.realized_pnl),
+            total_fees=str(stored.total_fees),
+        )
 
     # --- Bar processing ---------------------------------------------------------------------
 

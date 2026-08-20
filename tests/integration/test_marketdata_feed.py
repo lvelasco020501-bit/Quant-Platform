@@ -590,19 +590,94 @@ def test_reconnection_delays_follow_the_exponential_schedule() -> None:
     assert feed.metrics.reconnects == 1
 
 
-def test_exhausting_the_retry_budget_ends_the_run_loudly() -> None:
-    # A feed that retried forever would turn an outage into a silent stall: the session
-    # would keep reporting an hour-old portfolio and every number would stay plausible.
-    bars = _flat_bars(1)
+def test_the_feed_keeps_retrying_past_the_nominal_budget_instead_of_giving_up() -> None:
+    # SEV-1 2026-08-20: a transport outage that took six consecutive connection attempts
+    # to clear ended paper-7c-week4 in 31 seconds, on infrastructure that had run cleanly
+    # for 50 hours. Continuity now survives more failed attempts than the nominal budget —
+    # DataGapError, not an attempt counter, is what may end a session over market data.
+    bars = _flat_bars(2)
     feed, _, delays = _feed(
-        [*_bar_steps(bars), _fail(then_refuse_connects=99)],
-        schedule=BackoffSchedule(max_attempts=2),
+        [*_bar_steps(bars[:1]), _fail(then_refuse_connects=6), *_bar_steps(bars[1:])],
+        schedule=BackoffSchedule(max_attempts=2, max_delay_seconds=4.0),
     )
 
-    with pytest.raises(MarketDataConnectionError, match="budget exhausted"):
+    delivered = _take(feed, 2)
+
+    assert [bar.open_time for bar in delivered] == [bars[0].open_time, bars[1].open_time]
+    assert len(delays) == 7
+    assert feed.metrics.reconnects == 1
+
+
+def test_a_prolonged_outage_leaves_the_session_alive_not_terminated() -> None:
+    # Fifty consecutive failures, far past any nominal budget this platform has ever
+    # configured — the feed must still be standing, and delivering, on the other side.
+    bars = _flat_bars(2)
+    feed, _, delays = _feed(
+        [*_bar_steps(bars[:1]), _fail(then_refuse_connects=50), *_bar_steps(bars[1:])],
+        schedule=BackoffSchedule(max_attempts=5, max_delay_seconds=8.0),
+    )
+
+    delivered = _take(feed, 2)
+
+    assert [bar.open_time for bar in delivered] == [bars[0].open_time, bars[1].open_time]
+    assert len(delays) == 51
+    assert delays[-1] == 8.0
+    assert feed.state is not MarketDataFeedState.STOPPED
+
+
+def test_a_long_outage_that_resumes_ahead_is_still_caught_as_a_gap() -> None:
+    # Composing the two changes: retrying past the old budget must not weaken the one
+    # thing that is still allowed to end a session over market data.
+    first = make_bar(index=0)
+    resumed = make_bar(index=5)
+    feed, _, _ = _feed(
+        [
+            _frame(make_kline_frame(first), at=first.close_time),
+            _fail(then_refuse_connects=8),
+            _frame(make_kline_frame(resumed), at=resumed.close_time),
+        ],
+        schedule=BackoffSchedule(max_attempts=2, max_delay_seconds=2.0),
+    )
+
+    with pytest.raises(DataGapError, match="4 missing"):
         _take(feed, 2)
 
-    assert len(delays) == 2
+    assert feed.state is MarketDataFeedState.PAUSED
+
+
+def test_a_stop_request_during_reconnection_is_honoured_between_attempts() -> None:
+    # No real signal is raised here — request_stop() is exactly what a caught SIGTERM
+    # calls, and this asserts the one thing this change owns: the retry loop notices the
+    # flag between attempts and gives up cleanly, rather than retrying forever regardless.
+    clock = SimulatedClock(ANCHOR)
+    bars = _flat_bars(1)
+    transport = _ScriptedTransport(
+        clock=clock, steps=[*_bar_steps(bars), _fail(then_refuse_connects=99)]
+    )
+    delays: list[float] = []
+    stop_after = 3
+
+    def _sleep_then_stop_on_the_third_wait(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= stop_after:
+            feed.request_stop()
+
+    feed = BinanceSpotMarketDataFeed(
+        config=_config(max_reconnect_attempts=2),
+        clock=clock,
+        transport=transport,
+        schedule=BackoffSchedule(max_attempts=2, max_delay_seconds=2.0),
+        sleep=_sleep_then_stop_on_the_third_wait,
+    )
+
+    feed_iter = feed.closed_bars()
+    next(feed_iter)  # the one bar delivered before the outage starts
+
+    delivered = list(feed_iter)
+
+    assert delivered == []
+    assert len(delays) == stop_after
+    assert feed.state is not MarketDataFeedState.STOPPED  # request_stop, not close()
 
 
 def test_a_candle_replayed_after_a_reconnect_is_suppressed() -> None:

@@ -1,28 +1,46 @@
-"""Reconnection policy: how long to wait, and when to stop waiting.
+"""Reconnection policy: how long to wait, and how the wait is bounded.
 
-Exponential backoff with a ceiling and a finite attempt budget. Two choices here are
-deliberate and worth stating, because both are places where the conventional answer is
-wrong for this component.
+Exponential backoff with a ceiling and no jitter. Jitter exists to desynchronise a fleet
+of clients stampeding a recovering server; a trading process runs one feed against one
+venue, so it buys nothing here — and it would cost the property that makes the whole
+platform testable, namely that the same inputs produce the same run.
 
-**No jitter.** Jitter exists to desynchronise a fleet of clients stampeding a recovering
-server. A trading process runs one feed against one venue, so jitter buys nothing — and it
-would cost the property that makes the whole platform testable, namely that the same inputs
-produce the same run.
-
-**A finite budget.** Retrying forever is the usual default and it is the dangerous one
-here: it converts an outage into a silent stall. A paper session that quietly stops
-receiving candles keeps reporting the portfolio it had an hour ago, and every metric it
-publishes stays plausible while being wrong. Exhausting the budget raises instead, so the
-run ends where the data ended.
+**Retrying is not bounded by a count, on purpose.** It once was: an attempt budget that
+raised once spent, reasoned from the fear of a feed that stalls silently while a session
+keeps reporting a stale, plausible-looking portfolio. That fear was real but the fix was
+wrong for a process meant to run seven days unattended — a transport hiccup that took six
+reconnection attempts to clear, on infrastructure that had otherwise run cleanly for two
+days, ended a session in thirty-one seconds. The failure this format actually needs to
+catch is a session trading on data that stopped arriving, and that is what
+:class:`~quantplatform.core.errors.DataGapError` and the session's stall watchdog already
+exist to catch — the first by refusing to trade across a hole in the series, the second by
+observing the pipeline directly rather than counting an unrelated proxy for it. Neither of
+them cares how many times the transport had to retry to get there. What is now bounded
+instead is the *delay* between attempts, which is what keeps an outage from burning CPU or
+spamming the venue — :attr:`BackoffSchedule.max_delay_seconds` still caps every wait, no
+matter how long the outage or how many attempts it has taken.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
-from quantplatform.core.errors import DomainValidationError, MarketDataConnectionError
+from quantplatform.core.errors import DomainValidationError
 
 __all__ = ["BackoffSchedule", "ReconnectPolicy"]
+
+_MAX_GROWTH_EXPONENT: Final[int] = 50
+"""Ceiling on the exponent :meth:`BackoffSchedule.delay_for` will actually compute.
+
+An outage lasting long enough — hours, now that reconnection has no attempt limit — pushes
+the attempt number into the thousands, and ``multiplier ** (attempt - 1)`` would overflow
+a float long before that (verified: ``2.0 ** 1029`` raises ``OverflowError`` on CPython).
+Fifty doublings of any sane ``initial_delay_seconds`` already exceeds any sane
+``max_delay_seconds`` by many orders of magnitude, so capping the exponent here changes
+nothing observable — the result was always going to be clamped to the ceiling — and it
+costs nothing to compute regardless of how many attempts an outage has actually taken.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +58,9 @@ class BackoffSchedule:
     max_delay_seconds: float = 60.0
     multiplier: float = 2.0
     max_attempts: int = 5
+    """No longer a point at which reconnection stops. Kept as the threshold
+    :attr:`ReconnectPolicy.is_exhausted` reports once crossed — informational only, for a
+    caller that wants to know an outage has run longer than the nominal, everyday case."""
 
     def __post_init__(self) -> None:
         """Check the schedule is usable.
@@ -80,7 +101,8 @@ class BackoffSchedule:
         """
         if attempt < 1:
             raise DomainValidationError("attempt must be at least 1", attempt=attempt)
-        grown = self.initial_delay_seconds * (self.multiplier ** (attempt - 1))
+        exponent = min(attempt - 1, _MAX_GROWTH_EXPONENT)
+        grown = self.initial_delay_seconds * (self.multiplier**exponent)
         return min(grown, self.max_delay_seconds)
 
     def permits(self, attempt: int) -> bool:
@@ -118,20 +140,14 @@ class ReconnectPolicy:
     def next_delay(self) -> float:
         """Consume one attempt and return how long to wait before it.
 
+        Never refuses. An attempt past the nominal budget still gets a delay, clamped to
+        the same ceiling as every other attempt — see :attr:`is_exhausted` for the signal
+        that the nominal budget has been spent, which a caller may use for observability
+        but which no longer stops reconnection on its own.
+
         Returns:
             The delay in seconds.
-
-        Raises:
-            MarketDataConnectionError: If the attempt budget is already spent. Raising
-                rather than returning a sentinel is the point: a caller cannot accidentally
-                treat "give up" as "wait zero seconds and try again".
         """
-        if self.is_exhausted:
-            raise MarketDataConnectionError(
-                "market-data reconnection budget exhausted",
-                attempts=self._attempts,
-                max_attempts=self._schedule.max_attempts,
-            )
         self._attempts += 1
         return self._schedule.delay_for(self._attempts)
 

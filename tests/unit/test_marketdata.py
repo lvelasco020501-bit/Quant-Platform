@@ -20,7 +20,6 @@ from quantplatform.core.errors import (
     DataIntegrityError,
     DataProviderError,
     DomainValidationError,
-    MarketDataConnectionError,
     MarketDataSubscriptionError,
     OutOfOrderDataError,
 )
@@ -182,19 +181,35 @@ def test_asking_for_a_zeroth_attempt_is_refused() -> None:
         BackoffSchedule().delay_for(0)
 
 
-def test_the_policy_hands_out_delays_until_the_budget_is_spent() -> None:
+def test_the_policy_keeps_handing_out_delays_past_the_nominal_budget() -> None:
+    # A short-lived outage and a days-long one look the same for the first few attempts;
+    # what must never happen is the policy refusing to keep going once the nominal budget
+    # (still used for the *is_exhausted* signal) is spent. Retrying forever is the point —
+    # DataGapError, the watchdog and an operator are what may end a session now, not this.
     policy = ReconnectPolicy(
-        BackoffSchedule(initial_delay_seconds=1.0, multiplier=2.0, max_attempts=3)
+        BackoffSchedule(
+            initial_delay_seconds=1.0, max_delay_seconds=4.0, multiplier=2.0, max_attempts=3
+        )
     )
 
     assert [policy.next_delay() for _ in range(3)] == [1.0, 2.0, 4.0]
     assert policy.attempts == 3
     assert policy.is_exhausted is True
 
-    # Raising rather than returning a sentinel: a caller cannot mistake "give up" for
-    # "wait zero seconds and try again".
-    with pytest.raises(MarketDataConnectionError, match="budget exhausted"):
-        policy.next_delay()
+    # Past the nominal budget: no exception, delay stays clamped at the ceiling.
+    assert policy.next_delay() == 4.0
+    assert policy.next_delay() == 4.0
+    assert policy.attempts == 5
+
+
+def test_delay_for_does_not_overflow_after_thousands_of_attempts() -> None:
+    # An outage lasting long enough for attempt numbers to reach the thousands must not
+    # crash the process computing a delay curve whose only use, at that point, is to be
+    # clamped away by the ceiling regardless.
+    schedule = BackoffSchedule(initial_delay_seconds=1.0, max_delay_seconds=60.0, multiplier=2.0)
+
+    assert schedule.delay_for(2_000) == 60.0
+    assert schedule.delay_for(100_000) == 60.0
 
 
 def test_a_proven_connection_restores_the_full_retry_budget() -> None:

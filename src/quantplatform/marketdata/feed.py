@@ -524,7 +524,7 @@ class BinanceSpotMarketDataFeed:
             An iterator over closed bars in strictly increasing open-time order.
 
         Raises:
-            MarketDataConnectionError: If the feed is stopped, or reconnection is exhausted.
+            MarketDataConnectionError: If the feed is stopped.
             DataGapError: If a candle is missing, or the feed is already paused for one.
             DataIntegrityError: If the venue publishes a candle that cannot be trusted.
             OutOfOrderDataError: If a candle predates one already delivered.
@@ -640,10 +640,8 @@ class BinanceSpotMarketDataFeed:
         """Read one frame, reconnecting if the stream failed or fell silent.
 
         Returns:
-            The frame text, or ``None`` when the caller should simply try again.
-
-        Raises:
-            MarketDataConnectionError: If reconnection exhausts its budget.
+            The frame text, or ``None`` when the caller should simply try again — including
+            when reconnection gave up because :meth:`request_stop` was called mid-retry.
         """
         try:
             frame = self._transport.receive(self._config.receive_timeout_seconds)
@@ -677,9 +675,13 @@ class BinanceSpotMarketDataFeed:
         fact is what makes reconnection safe: a replayed candle is suppressed, a resumed
         stream that skipped ahead is caught as a gap, and one that rewound is refused.
 
-        Raises:
-            MarketDataConnectionError: If the attempt budget is exhausted.
+        **Does not give up.** There is no attempt at which this stops retrying on its own;
+        see the module docstring for why. It stops early, without either succeeding or
+        raising, if :meth:`request_stop` is called while it is waiting out a delay — checked
+        between attempts, so the wait already in progress still runs to its end before the
+        request is noticed.
         """
+        disconnected_at = self._clock.now()
         _LOGGER.warning(
             "reconnecting",
             extra={
@@ -691,14 +693,13 @@ class BinanceSpotMarketDataFeed:
         self._transport.close()
         self._clock.forget_frames()
         while True:
-            try:
-                delay = self._policy.next_delay()
-            except MarketDataConnectionError:
-                _LOGGER.error(
-                    "reconnect budget exhausted; giving up",
+            if self._stopping:
+                _LOGGER.info(
+                    "reconnect abandoned; shutdown requested",
                     extra={"feed": self.name, "attempts": self._policy.attempts},
                 )
-                raise
+                return
+            delay = self._policy.next_delay()
             _LOGGER.debug(
                 "reconnect attempt",
                 extra={
@@ -711,12 +712,21 @@ class BinanceSpotMarketDataFeed:
             try:
                 self._open()
             except (MarketDataConnectionError, MarketDataSubscriptionError) as exc:
+                elapsed = (self._clock.now() - disconnected_at).total_seconds()
                 _LOGGER.warning(
                     "reconnect attempt failed",
                     extra={
                         "feed": self.name,
                         "attempt": self._policy.attempts,
                         "error": type(exc).__name__,
+                        # The wrapper type above is always the same one or two classes;
+                        # what actually failed — a timeout, a refused connection, a DNS
+                        # failure — is preserved in .details by whichever layer first
+                        # caught it, and is worth surfacing here rather than only in a
+                        # traceback nobody reads for a routine retry.
+                        "original_exception_type": exc.details.get("error"),
+                        "seconds_since_disconnected": elapsed,
+                        "reconnect_loop_seconds": elapsed,
                     },
                 )
                 self._transport.close()

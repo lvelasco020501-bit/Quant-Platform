@@ -41,11 +41,13 @@ __all__ = [
     "OutOfOrderFillError",
     "PaperSessionStateError",
     "PortfolioError",
+    "PositionRiskAmbiguityError",
     "QuantPlatformError",
     "ReconciliationError",
     "RiskError",
     "RiskInvariantError",
     "RiskRejectionError",
+    "RiskSizingError",
     "StaleDataError",
     "StorageError",
     "StrategyAlreadyRegisteredError",
@@ -315,6 +317,24 @@ class UnsupportedRiskInputError(RiskError):
     """Raised when an intent is structurally outside anything the engine can reason about."""
 
     code = "unsupported_risk_input"
+
+
+class PositionRiskAmbiguityError(RiskError):
+    """Raised when a position's protective state can no longer be stated exactly.
+
+    Reached when a fill would add to a position whose recorded stop disagrees with the one
+    its approving order carried. There is no correct way to merge two protection levels into
+    one — the tighter would claim protection the second entry never bought, the looser would
+    silently widen the first entry's risk, and an average would describe neither trade.
+
+    Failing here rather than choosing is deliberate, and so is failing rather than dropping
+    the record: a position that exists while the platform has lost track of what protects it
+    is a worse outcome than a run that stops. Preventing the situation before the fill would
+    be better still, and belongs with whatever first introduces a scale-in strategy; no
+    strategy in the platform can currently reach it.
+    """
+
+    code = "position_risk_ambiguity"
 
 
 class RiskSizingError(RiskError):

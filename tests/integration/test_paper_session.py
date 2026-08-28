@@ -775,6 +775,7 @@ def _risk_state(symbol: str = SYMBOL, **overrides: object) -> PositionRiskState:
     defaults: dict[str, object] = {
         "symbol": symbol,
         "stop": StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+        "quantity": Decimal("0.5"),
         "risk_amount": Decimal("100"),
         "entry_price": Decimal("72000"),
         "opened_at": ANCHOR,

@@ -48,6 +48,7 @@ from quantplatform.core.enums import (
 from quantplatform.core.errors import (
     ConfigurationError,
     DataIntegrityError,
+    PositionRiskAmbiguityError,
     StrategyContextError,
 )
 from quantplatform.core.events import DomainEvent
@@ -56,12 +57,14 @@ from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
-from quantplatform.core.models.risk import RiskContext, RiskDecision
+from quantplatform.core.models.risk import PositionRiskState, RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
+from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.symbol_rules import as_symbol_rules_store
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.risk.engine import StandardRiskEngine
+from quantplatform.risk.sizing import projected_stop_out_cost
 from quantplatform.strategies.base import BaseStrategy
 
 __all__ = ["BacktestEngine", "RunState"]
@@ -99,6 +102,14 @@ class RunState:
     last_close: dict[str, Decimal]
     positions: dict[str, Position]
     approved_by_id: dict[str, ApprovedOrder]
+    position_risk: dict[str, PositionRiskState]
+    """What each open position is protected by, keyed by symbol.
+
+    Reconstructed after every fill from the position that actually resulted, never from what
+    was requested. Empty unless the risk engine derived a stop — a position with no recorded
+    protection has none, which is a true statement where an entry claiming otherwise would
+    not be.
+    """
     approval_times: list[datetime]
     initial_equity: Decimal
     """The equity the account genuinely held when the run opened.
@@ -272,6 +283,10 @@ class BacktestEngine:
                 msg = "the broker reported a fill the portfolio never applied"
                 raise DataIntegrityError(msg, fill_id=str(fill.fill_id))
             state.calls["portfolio_fills_applied"] += 1
+
+        # Every fill is now booked, so the position is final for this bar and its risk can
+        # be restated from what genuinely exists rather than from what was asked for.
+        self._update_position_risk(execution.fills, state)
 
         history = state.history.setdefault(bar.symbol, [])
         history.append(bar)
@@ -524,6 +539,93 @@ class BacktestEngine:
             else:
                 state.slippage += (bar.open - fill.price) * fill.quantity
 
+    def _update_position_risk(self, fills: Sequence[Fill], state: RunState) -> None:
+        """Restate what each touched position is protected by, from the position itself.
+
+        Called once per bar, after the portfolio has booked every fill it produced, so the
+        position read here is final: partial fills, several fills of one order, and a
+        reduction all arrive as one settled outcome rather than a sequence to be replayed.
+
+        The risk recorded is computed from ``avg_entry_price`` and the size that actually
+        remains — never from the sizing that preceded execution. Those differ whenever a cap
+        reduced the order, lot rounding moved it, or the fill landed away from the reference
+        price, and persisting the earlier figure would describe a position that was never
+        opened.
+
+        A position reduced to flat loses its record: nothing is protecting it, and a stale
+        entry would go on claiming otherwise.
+
+        Raises:
+            PositionRiskAmbiguityError: If a fill adds to a position whose recorded stop
+                disagrees with the one its approving order carried. See the error for why
+                this fails rather than choosing between them.
+        """
+        held = {position.symbol: position for position in self._portfolio.positions()}
+        for symbol in {fill.symbol for fill in fills}:
+            position = held.get(symbol)
+            if position is None or not position.is_open:
+                state.position_risk.pop(symbol, None)
+                continue
+            stop = self._approved_stop(symbol, fills, state)
+            existing = state.position_risk.get(symbol)
+            if stop is None:
+                # A reduction, or an entry that carried no stop. An existing record is
+                # rescaled to what remains; absent one, there is nothing to record.
+                if existing is None:
+                    continue
+                stop = existing.stop
+            elif existing is not None and existing.stop != stop:
+                msg = "this fill's protective stop and the position's recorded stop differ"
+                raise PositionRiskAmbiguityError(
+                    msg,
+                    symbol=symbol,
+                    recorded_stop=str(existing.stop.trigger_price),
+                    incoming_stop=str(stop.trigger_price),
+                )
+            entry = position.avg_entry_price
+            opened_at = position.opened_at
+            if entry is None or opened_at is None:  # pragma: no cover - an open position has both
+                continue
+            risk_amount = projected_stop_out_cost(
+                quantity=position.quantity,
+                entry_price=entry,
+                stop=stop,
+                side=OrderSide.BUY,
+                policy=self._risk.config.execution_policy,
+            )
+            if risk_amount is None or risk_amount <= ZERO:
+                # Nothing computable, so nothing is claimed. Recording a position as
+                # protected without being able to say by how much is the failure this
+                # whole layer exists to prevent.
+                state.position_risk.pop(symbol, None)
+                continue
+            state.position_risk[symbol] = PositionRiskState(
+                symbol=symbol,
+                stop=stop,
+                quantity=position.quantity,
+                risk_amount=risk_amount,
+                entry_price=entry,
+                opened_at=existing.opened_at if existing is not None else opened_at,
+            )
+
+    def _approved_stop(
+        self, symbol: str, fills: Sequence[Fill], state: RunState
+    ) -> StopSpecification | None:
+        """Return the protective stop the orders behind this bar's buys were approved under.
+
+        Only buys are consulted: a sell reduces a position and cannot change what the
+        remaining size is protected at. Several fills of one order share a client order id
+        and therefore one stop, which is why this looks the stop up rather than accumulating
+        one per fill.
+        """
+        for fill in fills:
+            if fill.symbol != symbol or fill.side is not OrderSide.BUY:
+                continue
+            approved = state.approved_by_id.get(fill.client_order_id)
+            if approved is not None and approved.protective_stop is not None:
+                return approved.protective_stop
+        return None
+
     def _record_equity(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
         """Append an equity point and update the peak and daily anchors."""
         equity = snapshot.equity
@@ -684,6 +786,7 @@ class BacktestEngine:
             last_close={},
             positions={},
             approved_by_id={},
+            position_risk={},
             approval_times=[],
             peak_equity=equity,
             day_start_equity=equity,

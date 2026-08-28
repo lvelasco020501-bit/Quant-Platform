@@ -829,7 +829,15 @@ class StandardRiskEngine:
         quantity does, so every cap applies identically either way. That is what keeps the
         engine the single owner of balance, exposure, venue bounds and lot precision.
         """
-        if stop is not None and self._config.risk_budget is not None:
+        # Entries only. An exit is not a new risk being taken — it is one being ended, and
+        # sizing it against a risk budget would refuse to close the whole position, leaving a
+        # residue no later exit could clear because each would be sized the same way. On a
+        # spot long-only platform the entry is always the buy.
+        if (
+            stop is not None
+            and self._config.risk_budget is not None
+            and intent.side is OrderSide.BUY
+        ):
             outcome = RiskBasedSizer().size(
                 SizingRequest(
                     equity=context.snapshot.equity,

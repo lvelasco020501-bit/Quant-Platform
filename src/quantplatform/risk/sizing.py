@@ -39,6 +39,7 @@ __all__ = [
     "market_buy_price_cap",
     "normalize_limit_price",
     "normalize_quantity",
+    "projected_stop_out_cost",
     "quantity_for_notional",
     "select_sizer",
 ]
@@ -418,3 +419,43 @@ def select_sizer(
     if config.risk_budget is not None and has_stop:
         return RiskBasedSizer()
     return FixedFractionSizer(entry_fraction=entry_fraction)
+
+
+def projected_stop_out_cost(
+    *,
+    quantity: Decimal,
+    entry_price: Decimal,
+    stop: StopSpecification,
+    side: OrderSide,
+    policy: ExecutionPolicy,
+) -> Decimal | None:
+    """Return what being stopped out of an existing position would cost.
+
+    The same arithmetic :class:`RiskBasedSizer` sizes with, exposed so that the figure
+    recorded against a position and the figure a position was sized to are computed by one
+    function rather than two that must agree. They are asked in opposite directions — sizing
+    solves for quantity given a budget, this solves for cost given a quantity — and a second
+    implementation of the shared middle would drift the first time either changed.
+
+    Args:
+        quantity: Open size the cost is computed over.
+        entry_price: What the position actually paid, averaged across its fills.
+        stop: The level it is protected at.
+        side: Direction of the open position.
+        policy: Fee and slippage assumptions, shared with the executing adapter.
+
+    Returns:
+        The modelled cost, or ``None`` when the stop carries no absolute level to measure
+        against — a distance-only stop describes no cost until a level exists.
+    """
+    if stop.trigger_price is None or quantity <= ZERO:
+        return None
+    exit_side = OrderSide.SELL if side is OrderSide.BUY else OrderSide.BUY
+    exit_price = policy.slippage.adjust(stop.trigger_price, exit_side)
+    at_zero = policy.fee.fee_for(ZERO, is_first_fill=True)
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        entry_leg = policy.fee.fee_for(entry_price, is_first_fill=True) - at_zero
+        exit_leg = policy.fee.fee_for(exit_price, is_first_fill=True) - at_zero
+        per_unit = abs(entry_price - exit_price) + entry_leg + exit_leg
+        return quantity * per_unit + at_zero * 2

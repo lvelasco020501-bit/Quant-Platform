@@ -30,13 +30,16 @@ from quantplatform.core.enums import (
 from quantplatform.core.errors import (
     ConfigurationError,
     DataIntegrityError,
+    PositionRiskAmbiguityError,
     StrategyContextError,
     StrategyError,
 )
 from quantplatform.core.events import FillReceived, OrderStatusChanged, RiskDecisionMade
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.risk import PositionRiskState, RiskBudget
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
+from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.features import (
     ExponentialMovingAverageFeatures,
     MovingAverageFeatures,
@@ -762,3 +765,169 @@ def test_moving_the_configured_capital_moves_the_reported_opening_equity() -> No
         assert result.performance is not None
         assert result.performance.initial_equity == cash
         assert result.config.initial_capital == cash
+
+
+# --- M5b: position risk state reconstructed from real fills -------------------------------------
+#
+# The stop travelled as far as the approved order in M5a and stopped there. It now reaches the
+# position it protects, carrying what that position genuinely risks — computed from the fill
+# that actually happened and the size that actually remains, never from what was requested.
+#
+# Nothing here enforces anything. A stop recorded against a position is still metadata; the
+# broker matches exactly as it did. What changes is that the platform can now answer "what is
+# this position protected by, and how much is at stake?" — a question week 5 could not answer
+# about the position it held for four days.
+
+
+def _v2_backtest(
+    **overrides: object,
+) -> tuple[BacktestEngine, SimulatedBroker, SpotPortfolioEngine]:
+    """Wire a backtest whose risk engine derives stops and sizes from a risk budget."""
+    defaults: dict[str, object] = {
+        "risk_budget": RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        "initial_stop_distance_bps": Decimal(200),
+    }
+    return make_backtest(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def test_a_v1_run_records_no_position_risk() -> None:
+    # No stop is derived, so nothing is protected and nothing claims to be. An empty mapping
+    # rather than entries reporting nothing: a record that cannot say what it protects is the
+    # failure this whole layer exists to prevent.
+    engine, _, _ = make_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 2):
+        engine.advance(bar, state)
+
+    assert state.position_risk == {}
+
+
+def test_a_protected_entry_records_what_it_risks() -> None:
+    engine, _, portfolio = _v2_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 2):
+        engine.advance(bar, state)
+
+    risk = state.position_risk[SYMBOL]
+    position = portfolio.positions()[0]
+    assert risk.symbol == SYMBOL
+    assert risk.risk_amount > Decimal(0)
+    assert risk.entry_price == position.avg_entry_price
+
+
+def test_the_recorded_risk_uses_the_real_fill_not_the_requested_size() -> None:
+    # The distinction the milestone turns on. Sizing produced a number before execution;
+    # what is persisted must describe the position that exists, after every cap, rounding
+    # and fill price the run actually produced.
+    engine, _, portfolio = _v2_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 2):
+        engine.advance(bar, state)
+
+    risk = state.position_risk[SYMBOL]
+    position = portfolio.positions()[0]
+    assert risk.quantity == position.quantity
+    assert risk.entry_price == position.avg_entry_price
+
+
+def test_the_recorded_stop_is_the_one_the_order_was_approved_under() -> None:
+    engine, _, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 2):
+        engine.advance(bar, state)
+
+    approved = next(order for order in state.approved if order.protective_stop is not None)
+    assert state.position_risk[SYMBOL].stop == approved.protective_stop
+
+
+def test_closing_a_position_removes_its_risk_state() -> None:
+    # A flat position is protected by nothing, and must not go on claiming otherwise.
+    engine, _, _ = _v2_backtest(strategy=BuyThenSell(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 4):
+        engine.advance(bar, state)
+
+    assert SYMBOL not in state.position_risk
+
+
+def test_risk_state_survives_a_snapshot_round_trip() -> None:
+    engine, _, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+
+    for bar in _flat_bars(_WARMUP_BARS + 2):
+        engine.advance(bar, state)
+
+    risk = state.position_risk[SYMBOL]
+    restored = PositionRiskState.model_validate_json(risk.model_dump_json())
+    assert restored == risk
+
+
+class BuyTwice(BaseStrategy):
+    """Enters twice regardless of position state, which no shipped strategy does.
+
+    Exists solely to reach the scale-in path: every strategy the platform ships gates its
+    entry on being flat, so the ambiguity this test pins cannot occur in production today —
+    and that is exactly why it needs a deliberate way to be reached before one can.
+    """
+
+    METADATA: ClassVar[StrategyMetadata] = StrategyMetadata(
+        strategy_id="buy_twice",
+        version="1.0.0",
+        name="Buy twice",
+        description="Enters on two bars, ignoring position state.",
+        required_history=_WARMUP_BARS,
+        required_features=(),
+        supported_timeframes=(Timeframe.H1,),
+        supported_market_types=(MarketType.SPOT,),
+        parameter_schema=_Params,
+        operates_intrabar=False,
+        allows_short=False,
+    )
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Return an entry on the warm-up bar and on the one after it."""
+        if context.history_length in (_WARMUP_BARS, _WARMUP_BARS + 1):
+            return (
+                self.build_signal(
+                    context=context,
+                    action=SignalAction.ENTER_LONG,
+                    confidence=Decimal("0.6"),
+                    reason="scale in",
+                ),
+            )
+        return ()
+
+
+def test_a_scale_in_with_a_different_stop_fails_loudly() -> None:
+    # No combination policy is invented, and none is guessed at. Two entries protected at
+    # different levels leave the platform unable to say what the combined position is
+    # protected by — and a position that exists while the system has lost track of its
+    # protection is worse than a run that stops. Prevention before the fill would be better
+    # still, but belongs with whatever introduces a scale-in strategy; today no shipped
+    # strategy can reach this, so the reconciliation check is what stands guard.
+    engine, _, _ = _v2_backtest(
+        strategy=BuyTwice(_Params()), max_open_positions=2, max_open_orders=2
+    )
+    state = engine.begin()
+    # Prices move between the two entries so risk derives a different stop for each, but
+    # by less than the first order's market-buy cap, so that order still fills rather than
+    # being cancelled for breaching it.
+    prices = [Decimal(50_000)] * _WARMUP_BARS + [Decimal(51_000)] * 3
+    bars = make_bars(prices)
+
+    def _drive() -> None:
+        for bar in bars:
+            engine.advance(bar, state)
+
+    with pytest.raises(PositionRiskAmbiguityError, match="differ"):
+        _drive()

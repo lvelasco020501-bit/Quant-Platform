@@ -161,6 +161,7 @@ def test_position_risk_state_records_what_was_actually_risked() -> None:
     state = PositionRiskState(
         symbol=SYMBOL,
         stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+        quantity=Decimal("0.05"),
         risk_amount=Decimal("100"),
         entry_price=Decimal("72000"),
         opened_at=ANCHOR,
@@ -177,6 +178,7 @@ def test_a_position_risking_nothing_is_refused() -> None:
         PositionRiskState(
             symbol=SYMBOL,
             stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+            quantity=Decimal("0.05"),
             risk_amount=Decimal(0),
             entry_price=Decimal("72000"),
             opened_at=ANCHOR,
@@ -335,6 +337,7 @@ def test_position_risk_state_round_trips_through_json() -> None:
     state = PositionRiskState(
         symbol=SYMBOL,
         stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+        quantity=Decimal("0.05"),
         risk_amount=Decimal("100.25"),
         entry_price=Decimal("72000"),
         highest_price_seen=Decimal("73500"),

@@ -570,6 +570,13 @@ class PaperTradingSession:
             saved_at=self._clock.now(),
             balances=tuple(self._portfolio.balances()),
             positions=tuple(self._portfolio.positions()),
+            # Whatever the run reconstructed from real fills, in a stable order so two
+            # snapshots of the same state compare equal.
+            position_risk=tuple(
+                self._state.position_risk[symbol] for symbol in sorted(self._state.position_risk)
+            )
+            if self._state is not None
+            else (),
             last_bar=self._last_bar,
             bars_processed=self._metrics.bars_processed,
             realized_pnl=snapshot.realized_pnl if snapshot is not None else ZERO,

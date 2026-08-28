@@ -354,6 +354,15 @@ class PositionRiskState(DomainModel):
 
     symbol: Symbol
     stop: StopSpecification
+    quantity: NonNegativeMoney = Field(gt=0)
+    """The open size this risk describes.
+
+    Recorded alongside the amount rather than derived from it, because the two answer
+    different questions after a partial exit: the amount says what is now at stake, the
+    quantity says what it is at stake on. Without it a reduced position's risk figure could
+    not be checked against the position it belongs to.
+    """
+
     risk_amount: NonNegativeMoney = Field(gt=0)
     """Quote-asset amount at risk at entry: the denominator of every R-multiple.
 

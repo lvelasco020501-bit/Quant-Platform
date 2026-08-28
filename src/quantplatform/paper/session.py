@@ -389,14 +389,20 @@ class PaperTradingSession:
 
         try:
             outcome = self._engine.advance(bar, self._state)
-        except DataIntegrityError:
-            # Ordering and closure are already screened above, so what remains is an unknown
-            # symbol: a wiring mistake, not a transient feed problem, and it must surface.
+        except DataIntegrityError as exc:
+            # Ordering and closure are already screened above, so what reaches here is an
+            # integrity failure the engine could not reconcile: an unknown symbol, or a
+            # position the accounting cannot describe. Naming only the first was true when it
+            # was the only one; it is now a misfiling that would tell a post-incident reader
+            # the feed sent an untraded symbol when a position had in fact lost the record of
+            # what protects it. The error says which; the log repeats it rather than guessing.
             self._metrics.bars_rejected += 1
             _LOGGER.error(
-                "bar rejected: unknown symbol",
+                "bar rejected: data integrity failure",
                 extra={
                     "session_id": self._session_id,
+                    "error_code": exc.code,
+                    "reason": exc.message,
                     "symbol": bar.symbol,
                     "close_time": bar.close_time.isoformat(),
                 },

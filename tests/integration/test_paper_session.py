@@ -17,11 +17,15 @@ import pytest
 
 from quantplatform.core.clock import SimulatedClock
 from quantplatform.core.enums import StopKind
-from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
+from quantplatform.core.errors import (
+    DataIntegrityError,
+    PaperSessionStateError,
+    PositionRiskUnavailableError,
+)
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import Balance
-from quantplatform.core.models.risk import PositionRiskState, StopSpecification
+from quantplatform.core.models.risk import PositionRiskState, RiskBudget, StopSpecification
 from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 from quantplatform.paper import (
     InMemoryPaperStateRepository,
@@ -885,3 +889,30 @@ def test_an_empty_risk_state_does_not_by_itself_block_resume() -> None:
 
     assert status.running is True
     assert second.runtime_metrics().bars_processed == 3
+
+
+def test_a_position_integrity_failure_is_not_logged_as_an_unknown_symbol() -> None:
+    # The bar handler catches `DataIntegrityError` and re-raises it, which is right, but it
+    # labels every one of them "unknown symbol" and counts it as a rejected bar. That was
+    # true when an unknown symbol was the only integrity failure the engine could raise; M5b
+    # and M6 added two more. A post-incident reader would then be told the feed sent a symbol
+    # the platform does not trade, when what actually happened is that a position lost the
+    # record of what protects it — which is the more serious event, misfiled as the lesser.
+    session, clock, _, _ = _session(
+        risk_budget=RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        initial_stop_distance_bps=Decimal(200),
+    )
+    session.start()
+    bars = make_bars([Decimal(50_000)] * (_WARMUP_BARS + 4))
+    _feed_bars(session, clock, bars[:4])
+    assert session._state is not None
+    assert SYMBOL in session._state.position_risk
+    session._state.position_risk.clear()
+
+    with pytest.raises(PositionRiskUnavailableError):
+        _feed_bars(session, clock, bars[4:])

@@ -333,10 +333,14 @@ class StandardRiskEngine:
 
         Raises:
             PositionRiskUnavailableError: If a position that must be protected has no
-                recorded risk, or carries a stop with no level to test. Continuing would
-                leave the account exposed while the system reported it covered, and silence
-                is worse than a stopped run because a stopped run is noticed.
+                recorded risk, carries a stop with no level to test, is described by a
+                record whose size has drifted from the position's own, or if a record
+                outlives the position it describes. Continuing would leave the account
+                exposed while the system reported it covered, and silence is worse than a
+                stopped run because a stopped run is noticed.
         """
+        if require_protection:
+            self._verify_risk_records(positions, position_risk)
         actions: list[RiskAction] = []
         for position in positions:
             if not position.is_open or position.symbol != bar.symbol:
@@ -378,7 +382,7 @@ class StandardRiskEngine:
         self._check_duplication(recorder, intent, context, forced_exit=forced_exit)
         self._check_frequency(recorder, context, forced_exit=forced_exit)
         self._check_drawdown(recorder, context)
-        self._check_market_conditions(recorder, context)
+        self._check_market_conditions(recorder, context, forced_exit=forced_exit)
         self._check_instrument(recorder, intent, context)
 
         sizing = self._size(recorder, intent, context)
@@ -698,14 +702,32 @@ class StandardRiskEngine:
             limit=limit,
         )
 
-    def _check_market_conditions(self, recorder: _Recorder, context: RiskContext) -> None:
-        """Evaluate the spread and volatility guards."""
+    def _check_market_conditions(
+        self, recorder: _Recorder, context: RiskContext, *, forced_exit: bool = False
+    ) -> None:
+        """Evaluate the spread and volatility guards.
+
+        Both describe a market an entry would be unwise to walk into, and neither describes
+        an exit that cannot happen. Refusing to close a position because the market is
+        disorderly keeps the account exposed precisely while exposure is most dangerous,
+        which inverts each guard's purpose exactly as the frequency limit did before M6. On
+        a forced exit they are therefore recorded as advisory: the check still runs, still
+        reports what it found, and only loses its veto.
+
+        The line is drawn at what the guard is about. A wide spread or a violent tape is a
+        judgement about a price we can see, so it may be overruled. Stale data means we
+        cannot see one, and :meth:`_check_operational` keeps that blocking on every intent —
+        which is what makes data integrity outrank capital protection rather than merely be
+        listed above it.
+        """
+        severity = RiskCheckSeverity.ADVISORY if forced_exit else RiskCheckSeverity.BLOCKING
         self._record_optional_metric(
             recorder,
             RiskCheckCode.EXCESSIVE_SPREAD,
             value=context.spread_basis_points,
             limit=self._config.max_spread_bps,
             label="spread",
+            severity=severity,
         )
         self._record_optional_metric(
             recorder,
@@ -713,6 +735,7 @@ class StandardRiskEngine:
             value=context.realized_volatility,
             limit=self._config.max_volatility,
             label="realized volatility",
+            severity=severity,
         )
 
     def _record_optional_metric(
@@ -723,6 +746,7 @@ class StandardRiskEngine:
         value: Decimal | None,
         limit: Decimal,
         label: str,
+        severity: RiskCheckSeverity = RiskCheckSeverity.BLOCKING,
     ) -> None:
         """Record a guard over a metric the context may not carry."""
         if value is None:
@@ -732,6 +756,7 @@ class StandardRiskEngine:
                     passed=False,
                     message=f"{label} is unavailable and strict mode requires it",
                     limit=limit,
+                    severity=severity,
                 )
             else:
                 recorder.skip(code, message=f"{label} is unavailable")
@@ -742,6 +767,7 @@ class StandardRiskEngine:
             message=f"{label} exceeds its limit"
             if value > limit
             else f"{label} is within its limit",
+            severity=severity,
             observed=value,
             limit=limit,
         )
@@ -807,6 +833,43 @@ class StandardRiskEngine:
             observed=context.reference_price,
         )
 
+    def _verify_risk_records(
+        self, positions: Sequence[Position], position_risk: Mapping[str, PositionRiskState]
+    ) -> None:
+        """Check every risk record still describes the position it claims to protect.
+
+        Two failures that :meth:`evaluate_open_positions` cannot see from a position alone,
+        because both are about records rather than about levels.
+
+        An **orphan** is a record that outlived its position. M5b drops one the moment its
+        position goes flat, so an orphan means that cleanup did not run — and the next entry
+        on the symbol would be reconciled against a stop belonging to a position that no
+        longer exists.
+
+        A **drifted quantity** is a record restated from something other than the position
+        it describes. Too small and a stop-out under-closes, leaving a residue no later exit
+        clears; too large and it asks to sell what the account does not hold. Neither is a
+        protected position, and choosing between the two figures would be inventing which
+        one is true.
+
+        Raises:
+            PositionRiskUnavailableError: On either condition, naming the symbol.
+        """
+        held = {position.symbol: position for position in positions if position.is_open}
+        for symbol, state in position_risk.items():
+            position = held.get(symbol)
+            if position is None:
+                msg = "a recorded risk state has no open position to protect"
+                raise PositionRiskUnavailableError(msg, symbol=symbol)
+            if state.quantity != position.quantity:
+                msg = "a recorded risk state's quantity has drifted from its position"
+                raise PositionRiskUnavailableError(
+                    msg,
+                    symbol=symbol,
+                    recorded_quantity=str(state.quantity),
+                    position_quantity=str(position.quantity),
+                )
+
     # --- Sizing --------------------------------------------------------------------------------
 
     def _size(
@@ -847,7 +910,7 @@ class StandardRiskEngine:
         # risk per unit constant no matter how much worse than reference the fill lands. Sizing
         # still funds against the worst case below; only the level itself is anchored here.
         stop = self._derive_stop(recorder, intent, context.reference_price)
-        if stop is None and self._config.require_stop_on_entry:
+        if stop is None and self._config.stop_required:
             return None
         try:
             requested = self._requested_quantity(intent, valuation, rules, context, stop)
@@ -915,9 +978,9 @@ class StandardRiskEngine:
         if distance_bps is None:
             recorder.record(
                 RiskCheckCode.PROTECTIVE_STOP,
-                passed=not self._config.require_stop_on_entry,
+                passed=not self._config.stop_required,
                 message="no protective stop is configured and this entry requires one"
-                if self._config.require_stop_on_entry
+                if self._config.stop_required
                 else "no protective stop is configured, and none is required",
             )
             return None

@@ -382,6 +382,11 @@ class BacktestEngine:
         judgement of whether a stop was breached belongs to the risk engine, which is the only
         component that knows what each position is protected by.
 
+        Whether protection is *obligatory* is the configuration's own answer, not a separate
+        switch this method could be left holding the wrong way: a run that sizes by risk is a
+        run where every open position must be accounted for. Under V1 nothing derives a stop,
+        so an unprotected position is ordinary and nothing is required of it.
+
         Returns:
             One exit intent per position risk decided must be closed, empty on the ordinary
             bar where nothing breached anything.
@@ -390,6 +395,7 @@ class BacktestEngine:
             positions=self._portfolio.positions(),
             position_risk=state.position_risk,
             bar=bar,
+            require_protection=self._risk.config.risk_v2_active,
         )
         intents: list[OrderIntent] = []
         for action in actions:

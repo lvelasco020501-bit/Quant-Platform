@@ -282,6 +282,11 @@ def test_the_fixed_fraction_sizer_reports_no_risk_amount() -> None:
     assert outcome.risk_amount is None
 
 
+def _v2_config() -> RiskConfiguration:
+    """A V2 configuration: a budget requires a stop distance to construct at all."""
+    return RiskConfiguration(risk_budget=_budget(), initial_stop_distance_bps=Decimal(200))
+
+
 # --- Choosing between them ---------------------------------------------------------------------
 
 
@@ -295,17 +300,13 @@ def test_v1_is_selected_when_a_budget_exists_but_the_intent_carries_no_stop() ->
     # Explicit, not a silent fallback: a risk budget cannot size anything without knowing
     # where the loss stops, and inventing a stop to satisfy the configuration would be the
     # fabricated-data failure this milestone is written against.
-    sizer = select_sizer(
-        RiskConfiguration(risk_budget=_budget()), has_stop=False, entry_fraction=Decimal("0.95")
-    )
+    sizer = select_sizer(_v2_config(), has_stop=False, entry_fraction=Decimal("0.95"))
 
     assert isinstance(sizer, FixedFractionSizer)
 
 
 def test_risk_based_sizing_requires_both_a_budget_and_a_stop() -> None:
-    sizer = select_sizer(
-        RiskConfiguration(risk_budget=_budget()), has_stop=True, entry_fraction=Decimal("0.95")
-    )
+    sizer = select_sizer(_v2_config(), has_stop=True, entry_fraction=Decimal("0.95"))
 
     assert isinstance(sizer, RiskBasedSizer)
 
@@ -316,7 +317,7 @@ def test_the_two_sizers_are_never_both_selected() -> None:
     for has_stop in (True, False):
         for budget in (None, _budget()):
             sizer = select_sizer(
-                RiskConfiguration(risk_budget=budget),
+                _v2_config() if budget is not None else RiskConfiguration(),
                 has_stop=has_stop,
                 entry_fraction=Decimal("0.95"),
             )

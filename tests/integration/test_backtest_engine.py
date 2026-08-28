@@ -31,6 +31,7 @@ from quantplatform.core.errors import (
     ConfigurationError,
     DataIntegrityError,
     PositionRiskAmbiguityError,
+    PositionRiskUnavailableError,
     StrategyContextError,
     StrategyError,
 )
@@ -1017,6 +1018,55 @@ def test_a_v1_run_is_unaffected_by_the_same_crash() -> None:
     engine, _, portfolio = make_backtest(strategy=BuyOnce(_Params()))
 
     state = _drive(engine, _crash_bars())
+
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+    assert state.position_risk == {}
+
+
+# --- M7a: under Risk V2, protection is not optional ---------------------------------------------
+#
+# M6 built the enforcement and left it switched off: `require_protection` was hard-wired to
+# False, so the fail-loudly path existed and nothing reached it. The switch is now the
+# configuration itself — a run with a risk budget is a run where every open position must be
+# accounted for — and V1 is untouched, which is what keeps the week-5 benchmark comparable.
+
+
+def test_a_v2_run_with_every_position_protected_proceeds_normally() -> None:
+    engine, _, portfolio = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _flat_bars(_WARMUP_BARS + 3))
+
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+    assert SYMBOL in state.position_risk
+
+
+def test_a_v2_run_that_loses_a_position_s_protection_stops() -> None:
+    # Staged by removing the record rather than by finding a path that produces the loss,
+    # because no such path is known — which is the point. The engine must detect the state
+    # it cannot explain, not only the states it knows how to reach. A run that continued
+    # here would hold an unprotected position while reporting a protected one.
+    engine, _, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+    state = engine.begin()
+    bars = _flat_bars(_WARMUP_BARS + 4)
+    for bar in bars[:4]:
+        engine.advance(bar, state)
+    assert SYMBOL in state.position_risk
+    del state.position_risk[SYMBOL]
+
+    def _continue() -> None:
+        for bar in bars[4:]:
+            engine.advance(bar, state)
+
+    with pytest.raises(PositionRiskUnavailableError, match="no recorded risk state"):
+        _continue()
+
+
+def test_a_v1_run_holds_an_unprotected_position_without_complaint() -> None:
+    # The golden. Every completed run of this platform held exactly this: an open position,
+    # no derived stop, no risk record, and no reason for any of that to be an error.
+    engine, _, portfolio = make_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _flat_bars(_WARMUP_BARS + 3))
 
     assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
     assert state.position_risk == {}

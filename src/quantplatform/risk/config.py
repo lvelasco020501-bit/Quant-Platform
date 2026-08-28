@@ -188,6 +188,13 @@ class RiskConfiguration(BaseModel):
         if not self.allowed_time_in_force:
             msg = "at least one time in force must be permitted"
             raise ValueError(msg)
+        if self.risk_budget is not None and self.initial_stop_distance_bps is None:
+            msg = (
+                "a risk budget requires initial_stop_distance_bps: without a level to "
+                "measure risk from, the budget sizes nothing and the engine falls back to "
+                "notional sizing — V1 behaviour under a V2 configuration"
+            )
+            raise ValueError(msg)
         if self.max_total_drawdown_pct < self.max_daily_drawdown_pct:
             msg = "max_total_drawdown_pct must not be below max_daily_drawdown_pct"
             raise ValueError(msg)
@@ -204,6 +211,31 @@ class RiskConfiguration(BaseModel):
             )
             raise ValueError(msg)
         return self
+
+    @property
+    def risk_v2_active(self) -> bool:
+        """Return whether this configuration sizes by risk rather than by notional.
+
+        One declared fact rather than an emergent one. Before this, V2 was whatever the two
+        independent fields happened to produce: a budget without a stop distance derived no
+        stop, so risk-based sizing never engaged and the engine quietly ran V1 under a
+        configuration that read as V2. The construction invariant forecloses that shape, and
+        this property is what every consumer asks instead of re-deriving the answer.
+        """
+        return self.risk_budget is not None
+
+    @property
+    def stop_required(self) -> bool:
+        """Return whether an entry must carry a protective stop to be approved.
+
+        V2 implies the requirement without being asked to. :attr:`require_stop_on_entry`
+        defaults to ``False`` and nothing in a V2 configuration sets it, so leaving the two
+        independent would let an account that sizes by risk open a position with nothing
+        protecting it — the one outcome this whole layer exists to make impossible. The
+        explicit flag still stands on its own, so V1 may require a stop without adopting a
+        budget.
+        """
+        return self.require_stop_on_entry or self.risk_v2_active
 
     @property
     def minimum_required_buffer_bps(self) -> Money:

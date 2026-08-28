@@ -14,6 +14,7 @@ risk, and no fill at the stop price — a stop is a trigger, never a guaranteed 
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -44,7 +45,11 @@ _STOP_PRICE = Decimal("49000")
 
 
 def _holding_context(
-    *, approved_orders_last_hour: int = 0, approved_orders_today: int = 0
+    *,
+    approved_orders_last_hour: int = 0,
+    approved_orders_today: int = 0,
+    spread_basis_points: Decimal | None = Decimal(1),
+    as_of: datetime = ANCHOR,
 ) -> RiskContext:
     """A context whose account actually holds the position a forced exit would sell.
 
@@ -61,6 +66,9 @@ def _holding_context(
         ),
         approved_orders_last_hour=approved_orders_last_hour,
         approved_orders_today=approved_orders_today,
+        spread_basis_points=spread_basis_points,
+        as_of=as_of,
+        latest_bar_close_time=ANCHOR,
     )
 
 
@@ -208,5 +216,106 @@ def test_a_venue_rule_still_blocks_a_forced_exit() -> None:
     intent = make_intent(side=OrderSide.SELL, quantity=Decimal("0.0000000001"))
 
     decision = engine.assess(intent, _holding_context(), forced_exit=True).decision
+
+    assert decision.outcome is RiskOutcome.REJECTED
+
+
+# --- M7a: protection that must exist, and refusals that name what is missing --------------------
+
+
+def test_a_risk_record_with_no_open_position_fails_loudly() -> None:
+    # The orphan. M5b drops a record the moment its position goes flat, so one that outlives
+    # its position means that cleanup did not run — and the next entry on the symbol would be
+    # reconciled against a stop belonging to a position that no longer exists. Silence here
+    # would let a stale level protect nothing while claiming to protect something.
+    with pytest.raises(PositionRiskUnavailableError, match="no open position"):
+        _evaluate(positions=(), require_protection=True)
+
+
+def test_the_orphan_refusal_names_the_symbol_it_could_not_account_for() -> None:
+    with pytest.raises(PositionRiskUnavailableError) as caught:
+        _evaluate(positions=(), require_protection=True)
+
+    assert SYMBOL in str(caught.value.details)
+
+
+def test_a_risk_record_whose_quantity_has_drifted_fails_loudly() -> None:
+    # M5b restates the record from the position after every fill, so a divergence means that
+    # restatement failed. The recorded risk would then describe a size the account does not
+    # hold: too small and the stop under-closes, leaving a residue; too large and it asks to
+    # sell what is not there. Neither is a protected position.
+    with pytest.raises(PositionRiskUnavailableError, match="quantity"):
+        _evaluate(
+            positions=(make_position(quantity=Decimal("0.2")),),
+            position_risk={SYMBOL: _risk_state(quantity=Decimal("0.1"))},
+            require_protection=True,
+        )
+
+
+def test_a_drifted_quantity_is_tolerated_when_protection_is_optional() -> None:
+    # V1 never records risk at all, so this path is unreachable there. The gate stays on
+    # `require_protection` regardless, so that a V1 run cannot begin raising on state a
+    # future change happens to leave behind.
+    actions = _evaluate(
+        positions=(make_position(quantity=Decimal("0.2")),),
+        position_risk={SYMBOL: _risk_state(quantity=Decimal("0.1"))},
+        bar=_bar(low=Decimal("49500")),
+    )
+
+    assert actions == ()
+
+
+# --- M7a: a market condition may refuse an entry, never a protective exit -----------------------
+
+
+def test_an_excessive_spread_still_blocks_an_ordinary_entry() -> None:
+    # The control. A wide spread is a real reason not to open a position, and must keep
+    # being one, or the exemption below would be indistinguishable from removing the check.
+    engine = make_risk_engine(max_spread_bps=Decimal(5))
+
+    decision = engine.assess(
+        make_intent(), make_risk_context(spread_basis_points=Decimal(500))
+    ).decision
+
+    assert decision.outcome is RiskOutcome.REJECTED
+
+
+def test_an_excessive_spread_does_not_block_a_protective_exit() -> None:
+    # A wide spread makes the exit expensive; it does not make it impossible. Refusing to
+    # close would keep the account exposed precisely while the market is disorderly, which
+    # inverts what the guard is for in the same way the rate limit did.
+    engine = make_risk_engine(max_spread_bps=Decimal(5))
+    intent = make_intent(side=OrderSide.SELL, quantity=Decimal("0.1"))
+
+    decision = engine.assess(
+        intent, _holding_context(spread_basis_points=Decimal(500)), forced_exit=True
+    ).decision
+
+    assert decision.outcome is not RiskOutcome.REJECTED
+
+
+def test_the_spread_is_recorded_as_advisory_rather_than_hidden_on_a_forced_exit() -> None:
+    engine = make_risk_engine(max_spread_bps=Decimal(5))
+    intent = make_intent(side=OrderSide.SELL, quantity=Decimal("0.1"))
+
+    decision = engine.assess(
+        intent, _holding_context(spread_basis_points=Decimal(500)), forced_exit=True
+    ).decision
+
+    spread = next(c for c in decision.checks if c.code.value == "excessive_spread")
+    assert spread.severity is RiskCheckSeverity.ADVISORY
+    assert spread.passed is False
+
+
+def test_stale_data_still_blocks_a_protective_exit() -> None:
+    # Where the exemption stops, and the reason the authority order is real rather than
+    # decorative. A market condition is a judgement about a price we can see; stale data
+    # means we cannot see one. Exiting on it would act on a level that may not exist, and
+    # data integrity outranks capital protection precisely so that never happens.
+    engine = make_risk_engine()
+    intent = make_intent(side=OrderSide.SELL, quantity=Decimal("0.1"))
+    stale = _holding_context(as_of=ANCHOR + timedelta(hours=1))
+
+    decision = engine.assess(intent, stale, forced_exit=True).decision
 
     assert decision.outcome is RiskOutcome.REJECTED

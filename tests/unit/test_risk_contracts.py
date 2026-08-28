@@ -275,6 +275,7 @@ def test_the_v2_fields_can_be_configured_without_disturbing_v1_limits() -> None:
     baseline = RiskConfiguration()
     configured = RiskConfiguration(
         risk_budget=budget,
+        initial_stop_distance_bps=Decimal(200),
         max_daily_loss_pct=Decimal("0.02"),
         max_consecutive_losses=3,
         require_stop_on_entry=True,

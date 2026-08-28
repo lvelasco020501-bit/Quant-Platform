@@ -17,7 +17,7 @@ checks that would divide by that quantity are recorded as skipped instead of com
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
@@ -60,6 +60,7 @@ from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.sizing import (
     RiskBasedSizer,
     SizingRequest,
+    break_even_price,
     market_buy_price_cap,
     normalize_limit_price,
     normalize_quantity,
@@ -896,6 +897,113 @@ class StandardRiskEngine:
             else "reference price is usable",
             observed=context.reference_price,
         )
+
+    def advance_position_risk(
+        self,
+        *,
+        positions: Sequence[Position],
+        position_risk: Mapping[str, PositionRiskState],
+        bar: MarketBar,
+        triggered: Collection[str] = (),
+    ) -> dict[str, PositionRiskState]:
+        """Return what each open position is protected by *from the next bar onward*.
+
+        Deliberately separate from :meth:`evaluate_open_positions`, which asks whether the
+        level already in force was broken. This asks what the level becomes. Keeping them
+        apart is what stops a trailing stop raised by a bar's own high from judging that same
+        bar: the level computed here was not in the market during the part of the bar which
+        preceded the high that produced it, and applying it retroactively would report a
+        stop-out at a price the account could not have obtained. The orchestrator calls this
+        after it has evaluated triggers, so the new level is unreadable until the next bar.
+
+        A position that already triggered is left exactly as it was. It is on its way out,
+        and moving the level it was closed under would rewrite the record of why it closed.
+
+        The stop only ever moves **up**. A protective level that retreats hands back risk the
+        account had already retired, silently, at the moment the market is moving against the
+        position. The new trigger is the highest of what it already was and whatever the
+        armed rules propose, so monotonicity is a property of the construction rather than a
+        rule that could be forgotten.
+
+        Args:
+            positions: Every position currently held.
+            position_risk: What each protected position is protected by, keyed by symbol.
+            bar: The closed bar to advance through.
+            triggered: Symbols whose stop fired on this bar, which are not advanced.
+
+        Returns:
+            The risk state to record, keyed by symbol. Symbols absent from ``position_risk``
+            stay absent: this moves levels, it never creates protection.
+        """
+        held = {position.symbol for position in positions if position.is_open}
+        advanced: dict[str, PositionRiskState] = {}
+        for symbol, state in position_risk.items():
+            if symbol in triggered or symbol not in held or symbol != bar.symbol:
+                advanced[symbol] = state
+                continue
+            advanced[symbol] = self._advance_one(state, bar)
+        return advanced
+
+    def _advance_one(self, state: PositionRiskState, bar: MarketBar) -> PositionRiskState:
+        """Move one position's anchor and, if anything armed, its protective level."""
+        anchor = max(state.highest_price_seen or state.entry_price, bar.high)
+        stop = self._next_stop(state, anchor)
+        return state.model_copy(update={"highest_price_seen": anchor, "stop": stop})
+
+    def _next_stop(self, state: PositionRiskState, anchor: Decimal) -> StopSpecification:
+        """Return the highest level the armed rules justify, never below the current one."""
+        current = state.stop.trigger_price
+        if current is None:
+            return state.stop
+        best = current
+        kind = state.stop.kind
+        for candidate, candidate_kind in self._stop_candidates(state, anchor):
+            if candidate > best:
+                best = candidate
+                kind = candidate_kind
+        if best == current:
+            return state.stop
+        return StopSpecification(
+            kind=kind,
+            trigger_price=best,
+            activated_at=state.stop.activated_at or state.opened_at,
+        )
+
+    def _stop_candidates(
+        self, state: PositionRiskState, anchor: Decimal
+    ) -> list[tuple[Decimal, StopKind]]:
+        """Return every level the configuration currently proposes, armed ones only."""
+        config = self._config
+        candidates: list[tuple[Decimal, StopKind]] = []
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            if (
+                config.trailing_activation_bps is not None
+                and config.trailing_distance_bps is not None
+                and anchor
+                >= state.entry_price
+                + apply_basis_points(state.entry_price, config.trailing_activation_bps)
+            ):
+                offset = apply_basis_points(anchor, config.trailing_distance_bps)
+                candidates.append((anchor - offset, StopKind.TRAILING))
+            armed_be = config.break_even_activation_bps is not None and (
+                anchor
+                >= state.entry_price
+                + apply_basis_points(state.entry_price, config.break_even_activation_bps)
+            )
+        if armed_be:
+            candidates.append(
+                (
+                    break_even_price(
+                        quantity=state.quantity,
+                        entry_price=state.entry_price,
+                        side=OrderSide.BUY,
+                        policy=config.execution_policy,
+                    ),
+                    StopKind.BREAK_EVEN,
+                )
+            )
+        return candidates
 
     def _verify_risk_records(
         self, positions: Sequence[Position], position_risk: Mapping[str, PositionRiskState]

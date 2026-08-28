@@ -26,6 +26,7 @@ from quantplatform.core.enums import (
     RiskCheckCode,
     RiskCheckStatus,
     SignalAction,
+    StopKind,
     Timeframe,
 )
 from quantplatform.core.errors import (
@@ -1402,3 +1403,175 @@ def test_a_loss_realised_on_a_bar_gates_that_bar_rather_than_the_next() -> None:
 
     assert latched_at is not None
     assert entered_after_latch == 0
+
+
+# --- M8a: the protective level moves, and never in time to judge its own bar --------------------
+#
+# A trailing level computed from a bar's own high was not in the market during the part of that
+# bar which preceded the high. These tests hold the ordering that makes that true: the trigger is
+# evaluated against the level as the bar opened, and whatever the bar produces governs from the
+# next one onward. Structurally it is guaranteed rather than checked — `evaluate_open_positions`
+# reads the state and `_advance_position_risk` writes it, strictly in that order within a bar —
+# but a structure nobody pinned is a structure that gets reordered.
+
+
+def _m8a_backtest(**overrides: object) -> tuple[BacktestEngine, SpotPortfolioEngine]:
+    engine, _, portfolio = make_backtest(
+        strategy=BuyOnce(_Params()),
+        risk_budget=RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        initial_stop_distance_bps=Decimal(200),
+        **overrides,  # type: ignore[arg-type]
+    )
+    return engine, portfolio
+
+
+def test_a_trailing_level_raised_by_a_bar_does_not_fire_on_that_same_bar() -> None:
+    # The bar rallies to 52 000 and closes back at 50 400. A trailing stop 200 bps under the
+    # new high sits at 50 960, above that low — so applying it retroactively would close the
+    # position on the very bar that created the level, at a price the account never had.
+    engine, portfolio = _m8a_backtest(
+        trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    rally = make_bar(
+        index=_WARMUP_BARS + 1,
+        open_price=Decimal(50_000),
+        high=Decimal(52_000),
+        low=Decimal(49_900),
+        close=Decimal(50_400),
+    )
+
+    engine.advance(rally, state)
+
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+    assert state.position_risk[SYMBOL].stop.trigger_price == Decimal(52_000) * Decimal("0.98")
+
+
+def test_the_level_raised_by_one_bar_does_fire_on_the_next() -> None:
+    # The other half. Without it the previous test would also pass for an engine that simply
+    # never enforced a trailing stop at all.
+    engine, portfolio = _m8a_backtest(
+        trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    rally = make_bar(
+        index=_WARMUP_BARS + 1,
+        open_price=Decimal(50_000),
+        high=Decimal(52_000),
+        low=Decimal(49_900),
+        close=Decimal(50_400),
+    )
+    engine.advance(rally, state)
+
+    for index in (_WARMUP_BARS + 2, _WARMUP_BARS + 3):
+        engine.advance(make_bar(index=index, close=Decimal(50_000)), state)
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+
+
+def test_the_anchor_survives_a_fill() -> None:
+    # D1. The risk state is rebuilt from the position after every fill, and the rebuild used
+    # to drop the anchor. Nothing noticed because nothing wrote it; a trailing stop would
+    # have restarted from entry on every fill and trailed only the bars since the last one.
+    engine, _ = _m8a_backtest(
+        trailing_activation_bps=Decimal(100),
+        trailing_distance_bps=Decimal(200),
+        max_open_positions=2,
+        max_open_orders=2,
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(50_400),
+        ),
+        state,
+    )
+    anchored = state.position_risk[SYMBOL].highest_price_seen
+    assert anchored == Decimal(52_000)
+
+    engine.advance(make_bar(index=_WARMUP_BARS + 2, close=Decimal(50_500)), state)
+
+    assert state.position_risk[SYMBOL].highest_price_seen == anchored
+
+
+def test_moving_the_stop_preserves_when_the_position_opened() -> None:
+    engine, _ = _m8a_backtest(
+        trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    opened_at = state.position_risk[SYMBOL].opened_at
+
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(50_400),
+        ),
+        state,
+    )
+
+    assert state.position_risk[SYMBOL].stop.kind is StopKind.TRAILING
+    assert state.position_risk[SYMBOL].opened_at == opened_at
+
+
+def test_a_latched_breaker_does_not_stop_a_trailing_exit() -> None:
+    engine, portfolio = _m8a_backtest(
+        trailing_activation_bps=Decimal(100),
+        trailing_distance_bps=Decimal(200),
+        latch_total_drawdown=True,
+        max_total_drawdown_pct=Decimal("0.001"),
+        max_daily_drawdown_pct=Decimal("0.001"),
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(50_400),
+        ),
+        state,
+    )
+
+    for index in (_WARMUP_BARS + 2, _WARMUP_BARS + 3):
+        engine.advance(make_bar(index=index, close=Decimal(50_000)), state)
+
+    assert state.breakers != []
+    assert [p for p in portfolio.positions() if p.is_open] == []
+
+
+def test_a_v1_run_moves_no_stop_because_it_has_none() -> None:
+    engine, _, portfolio = make_backtest(
+        strategy=BuyOnce(_Params()),
+        trailing_activation_bps=Decimal(100),
+        trailing_distance_bps=Decimal(200),
+    )
+    state = engine.begin()
+
+    for index in range(_WARMUP_BARS + 4):
+        engine.advance(make_bar(index=index, close=Decimal(50_000) + Decimal(100) * index), state)
+
+    assert state.position_risk == {}
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]

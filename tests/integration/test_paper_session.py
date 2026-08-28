@@ -981,3 +981,41 @@ def test_the_refusal_names_the_breaker_that_halted_the_account() -> None:
         session.resume()
 
     assert "consecutive_losses" in str(caught.value.details)
+
+
+def test_a_moved_stop_and_its_anchor_survive_the_snapshot_round_trip() -> None:
+    # The level a position is protected at is now something the run *computed*, not something
+    # it was given, so losing it in the snapshot would lose work rather than a copy of the
+    # configuration. The anchor matters just as much: without it a resumed reader cannot say
+    # why the stop sits where it does.
+    session, clock, repository, _ = _session(
+        strategy=BuyOnce(_Params()),
+        risk_budget=RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        initial_stop_distance_bps=Decimal(200),
+        trailing_activation_bps=Decimal(100),
+        trailing_distance_bps=Decimal(200),
+    )
+    session.start()
+    _feed_bars(session, clock, make_bars([Decimal(50_000)] * (_WARMUP_BARS + 2)))
+    rally = make_bar(
+        index=_WARMUP_BARS + 2,
+        open_price=Decimal(50_000),
+        high=Decimal(52_000),
+        low=Decimal(49_900),
+        close=Decimal(50_400),
+    )
+    _feed_bars(session, clock, (rally,))
+    session.save()
+
+    stored = repository.load("paper-1")
+
+    assert stored is not None
+    (risk,) = stored.position_risk
+    assert risk.stop.kind is StopKind.TRAILING
+    assert risk.stop.trigger_price == Decimal(52_000) * Decimal("0.98")
+    assert risk.highest_price_seen == Decimal(52_000)

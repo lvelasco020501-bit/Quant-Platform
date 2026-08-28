@@ -15,7 +15,7 @@ rounds **up**, because a cap that rounds down under-reserves.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
+from decimal import ROUND_CEILING, Decimal, localcontext
 from typing import TYPE_CHECKING, Protocol
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
@@ -36,6 +36,7 @@ __all__ = [
     "RiskBasedSizer",
     "SizingOutcome",
     "SizingRequest",
+    "break_even_price",
     "market_buy_price_cap",
     "normalize_limit_price",
     "normalize_quantity",
@@ -459,3 +460,72 @@ def projected_stop_out_cost(
         exit_leg = policy.fee.fee_for(exit_price, is_first_fill=True) - at_zero
         per_unit = abs(entry_price - exit_price) + entry_leg + exit_leg
         return quantity * per_unit + at_zero * 2
+
+
+def break_even_price(
+    *,
+    quantity: Decimal,
+    entry_price: Decimal,
+    side: OrderSide,
+    policy: ExecutionPolicy,
+) -> Decimal:
+    """Return the price at which closing this position recovers exactly what it cost.
+
+    Not the entry price. Exiting where the position opened pays the exit's slippage and the
+    exit's commission, so a stop placed at entry and called break-even reports a scratch and
+    books a loss — the kind of name that lies, which is what this function exists to avoid.
+
+    ``entry_price`` is the position's ``avg_entry_price``, which the portfolio engine already
+    computes fee-inclusive: it divides ``executed_notional + fee`` by the filled quantity. The
+    entry's commission is therefore **already** in the figure and must not be added again, or
+    the level comes out one commission too high and no arithmetic anywhere explains why.
+
+    The net proceeds of the exit are affine in the exit price — ``slippage.adjust`` and
+    ``apply_basis_points`` are exact scalings with no rounding or quantisation, and every fee
+    model is either zero, a constant or a rate on notional. Two probes therefore determine the
+    line exactly, and its root is the answer, without branching on which fee model is
+    configured. It is the same technique that decomposes a fee into fixed and per-unit parts
+    elsewhere in this module.
+
+    The root is rounded *up*. A level that nets fractionally below zero is not a break-even
+    level, and of the two directions only one can be described honestly.
+
+    Args:
+        quantity: Open size that would be closed.
+        entry_price: Fee-inclusive average price the position was opened at.
+        side: Direction of the open position; spot is long-only.
+        policy: Fee and slippage assumptions, shared with the executing adapter.
+
+    Returns:
+        The exit price at which the modelled round trip nets zero or fractionally above.
+
+    Raises:
+        RiskSizingError: If the position is not long, or if the policy admits no such price
+            — total slippage or a 100% fee leaves the exit's proceeds independent of, or
+            decreasing in, the price. Returning something anyway would put a stop calling
+            itself break-even at a level that loses the position.
+    """
+    if side is not OrderSide.BUY:
+        msg = "break-even is defined for long positions only on this spot-only platform"
+        raise RiskSizingError(msg, side=side.value)
+
+    def _net(price: Decimal) -> Decimal:
+        exit_price = policy.slippage.adjust(price, OrderSide.SELL)
+        proceeds = quantity * exit_price
+        fee = policy.fee.fee_for(proceeds, is_first_fill=True)
+        return proceeds - fee - quantity * entry_price
+
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        low = entry_price
+        high = entry_price * 2
+        at_low = _net(low)
+        slope = (_net(high) - at_low) / (high - low)
+        if slope <= ZERO:
+            msg = "this execution policy admits no price at which the round trip breaks even"
+            raise RiskSizingError(
+                msg, slope=str(slope), entry_price=str(entry_price), quantity=str(quantity)
+            )
+        ctx.rounding = ROUND_CEILING
+        advance = -at_low / slope
+    return low + advance

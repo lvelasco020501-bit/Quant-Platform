@@ -333,6 +333,12 @@ class BacktestEngine:
         )
         events.extend(forced_events)
 
+        # Strictly after the triggers above have been read, and strictly before anything
+        # else can read the state again. That ordering *is* the guarantee that a level
+        # raised by this bar cannot judge this bar; there is no flag to check, because the
+        # new level is simply not present until the next iteration reaches the line above.
+        self._advance_position_risk(bar, state, triggered={i.symbol for i in forced})
+
         signals = self._generate(bar, history, features, snapshot, state)
         intents = self._build_intents(signals, snapshot)
         decisions, submitted, decision_events = self._authorise(intents, bar, snapshot, state)
@@ -424,6 +430,27 @@ class BacktestEngine:
             if intent is not None:
                 intents.append(intent)
         return tuple(intents)
+
+    def _advance_position_risk(
+        self, bar: MarketBar, state: RunState, *, triggered: set[str]
+    ) -> None:
+        """Move each open position's anchor and protective level on to the next bar.
+
+        Runs every bar, on every open position, whether or not anything filled. The other
+        update path — :meth:`_update_position_risk` — restates a position after its own
+        fills, so it visits only symbols that traded; a position held quietly through a
+        rally would record none of it, and a trailing stop reads exactly that record.
+        """
+        if not state.position_risk:
+            return
+        state.position_risk.update(
+            self._risk.advance_position_risk(
+                positions=self._portfolio.positions(),
+                position_risk=state.position_risk,
+                bar=bar,
+                triggered=triggered,
+            )
+        )
 
     def _forced_exit_intent(
         self, action: RiskAction, snapshot: PortfolioSnapshot, bar: MarketBar
@@ -710,6 +737,11 @@ class BacktestEngine:
                 quantity=position.quantity,
                 risk_amount=risk_amount,
                 entry_price=entry,
+                # Carried, not recomputed. The favourable extreme is a fact about the whole
+                # life of the position, and a rebuild that dropped it would restart a
+                # trailing stop from entry on every fill — trailing only the bars since the
+                # last one, while reporting that it had trailed throughout.
+                highest_price_seen=existing.highest_price_seen if existing is not None else None,
                 opened_at=existing.opened_at if existing is not None else opened_at,
             )
 

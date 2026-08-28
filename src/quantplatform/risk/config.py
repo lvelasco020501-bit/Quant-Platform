@@ -109,6 +109,21 @@ class RiskConfiguration(BaseModel):
     anticipate.
     """
 
+    trailing_activation_bps: NonNegativeMoney | None = Field(default=None, le=_MAX_BASIS_POINTS)
+    """Advance above entry at which a trailing stop arms. ``None`` leaves it dormant."""
+
+    trailing_distance_bps: NonNegativeMoney | None = Field(default=None, le=_MAX_BASIS_POINTS)
+    """Distance below the favourable extreme an armed trailing stop follows at."""
+
+    break_even_activation_bps: NonNegativeMoney | None = Field(default=None, le=_MAX_BASIS_POINTS)
+    """Advance above entry at which the stop moves to the level that recovers its costs.
+
+    Not to the entry price: exiting there pays the exit's slippage and commission and books
+    a loss, so a stop placed at entry and called break-even reports a scratch that did not
+    happen. The level is derived from the execution policy — see
+    :func:`~quantplatform.risk.sizing.break_even_price`.
+    """
+
     latch_total_drawdown: bool = False
     """Whether breaching :attr:`max_total_drawdown_pct` latches instead of merely refusing.
 
@@ -201,6 +216,13 @@ class RiskConfiguration(BaseModel):
             raise ValueError(msg)
         if not self.allowed_time_in_force:
             msg = "at least one time in force must be permitted"
+            raise ValueError(msg)
+        if (self.trailing_activation_bps is None) != (self.trailing_distance_bps is None):
+            msg = (
+                "a trailing stop needs both trailing_activation_bps and "
+                "trailing_distance_bps: an activation with no distance arms a stop with "
+                "nowhere to sit, and a distance with no activation never arms at all"
+            )
             raise ValueError(msg)
         if self.latch_total_drawdown and "max_total_drawdown_pct" not in self.model_fields_set:
             msg = (

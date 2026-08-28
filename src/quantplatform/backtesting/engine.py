@@ -29,7 +29,7 @@ from decimal import Decimal, localcontext
 from itertools import pairwise
 
 from quantplatform.backtesting.config import BacktestConfig
-from quantplatform.backtesting.intents import build_intent
+from quantplatform.backtesting.intents import build_forced_exit_intent, build_intent
 from quantplatform.backtesting.metrics import (
     EquityPoint,
     PerformanceSummary,
@@ -57,7 +57,12 @@ from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
-from quantplatform.core.models.risk import PositionRiskState, RiskContext, RiskDecision
+from quantplatform.core.models.risk import (
+    PositionRiskState,
+    RiskAction,
+    RiskContext,
+    RiskDecision,
+)
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.symbol_rules import as_symbol_rules_store
@@ -296,10 +301,24 @@ class BacktestEngine:
         state.calls["feature_computations"] += 1
 
         snapshot = self._snapshot(bar, state)
+
+        # Protection is decided before opinion is asked for, and authorised before it. An exit
+        # forced by risk must not lose its place in a queue to the very strategy whose position
+        # it is closing — and must not have its budget spent by that strategy's next entry.
+        forced = self._forced_exit_intents(bar, snapshot, state)
+        forced_decisions, forced_submitted, forced_events = self._authorise(
+            forced, bar, snapshot, state, forced_exit=True
+        )
+        events.extend(forced_events)
+
         signals = self._generate(bar, history, features, snapshot, state)
         intents = self._build_intents(signals, snapshot)
         decisions, submitted, decision_events = self._authorise(intents, bar, snapshot, state)
         events.extend(decision_events)
+
+        intents = forced + intents
+        decisions = forced_decisions + decisions
+        submitted = forced_submitted + submitted
 
         state.signals.extend(signals)
         state.intents.extend(intents)
@@ -354,6 +373,44 @@ class BacktestEngine:
         state.calls["strategy_invocations"] += 1
         return tuple(self._strategy.generate(context))
 
+    def _forced_exit_intents(
+        self, bar: MarketBar, snapshot: PortfolioSnapshot, state: RunState
+    ) -> tuple[OrderIntent, ...]:
+        """Ask risk what this bar did to what is already open, and propose the exits it names.
+
+        The engine does not decide anything here: it reads actions and translates them. The
+        judgement of whether a stop was breached belongs to the risk engine, which is the only
+        component that knows what each position is protected by.
+
+        Returns:
+            One exit intent per position risk decided must be closed, empty on the ordinary
+            bar where nothing breached anything.
+        """
+        actions = self._risk.evaluate_open_positions(
+            positions=self._portfolio.positions(),
+            position_risk=state.position_risk,
+            bar=bar,
+        )
+        intents: list[OrderIntent] = []
+        for action in actions:
+            intent = self._forced_exit_intent(action, snapshot, bar)
+            if intent is not None:
+                intents.append(intent)
+        return tuple(intents)
+
+    def _forced_exit_intent(
+        self, action: RiskAction, snapshot: PortfolioSnapshot, bar: MarketBar
+    ) -> OrderIntent | None:
+        """Build the market exit that carries out one risk action."""
+        symbol = action.symbol if action.symbol is not None else bar.symbol
+        return build_forced_exit_intent(
+            action,
+            snapshot=snapshot,
+            bar_close_time=bar.close_time,
+            execution_mode=self._config.execution_mode,
+            market_type=self._symbols[symbol].market_type,
+        )
+
     def _build_intents(
         self, signals: Sequence[Signal], snapshot: PortfolioSnapshot
     ) -> tuple[OrderIntent, ...]:
@@ -377,19 +434,33 @@ class BacktestEngine:
         bar: MarketBar,
         snapshot: PortfolioSnapshot,
         state: RunState,
+        *,
+        forced_exit: bool = False,
     ) -> tuple[tuple[RiskDecision, ...], tuple[ApprovedOrder, ...], tuple[DomainEvent, ...]]:
         """Evaluate every intent and submit whatever the risk engine authorised.
 
         A rejection is an ordinary outcome and never stops the run: refusing one intent says
         nothing about the next. A broker refusal is equally ordinary — the venue declining an
         order is information, not a crash.
+
+        Args:
+            intents: Proposals to evaluate, in the order they were produced.
+            bar: The closed bar the decision is made from.
+            snapshot: Account state the decision is made against.
+            state: Run state, updated with what was submitted.
+            forced_exit: Whether these intents carry out a risk action. Withdraws the veto of
+                the administrative frequency limits only; every rule that decides whether the
+                venue could accept the order still blocks.
+
+        Returns:
+            The decisions taken, the orders the broker accepted, and the events both produced.
         """
         decisions: list[RiskDecision] = []
         submitted: list[ApprovedOrder] = []
         events: list[DomainEvent] = []
         for intent in intents:
             context = self._risk_context(bar, snapshot, state)
-            assessment = self._risk.assess(intent, context)
+            assessment = self._risk.assess(intent, context, forced_exit=forced_exit)
             state.calls["risk_evaluations"] += 1
             decisions.append(assessment.decision)
             events.extend(assessment.events)
@@ -584,8 +655,14 @@ class BacktestEngine:
                 )
             entry = position.avg_entry_price
             opened_at = position.opened_at
-            if entry is None or opened_at is None:  # pragma: no cover - an open position has both
-                continue
+            if entry is None or opened_at is None:
+                msg = "an open position carries neither an entry price nor an opening time"
+                raise DataIntegrityError(
+                    msg,
+                    symbol=symbol,
+                    has_entry_price=entry is not None,
+                    has_opened_at=opened_at is not None,
+                )
             risk_amount = projected_stop_out_cost(
                 quantity=position.quantity,
                 entry_price=entry,

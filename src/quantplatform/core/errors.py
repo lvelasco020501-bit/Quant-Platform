@@ -42,6 +42,7 @@ __all__ = [
     "PaperSessionStateError",
     "PortfolioError",
     "PositionRiskAmbiguityError",
+    "PositionRiskUnavailableError",
     "QuantPlatformError",
     "ReconciliationError",
     "RiskError",
@@ -317,6 +318,22 @@ class UnsupportedRiskInputError(RiskError):
     """Raised when an intent is structurally outside anything the engine can reason about."""
 
     code = "unsupported_risk_input"
+
+
+class PositionRiskUnavailableError(RiskError):
+    """Raised when a position that must be protected cannot say what protects it.
+
+    Reached when an open position has no recorded risk state, or one carrying no absolute
+    level to test a bar against, while the configuration requires every entry to be
+    protected. Both mean the same thing operationally: the account is exposed and nothing
+    can evaluate whether it should still be.
+
+    Continuing would be the specific failure this whole layer was built against — a system
+    reporting protection it is not applying. Silence here is worse than a stopped run,
+    because a stopped run is noticed.
+    """
+
+    code = "position_risk_unavailable"
 
 
 class PositionRiskAmbiguityError(RiskError):

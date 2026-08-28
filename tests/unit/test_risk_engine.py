@@ -1480,3 +1480,22 @@ def test_a_risk_sized_position_never_risks_more_than_the_budget() -> None:
     )
     budget = context.snapshot.equity * config.risk_budget.risk_per_trade_pct
     assert modelled_risk <= budget
+
+
+def test_the_stop_stays_below_the_entry_when_a_market_buy_cap_widens_the_valuation() -> None:
+    # Regression, found by M6 the moment the stop was first enforced. A market buy is *valued*
+    # at the worst price it may pay, which is correct for funding it. Deriving the stop from
+    # that same figure moved the level up with the cap and placed it above the price the
+    # position actually opens at — a long born already stopped out, closed on its first bar.
+    # The stop is anchored to the reference price; only sizing funds against the worst case.
+    engine = make_risk_engine(**_v2(market_buy_buffer_bps=Decimal(500)))
+    context = make_risk_context()
+
+    decision = engine.assess(make_intent(), context).decision
+
+    assert decision.approved_order is not None
+    stop = decision.approved_order.protective_stop
+    assert stop is not None
+    assert stop.trigger_price is not None
+    assert stop.trigger_price < context.reference_price
+    assert stop.trigger_price < decision.approved_order.max_execution_price  # type: ignore[operator]

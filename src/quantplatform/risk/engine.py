@@ -17,6 +17,7 @@ checks that would divide by that quantity are recorded as skipped instead of com
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
@@ -26,6 +27,7 @@ from quantplatform.core.enums import (
     MarketType,
     OrderSide,
     OrderType,
+    RiskActionKind,
     RiskCheckCode,
     RiskCheckSeverity,
     RiskCheckStatus,
@@ -33,13 +35,23 @@ from quantplatform.core.enums import (
     StopKind,
     SystemState,
 )
-from quantplatform.core.errors import RiskInvariantError, RiskSizingError
+from quantplatform.core.errors import (
+    PositionRiskUnavailableError,
+    RiskInvariantError,
+    RiskSizingError,
+)
 from quantplatform.core.events import RiskDecisionMade
 from quantplatform.core.ids import client_order_id_from_key, deterministic_uuid
-from quantplatform.core.models.market import SymbolRules
+from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, OrderIntent
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
-from quantplatform.core.models.risk import RiskCheckResult, RiskContext, RiskDecision
+from quantplatform.core.models.risk import (
+    PositionRiskState,
+    RiskAction,
+    RiskCheckResult,
+    RiskContext,
+    RiskDecision,
+)
 from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.numeric import apply_basis_points
 from quantplatform.risk.config import RiskConfiguration
@@ -243,12 +255,22 @@ class StandardRiskEngine:
 
     # --- Extended API -----------------------------------------------------------------------
 
-    def assess(self, intent: OrderIntent, context: RiskContext) -> RiskEvaluationResult:
+    def assess(
+        self, intent: OrderIntent, context: RiskContext, *, forced_exit: bool = False
+    ) -> RiskEvaluationResult:
         """Evaluate an intent and return the decision together with its events.
 
         Args:
             intent: Proposed order to evaluate.
             context: Observable system, market and portfolio state.
+            forced_exit: Whether this intent is a protective exit the engine itself
+                required, rather than something a strategy proposed. Administrative limits
+                — the order-rate budgets, and a conflict with a strategy's own exit on the
+                same position — are then recorded but stripped of their veto: a limit that
+                exists to stop a strategy over-trading must never be the reason an account
+                stays exposed. Nothing that would make the order *invalid* is relaxed, so
+                risk can overrule its own budgets but can never fabricate an order the
+                venue would refuse.
 
         Returns:
             The decision, the ``RiskDecisionMade`` event it produced, and whether the
@@ -262,7 +284,7 @@ class StandardRiskEngine:
         if replayed is not None:
             return RiskEvaluationResult(decision=replayed, events=(), replayed=True)
 
-        decision = self._decide(intent, context)
+        decision = self._decide(intent, context, forced_exit=forced_exit)
         self._decisions[intent.idempotency_key] = decision
         event = RiskDecisionMade(
             event_id=deterministic_uuid("event", "risk_decision_made", str(decision.decision_id)),
@@ -275,12 +297,86 @@ class StandardRiskEngine:
 
     # --- Decision construction ----------------------------------------------------------------
 
-    def _decide(self, intent: OrderIntent, context: RiskContext) -> RiskDecision:
+    def evaluate_open_positions(
+        self,
+        *,
+        positions: Sequence[Position],
+        position_risk: Mapping[str, PositionRiskState],
+        bar: MarketBar,
+        require_protection: bool = False,
+    ) -> tuple[RiskAction, ...]:
+        """Return what must happen to open exposure, given a bar that has closed.
+
+        The moment the stop stops being metadata. Everything before this recorded where a
+        position stops losing money; nothing looked to see whether it had.
+
+        **No look-ahead.** The bar is closed, so its low is a fact rather than a forecast,
+        and it is the bar the position was already open through. What this returns is an
+        *action*, not an execution: the caller turns it into an ordinary intent, and the
+        ordinary broker fills it on the next bar at that bar's open. A stop is a trigger,
+        never a guaranteed price — filling at the stop level would be a fiction the platform
+        would then compound in every metric derived from it. A gap through the level
+        therefore needs no special case: the fill lands wherever the next open is, which is
+        exactly what a real market stop delivers.
+
+        Args:
+            positions: Every position currently held.
+            position_risk: What each protected position is protected by, keyed by symbol.
+            bar: The closed bar to judge against.
+            require_protection: Whether every open position must have recorded risk. Under
+                V1 nothing derives a stop, so an unprotected position is ordinary and this
+                stays ``False``.
+
+        Returns:
+            One :class:`~quantplatform.core.models.risk.RiskAction` per position whose stop
+            the bar reached; empty when none did.
+
+        Raises:
+            PositionRiskUnavailableError: If a position that must be protected has no
+                recorded risk, or carries a stop with no level to test. Continuing would
+                leave the account exposed while the system reported it covered, and silence
+                is worse than a stopped run because a stopped run is noticed.
+        """
+        actions: list[RiskAction] = []
+        for position in positions:
+            if not position.is_open or position.symbol != bar.symbol:
+                continue
+            state = position_risk.get(position.symbol)
+            if state is None:
+                if require_protection:
+                    msg = "an open position that must be protected has no recorded risk state"
+                    raise PositionRiskUnavailableError(msg, symbol=position.symbol)
+                continue
+            trigger = state.stop.trigger_price
+            if trigger is None:
+                if require_protection:
+                    msg = "an open position's stop carries no trigger price to evaluate"
+                    raise PositionRiskUnavailableError(
+                        msg, symbol=position.symbol, stop_kind=state.stop.kind.value
+                    )
+                continue
+            # A stop at the price is a stop reached: requiring a strict breach would mean
+            # the one bar that traded exactly at the level did not count.
+            if bar.low <= trigger:
+                actions.append(
+                    RiskAction(
+                        kind=RiskActionKind.CLOSE,
+                        symbol=position.symbol,
+                        quantity=position.quantity,
+                        reason=(f"the bar low {bar.low} reached the protective stop {trigger}"),
+                        triggered_by=RiskCheckCode.PROTECTIVE_STOP,
+                    )
+                )
+        return tuple(actions)
+
+    def _decide(
+        self, intent: OrderIntent, context: RiskContext, *, forced_exit: bool = False
+    ) -> RiskDecision:
         """Run every check in order and assemble the resulting decision."""
         recorder = _Recorder(at=context.as_of)
         self._check_operational(recorder, context)
-        self._check_duplication(recorder, intent, context)
-        self._check_frequency(recorder, context)
+        self._check_duplication(recorder, intent, context, forced_exit=forced_exit)
+        self._check_frequency(recorder, context, forced_exit=forced_exit)
         self._check_drawdown(recorder, context)
         self._check_market_conditions(recorder, context)
         self._check_instrument(recorder, intent, context)
@@ -458,9 +554,25 @@ class StandardRiskEngine:
         )
 
     def _check_duplication(
-        self, recorder: _Recorder, intent: OrderIntent, context: RiskContext
+        self,
+        recorder: _Recorder,
+        intent: OrderIntent,
+        context: RiskContext,
+        *,
+        forced_exit: bool = False,
     ) -> None:
-        """Evaluate duplicate intents, pending-order capacity and symbol conflicts."""
+        """Evaluate duplicate intents, pending-order capacity and symbol conflicts.
+
+        On a forced exit the *conflict* check becomes advisory: the order it conflicts with
+        is the strategy's own exit on the same position, and refusing the protective one in
+        favour of a discretionary one inverts the authority this engine is supposed to hold.
+        Duplicate detection and working-order capacity stay blocking — the first prevents
+        acting twice on one decision, and the second is a venue constraint rather than an
+        administrative preference.
+        """
+        conflict_severity = (
+            RiskCheckSeverity.ADVISORY if forced_exit else RiskCheckSeverity.BLOCKING
+        )
         already_known = intent.idempotency_key in context.known_idempotency_keys
         recorder.record(
             RiskCheckCode.DUPLICATE_SIGNAL,
@@ -485,17 +597,26 @@ class StandardRiskEngine:
             message=f"an order is already working on {intent.symbol}"
             if conflicting
             else "no conflicting order on this symbol",
+            severity=conflict_severity,
             metadata={"symbol": intent.symbol},
         )
 
-    def _check_frequency(self, recorder: _Recorder, context: RiskContext) -> None:
+    def _check_frequency(
+        self, recorder: _Recorder, context: RiskContext, *, forced_exit: bool = False
+    ) -> None:
         """Evaluate the hourly and daily order-rate limits.
 
         Both counts come from the context, which the orchestration layer derives from
         decisions that actually authorised an order. A rejected intent therefore never
         consumes budget, and a replayed intent is never counted twice, because a replay does
         not reach this code at all.
+
+        **Advisory on a forced exit.** These budgets exist to stop a strategy over-trading.
+        Allowing one to also stop a stop-out inverts its purpose exactly: the account would
+        remain exposed *because* it had been active. The check still runs and still reports
+        what it found — exempt is not the same as unrecorded — but it cannot veto.
         """
+        severity = RiskCheckSeverity.ADVISORY if forced_exit else RiskCheckSeverity.BLOCKING
         recorder.record(
             RiskCheckCode.MAX_HOURLY_ORDERS,
             passed=context.approved_orders_last_hour < self._config.max_orders_per_hour,
@@ -504,6 +625,7 @@ class StandardRiskEngine:
             else "hourly order budget is available",
             observed=Decimal(context.approved_orders_last_hour),
             limit=Decimal(self._config.max_orders_per_hour),
+            severity=severity,
         )
         recorder.record(
             RiskCheckCode.MAX_DAILY_ORDERS,
@@ -513,6 +635,7 @@ class StandardRiskEngine:
             else "daily order budget is available",
             observed=Decimal(context.approved_orders_today),
             limit=Decimal(self._config.max_orders_per_day),
+            severity=severity,
         )
 
     def _check_drawdown(self, recorder: _Recorder, context: RiskContext) -> None:
@@ -718,7 +841,12 @@ class StandardRiskEngine:
         cap = self._market_buy_cap(recorder, intent, context)
         valuation = self._valuation_price(intent, limit_price, cap, context.reference_price)
 
-        stop = self._derive_stop(recorder, intent, valuation)
+        # The stop is anchored to the reference price, never to the worst-case valuation. A
+        # stop derived from the cap moves with the cap, which places it *above* the price the
+        # position actually opens at — a long born already stopped out — and keeps the modelled
+        # risk per unit constant no matter how much worse than reference the fill lands. Sizing
+        # still funds against the worst case below; only the level itself is anchored here.
+        stop = self._derive_stop(recorder, intent, context.reference_price)
         if stop is None and self._config.require_stop_on_entry:
             return None
         try:

@@ -15,7 +15,7 @@ from typing import ClassVar
 import pytest
 from pydantic import BaseModel
 
-from quantplatform.backtesting.engine import BacktestEngine
+from quantplatform.backtesting.engine import BacktestEngine, RunState
 from quantplatform.core.enums import (
     CommissionModel,
     ExecutionMode,
@@ -931,3 +931,92 @@ def test_a_scale_in_with_a_different_stop_fails_loudly() -> None:
 
     with pytest.raises(PositionRiskAmbiguityError, match="differ"):
         _drive()
+
+
+# --- M6: the stop stops being metadata ----------------------------------------------------------
+#
+# Every milestone so far recorded protection without ever applying it. The engine now reads each
+# closed bar against what its open positions are protected by, and turns a breach into an ordinary
+# exit intent — assessed by the same risk engine, submitted to the same broker, filled on the next
+# bar at that bar's open. Nothing fills at the stop price, because a stop is a trigger and not a
+# guarantee of where the market will be when the order reaches it.
+
+
+_STOP_DISTANCE_BPS = Decimal(200)
+"""2% below entry: the stop a ``_v2_backtest`` derives, so 50,000 is protected at 49,000."""
+
+
+def _crash_bars() -> tuple[MarketBar, ...]:
+    """Warm up, enter, fill, then fall clean through the stop and stay there.
+
+    The last bar exists so the exit the crash authorises has somewhere to settle: the fill
+    lands at *its* open, one bar after the trigger.
+    """
+    return make_bars([Decimal(50_000)] * 4 + [Decimal(48_000)] * 2)
+
+
+def _drive(engine: BacktestEngine, bars: Sequence[MarketBar]) -> RunState:
+    state = engine.begin()
+    for bar in bars:
+        engine.advance(bar, state)
+    return state
+
+
+def test_a_position_that_falls_through_its_stop_is_closed() -> None:
+    engine, _, portfolio = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    _drive(engine, _crash_bars())
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+
+
+def test_the_forced_exit_fills_at_the_next_bar_open_not_at_the_stop() -> None:
+    # The honest half of the model. A gap through the stop costs what the next open costs;
+    # filling at the trigger price would invent liquidity that was never there and would
+    # report a loss smaller than the one the account actually took.
+    engine, _, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _crash_bars())
+
+    exit_fill = next(fill for fill in state.fills if fill.side is OrderSide.SELL)
+    assert exit_fill.price < Decimal(49_000)
+
+
+def test_the_forced_exit_goes_through_the_ordinary_broker() -> None:
+    # There is no second execution path inside risk. The exit is an order like any other,
+    # which is what keeps fees, slippage and rejection modelled once rather than twice.
+    engine, broker, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _crash_bars())
+
+    assert any(order.side is OrderSide.SELL for order in state.approved)
+    assert broker.open_orders() == ()
+
+
+def test_the_closed_position_stops_claiming_protection() -> None:
+    engine, _, _ = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _crash_bars())
+
+    assert SYMBOL not in state.position_risk
+
+
+def test_a_position_that_holds_above_its_stop_is_left_alone() -> None:
+    # The control. Without it every one of these tests would also pass for an engine that
+    # closed positions indiscriminately.
+    engine, _, portfolio = _v2_backtest(strategy=BuyOnce(_Params()))
+
+    _drive(engine, make_bars([Decimal(50_000)] * 4 + [Decimal(49_500)] * 2))
+
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+
+
+def test_a_v1_run_is_unaffected_by_the_same_crash() -> None:
+    # No stop was ever derived, so there is nothing to breach. This is the behaviour every
+    # completed run of this platform has had, and the crash must not change it.
+    engine, _, portfolio = make_backtest(strategy=BuyOnce(_Params()))
+
+    state = _drive(engine, _crash_bars())
+
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+    assert state.position_risk == {}

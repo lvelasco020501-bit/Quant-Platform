@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from quantplatform.core.constants import ZERO
 from quantplatform.core.enums import OrderType, TimeInForce
 from quantplatform.core.models.execution_policy import MAX_BASIS_POINTS, ExecutionPolicy
+from quantplatform.core.models.risk import RiskBudget
 from quantplatform.core.numeric import Money, NonNegativeMoney, Rate
 
 __all__ = ["RiskConfiguration"]
@@ -76,6 +77,46 @@ class RiskConfiguration(BaseModel):
 
     max_daily_drawdown_pct: Rate = Decimal("0.05")
     max_total_drawdown_pct: Rate = Decimal("0.20")
+
+    # --- Risk V2 (declared, not yet enforced) --------------------------------------------------
+    #
+    # Every field below defaults to "not configured" rather than to a permissive-looking
+    # value, and **nothing reads any of them yet**. Both facts are the milestone's safety
+    # argument: an unconfigured engine is bit-for-bit the V1 engine, and a configured one
+    # still is, until the enforcement milestones land. A limit that silently defaulted to
+    # something safe-looking would be worse than no limit at all — it would read as
+    # protection that was never actually applied, which is this module's opening premise.
+
+    risk_budget: RiskBudget | None = None
+    """How much a single position may lose, and how large it may become.
+
+    ``None`` keeps V1 sizing: a fixed fraction of equity, blind to where any stop sits.
+    That is the behaviour that let one entry commit ~95% of the account in week 5.
+    """
+
+    max_daily_loss_pct: Rate | None = Field(default=None, gt=0, le=1)
+    """Realised loss within one reporting day that halts new entries.
+
+    Distinct from :attr:`max_daily_drawdown_pct`, which measures a peak-to-trough decline in
+    equity including open positions. This one counts money actually lost and booked.
+    """
+
+    max_consecutive_losses: int | None = Field(default=None, ge=1)
+    """Losing trades in a row that halt new entries.
+
+    A streak and a loss rate are different failures: five losses across a month is a
+    strategy performing within expectation, and five in a row is a regime it did not
+    anticipate.
+    """
+
+    require_stop_on_entry: bool = False
+    """Whether an intent that carries no :class:`~quantplatform.core.models.risk.StopSpecification`
+    is refused.
+
+    The single flag that turns "no naked entries" from an intention into an enforceable
+    rule. ``False`` preserves V1, where no intent carried a stop because the concept did
+    not exist.
+    """
 
     # --- Market-condition guards --------------------------------------------------------------
 

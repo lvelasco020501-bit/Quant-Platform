@@ -538,10 +538,50 @@ class CircuitBreakerReason(StrEnum):
     UNEXPLAINED_BALANCE_DIFFERENCE = "unexplained_balance_difference"
     EXCESSIVE_DRAWDOWN = "excessive_drawdown"
     EXCESSIVE_SLIPPAGE = "excessive_slippage"
+    DAILY_LOSS_LIMIT = "daily_loss_limit"
+    CONSECUTIVE_LOSSES = "consecutive_losses"
+    POSITION_EXPOSURE_LIMIT = "position_exposure_limit"
     CLOCK_DESYNCHRONIZATION = "clock_desynchronization"
     REPEATED_PROCESS_CRASHES = "repeated_process_crashes"
     DATABASE_FAILURE = "database_failure"
     INVALID_CONFIGURATION = "invalid_configuration"
+
+
+class StopKind(StrEnum):
+    """How a position's protective exit is expressed.
+
+    A stop belongs to the *intent* rather than to the strategy's private state, so that the
+    risk engine can size a position against it and an execution layer can honour it even if
+    the strategy never speaks again. That separation is the whole reason this enum exists:
+    week 5 held a position for four days with no protection of any kind, because the only
+    exit that existed lived inside the strategy's own crossover logic.
+    """
+
+    HARD = "hard"
+    """A fixed level. Once breached the position is closed, without consulting anything."""
+
+    TRAILING = "trailing"
+    """A level that follows the favourable extreme, never retreating."""
+
+    BREAK_EVEN = "break_even"
+    """A level moved to entry once a configured advance is reached."""
+
+    TIME = "time"
+    """A maximum holding duration, independent of price."""
+
+
+class RiskActionKind(StrEnum):
+    """What the risk engine has decided must happen to existing exposure.
+
+    Deliberately small. Risk may reduce, close or stop opening — it may never *open*, size
+    up, or choose an instrument. Those are the strategy's decisions, and a risk engine able
+    to make them would be a second strategy nobody audited.
+    """
+
+    NONE = "none"
+    REDUCE = "reduce"
+    CLOSE = "close"
+    HALT_NEW_ENTRIES = "halt_new_entries"
 
 
 class DataQualityIssue(StrEnum):

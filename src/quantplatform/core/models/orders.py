@@ -26,6 +26,7 @@ from quantplatform.core.models.base import (
     UtcDatetime,
     VenueId,
 )
+from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.numeric import Fee, Money, NonNegativeQuantity, Price, Quantity
 
 __all__ = ["ApprovedOrder", "Fill", "Order", "OrderIntent"]
@@ -82,6 +83,24 @@ class OrderIntent(DomainModel):
     requested_notional: Money | None = Field(default=None, gt=0)
     limit_price: Price | None = None
     stop_price: Price | None = None
+    """Trigger price of a ``STOP``/``STOP_LIMIT`` order — a property of the *order type*.
+
+    Not to be confused with :attr:`protective_stop`, which is a property of the *position*.
+    """
+
+    protective_stop: StopSpecification | None = None
+    """Where this position stops losing money, if the proposal came with a stop.
+
+    Distinct from :attr:`stop_price` in both meaning and consumer. ``stop_price`` says
+    "this is a stop order, trigger it here"; this says "whatever fills, protect it at this
+    level", and is what lets the risk engine size against a known loss and an execution
+    layer enforce an exit the strategy never has to speak again to produce.
+
+    ``None`` on every intent the platform has built so far, because the concept did not
+    exist. Nothing populates it yet — sizing and enforcement are later milestones — so an
+    intent carrying one behaves today exactly like an intent that does not.
+    """
+
     time_in_force: TimeInForce
     execution_mode: ExecutionMode
     idempotency_key: str = Field(min_length=8, max_length=128)

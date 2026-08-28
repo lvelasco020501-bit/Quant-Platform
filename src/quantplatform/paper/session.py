@@ -297,6 +297,11 @@ class PaperTradingSession:
         * **realised PnL** and **fees** — cumulative figures the engine restarts at zero. A
           resumed session would report a profitable week as flat, and every downstream
           number computed from them would be wrong in the same direction.
+        * **recorded position risk** — a position that was opened under a stop. Today this
+          is implied by the open position it describes, but the guard checks it directly
+          rather than relying on that implication: an orphaned risk record is precisely the
+          kind of state a later change could leave behind, and inferring safety from a
+          relationship that happens to hold is how a guard quietly stops guarding.
 
         The refusal names every condition it found rather than the first, because an
         operator deciding what to do next needs the whole picture, and it happens before any
@@ -321,6 +326,8 @@ class PaperTradingSession:
             blocking.append("realised pnl")
         if stored.total_fees != ZERO:
             blocking.append("fees paid")
+        if stored.position_risk:
+            blocking.append("recorded position risk")
         if not blocking:
             return
         raise PaperSessionStateError(
@@ -332,6 +339,7 @@ class PaperTradingSession:
             reserved_balances=reserved,
             realized_pnl=str(stored.realized_pnl),
             total_fees=str(stored.total_fees),
+            risk_managed_symbols=[risk.symbol for risk in stored.position_risk],
         )
 
     # --- Bar processing ---------------------------------------------------------------------

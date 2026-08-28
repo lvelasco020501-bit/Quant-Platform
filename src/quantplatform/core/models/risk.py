@@ -22,7 +22,6 @@ from quantplatform.core.enums import (
     RiskCheckSeverity,
     RiskCheckStatus,
     RiskOutcome,
-    StopKind,
 )
 from quantplatform.core.models.base import (
     DomainModel,
@@ -35,6 +34,7 @@ from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder
 from quantplatform.core.models.portfolio import PortfolioSnapshot
+from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.numeric import Money, NonNegativeMoney, Price, Quantity, Rate
 
 __all__ = [
@@ -302,51 +302,6 @@ class RiskDecision(DomainModel):
 # stop, no risk budget, and no mechanism by which the risk engine could close what the
 # strategy had opened. The engine's drawdown limits were configured and working; they simply
 # only gate the *next* intent, and can say nothing about the position already losing money.
-
-
-class StopSpecification(DomainModel):
-    """Where a position stops losing money, in a form the strategy does not own.
-
-    Exactly one way of naming the level is permitted per specification. Carrying both an
-    absolute price and a relative distance would give the enforcement layer two sources of
-    truth for one trigger, and whichever it chose the other would be a silent lie about
-    where the stop actually sits.
-    """
-
-    kind: StopKind
-
-    trigger_price: Price | None = None
-    """Absolute level, when it is known at intent time."""
-
-    distance_bps: NonNegativeMoney | None = None
-    """Distance from entry in basis points, for a stop whose level follows the fill."""
-
-    max_holding_seconds: int | None = Field(default=None, gt=0)
-    """Maximum time in position, for :attr:`StopKind.TIME`."""
-
-    activated_at: UtcDatetime | None = None
-    """When a trailing or break-even stop armed; ``None`` while it is still dormant."""
-
-    @model_validator(mode="after")
-    def _validate(self) -> Self:
-        """Check the stop can actually be evaluated.
-
-        Raises:
-            ValueError: If the specification names no level, names two, or omits the
-                duration a time stop is defined by.
-        """
-        if self.kind is StopKind.TIME:
-            if self.max_holding_seconds is None:
-                msg = "a time stop requires max_holding_seconds"
-                raise ValueError(msg)
-            return self
-        if self.trigger_price is not None and self.distance_bps is not None:
-            msg = "a stop names either a trigger_price or a distance_bps, not both"
-            raise ValueError(msg)
-        if self.trigger_price is None and self.distance_bps is None:
-            msg = "a stop requires either a trigger_price or a distance_bps"
-            raise ValueError(msg)
-        return self
 
 
 class RiskBudget(DomainModel):

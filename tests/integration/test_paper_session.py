@@ -7,6 +7,7 @@ real feed from a replayed one; if it could, the mode would prove nothing about l
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -15,15 +16,19 @@ from pathlib import Path
 import pytest
 
 from quantplatform.core.clock import SimulatedClock
+from quantplatform.core.enums import StopKind
 from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
 from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import Balance
+from quantplatform.core.models.risk import PositionRiskState, StopSpecification
 from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 from quantplatform.paper import (
     InMemoryPaperStateRepository,
     PaperTradingRunner,
     PaperTradingSession,
 )
+from quantplatform.storage.paper_state import _COMPUTED_FIELD_EXCLUSIONS
 from tests.factories import ANCHOR, SYMBOL, make_backtest, make_bar, make_bars
 from tests.integration.test_backtest_engine import (
     _WARMUP_BARS,
@@ -756,3 +761,126 @@ def test_a_refusal_leaves_the_stored_state_untouched() -> None:
         second.resume()
 
     assert repository.load("paper-1") == before
+
+
+# --- M3: stop/risk state persistence ------------------------------------------------------------
+#
+# The state file gains somewhere to record what a position was protected by. Nothing writes
+# it yet — sizing lands in M4, enforcement in M5 — so these tests hold two properties: a V1
+# session is byte-identical to what it was, and a risk state that *does* exist survives the
+# round trip and keeps resume closed.
+
+
+def _risk_state(symbol: str = SYMBOL, **overrides: object) -> PositionRiskState:
+    defaults: dict[str, object] = {
+        "symbol": symbol,
+        "stop": StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+        "risk_amount": Decimal("100"),
+        "entry_price": Decimal("72000"),
+        "opened_at": ANCHOR,
+    }
+    return PositionRiskState(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def test_a_v1_session_persists_an_empty_risk_state() -> None:
+    # No strategy sets a stop, so nothing populates this. An empty tuple rather than a
+    # record full of Nones: a PositionRiskState that cannot say what was risked would be
+    # the "protection that was never applied" failure this whole layer exists to prevent.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    session.start()
+    _feed_bars(session, clock, _flat_bars(3))
+
+    stored = repository.load("paper-1")
+
+    assert stored is not None
+    assert stored.position_risk == ()
+
+
+def test_a_v1_snapshot_serialises_exactly_as_it_did_before() -> None:
+    # The equivalence guarantee at the wire level. A new field that defaults to empty must
+    # not change what an existing session writes to disk, and must survive the exact
+    # serialisation path production uses — computed-field exclusions included, since a raw
+    # round trip has never worked and asserting on one would test a path nobody runs.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    session.start()
+    _feed_bars(session, clock, _flat_bars(2))
+    stored = repository.load("paper-1")
+    assert stored is not None
+
+    payload = stored.model_dump_json(exclude=_COMPUTED_FIELD_EXCLUSIONS)
+
+    assert json.loads(payload)["position_risk"] == []
+    assert PaperSessionState.model_validate_json(payload) == stored
+
+
+def test_a_persisted_risk_state_round_trips_through_json() -> None:
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    session, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    session.start()
+    _feed_bars(session, clock, _flat_bars(2))
+    stored = repository.load("paper-1")
+    assert stored is not None
+    with_risk = stored.model_copy(update={"position_risk": (_risk_state(),)})
+
+    restored = PaperSessionState.model_validate_json(
+        with_risk.model_dump_json(exclude=_COMPUTED_FIELD_EXCLUSIONS)
+    )
+
+    assert restored.position_risk == (_risk_state(),)
+    assert restored.position_risk[0].risk_amount == Decimal("100")
+    assert restored.position_risk[0].stop.trigger_price == Decimal("70000")
+
+
+def test_resume_is_refused_while_a_position_carries_recorded_risk() -> None:
+    # An orphan by construction: risk state without the position it describes. The guard
+    # must not rely on `positions` being non-empty to catch this — that implication holds
+    # today and a later change could break it silently.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, position_risk=(_risk_state(),))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+
+    with pytest.raises(PaperSessionStateError, match="recorded position risk"):
+        second.resume()
+
+
+def test_a_refusal_over_risk_state_names_the_symbol_it_found() -> None:
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(repository, position_risk=(_risk_state(),))
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    with pytest.raises(PaperSessionStateError) as caught:
+        second.resume()
+
+    assert SYMBOL in str(caught.value.details)
+
+
+def test_an_empty_risk_state_does_not_by_itself_block_resume() -> None:
+    # The V1 path must stay open: an untouched session resumes exactly as it did before M3.
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+
+    second, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    status = second.resume()
+
+    assert status.running is True
+    assert second.runtime_metrics().bars_processed == 3

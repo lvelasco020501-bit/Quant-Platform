@@ -22,6 +22,7 @@ from quantplatform.core.enums import ExecutionMode
 from quantplatform.core.models.base import AssetCode, DomainModel, Text, UtcDatetime
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.portfolio import Balance, Position
+from quantplatform.core.models.risk import PositionRiskState
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.core.numeric import Fee, Money
 
@@ -44,6 +45,20 @@ class PaperSessionState(DomainModel):
 
     balances: tuple[Balance, ...] = ()
     positions: tuple[Position, ...] = ()
+
+    position_risk: tuple[PositionRiskState, ...] = ()
+    """What each open position was protected by, and what it actually risked.
+
+    Keyed by symbol, matching :attr:`positions` — spot holds one position per symbol, so
+    the symbol is the association and no second identifier needs inventing.
+
+    Empty for every session the platform has run, and deliberately empty rather than a
+    record full of nulls: a
+    :class:`~quantplatform.core.models.risk.PositionRiskState` requires a strictly positive
+    ``risk_amount`` precisely so that it cannot claim protection it does not describe. A
+    position with no quantified risk therefore has no entry here at all, which is a true
+    statement, where an entry reporting ``None`` would be a misleading one.
+    """
 
     last_bar: MarketBar | None = None
     """The most recent bar the session finished processing.

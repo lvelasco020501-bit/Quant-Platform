@@ -14,11 +14,22 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from quantplatform.core.enums import CircuitBreakerReason, RiskActionKind, StopKind
+from quantplatform.core.enums import (
+    CircuitBreakerReason,
+    ExecutionMode,
+    MarketType,
+    OrderSide,
+    OrderType,
+    RiskActionKind,
+    StopKind,
+    TimeInForce,
+)
+from quantplatform.core.models.orders import OrderIntent
 from quantplatform.core.models.risk import (
     CircuitBreakerState,
     PositionRiskState,
@@ -28,6 +39,28 @@ from quantplatform.core.models.risk import (
 )
 from quantplatform.risk.config import RiskConfiguration
 from tests.factories import ANCHOR, SYMBOL
+
+
+def _intent(**overrides: object) -> OrderIntent:
+    """Build a minimal valid intent, so a test can vary exactly one thing."""
+    defaults: dict[str, object] = {
+        "intent_id": uuid4(),
+        "signal_id": uuid4(),
+        "strategy_id": "ema_trend",
+        "strategy_version": "1.0.0",
+        "symbol": SYMBOL,
+        "market_type": MarketType.SPOT,
+        "side": OrderSide.BUY,
+        "order_type": OrderType.MARKET,
+        "requested_notional": Decimal(1000),
+        "time_in_force": TimeInForce.GTC,
+        "execution_mode": ExecutionMode.PAPER,
+        "idempotency_key": "test-key-0001",
+        "reason": "test",
+        "created_at": ANCHOR,
+    }
+    return OrderIntent(**{**defaults, **overrides})  # type: ignore[arg-type]
+
 
 # --- StopSpecification ------------------------------------------------------------------------
 
@@ -250,3 +283,65 @@ def test_the_v2_fields_can_be_configured_without_disturbing_v1_limits() -> None:
     assert configured.max_orders_per_day == baseline.max_orders_per_day
     assert configured.max_portfolio_exposure_pct == baseline.max_portfolio_exposure_pct
     assert configured.max_total_drawdown_pct == baseline.max_total_drawdown_pct
+
+
+# --- M3: stop state persistence ---------------------------------------------------------------
+#
+# The stop now has somewhere to live: on the intent that proposed it, and on the state that
+# outlives the process. Nothing writes either field yet — sizing lands in M4 and enforcement
+# in M5 — so every assertion below is about *shape surviving a round trip*, not about
+# behaviour. That is the whole milestone: give the data a home before anything depends on it.
+
+
+def test_an_intent_without_a_protective_stop_is_still_valid() -> None:
+    # Every intent the platform has ever built carries no stop, because the concept did not
+    # exist. All of them must keep working unchanged.
+    intent = _intent()
+
+    assert intent.protective_stop is None
+
+
+def test_an_intent_can_carry_a_protective_stop() -> None:
+    stop = StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000"))
+
+    intent = _intent(protective_stop=stop)
+
+    assert intent.protective_stop == stop
+
+
+def test_a_protective_stop_is_not_the_order_type_stop_price() -> None:
+    # The two fields answer different questions and must not be conflated: stop_price says
+    # "this is a stop order, trigger it here"; protective_stop says "this position is
+    # protected at this level, by something other than the strategy".
+    intent = _intent(
+        protective_stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000"))
+    )
+
+    assert intent.stop_price is None
+    assert intent.protective_stop is not None
+
+
+def test_an_intent_round_trips_its_stop_through_json() -> None:
+    stop = StopSpecification(kind=StopKind.TRAILING, distance_bps=Decimal(250))
+    intent = _intent(protective_stop=stop)
+
+    restored = OrderIntent.model_validate_json(intent.model_dump_json())
+
+    assert restored.protective_stop == stop
+    assert restored == intent
+
+
+def test_position_risk_state_round_trips_through_json() -> None:
+    state = PositionRiskState(
+        symbol=SYMBOL,
+        stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
+        risk_amount=Decimal("100.25"),
+        entry_price=Decimal("72000"),
+        highest_price_seen=Decimal("73500"),
+        opened_at=ANCHOR,
+    )
+
+    restored = PositionRiskState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert restored.risk_amount == Decimal("100.25")

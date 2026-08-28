@@ -317,6 +317,19 @@ class UnsupportedRiskInputError(RiskError):
     code = "unsupported_risk_input"
 
 
+class RiskSizingError(RiskError):
+    """Raised when a position cannot be sized because its inputs are incoherent.
+
+    Deliberately distinct from returning a zero quantity. A stop sitting at the entry price,
+    or above it on a long, is not a market condition in which nothing happens to fit — it is
+    a statement that cannot be true, and it reaches the sizer only through a configuration or
+    a programming mistake. Zero is reserved for the ordinary case where every input is
+    sensible and the answer is simply that no tradeable size remains.
+    """
+
+    code = "risk_sizing_error"
+
+
 class SystemHaltedError(RiskError):
     """Raised when an operation is attempted while the system is halted."""
 

@@ -14,19 +14,36 @@ rounds **up**, because a cap that rounds down under-reserves.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, localcontext
+from typing import TYPE_CHECKING, Protocol
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
 from quantplatform.core.enums import OrderSide
+from quantplatform.core.errors import RiskSizingError
+from quantplatform.core.models.execution_policy import ExecutionPolicy
 from quantplatform.core.models.market import SymbolRules
+from quantplatform.core.models.risk import RiskBudget
+from quantplatform.core.models.stops import StopSpecification
 from quantplatform.core.numeric import apply_basis_points, ceil_to_step, quantize_to_step
 
+if TYPE_CHECKING:
+    from quantplatform.risk.config import RiskConfiguration
+
 __all__ = [
+    "FixedFractionSizer",
+    "PositionSizer",
+    "RiskBasedSizer",
+    "SizingOutcome",
+    "SizingRequest",
     "market_buy_price_cap",
     "normalize_limit_price",
     "normalize_quantity",
     "quantity_for_notional",
+    "select_sizer",
 ]
+
+_BASIS_POINT_DIVISOR = Decimal(10_000)
 
 
 def normalize_quantity(quantity: Decimal, rules: SymbolRules) -> Decimal:
@@ -111,3 +128,312 @@ def market_buy_price_cap(
     """
     buffered = reference_price + apply_basis_points(reference_price, buffer_basis_points)
     return ceil_to_step(buffered, rules.price_tick)
+
+
+# --- Position sizing (M4) ---------------------------------------------------------------------
+#
+# Two ways of answering "how large?", and the platform has only ever had the first.
+#
+# A fixed fraction asks how much of the account to *spend*. It is what week 5 ran on, and it
+# committed roughly 95% of the account to a single entry — not through a fault, but because
+# that is precisely what `entry_fraction = 0.95` instructs. The question it cannot express is
+# the one that governs survival: given where this position stops losing money, how large may
+# it be before a stop-out costs more than the account can afford?
+#
+# Nothing here is wired into StandardRiskEngine. The engine still sizes exactly as it did,
+# so V1 equivalence is structural rather than asserted, and connecting a sizer belongs with
+# the milestone that can prove a stop is actually enforced.
+
+
+@dataclass(frozen=True, slots=True)
+class SizingRequest:
+    """Everything a sizer may consider. Nothing else is reachable from one."""
+
+    equity: Decimal
+    available_quote: Decimal
+    entry_price: Decimal
+    side: OrderSide
+    rules: SymbolRules
+    stop: StopSpecification | None = None
+    budget: RiskBudget | None = None
+    policy: ExecutionPolicy | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SizingOutcome:
+    """What a sizer decided, and what bound it.
+
+    ``quantity`` of zero is an ordinary answer meaning no tradeable size remains, not a
+    failure — a genuinely incoherent input raises
+    :class:`~quantplatform.core.errors.RiskSizingError` instead.
+    """
+
+    quantity: Decimal = ZERO
+    notional: Decimal | None = None
+    """Set by a sizer that expresses size as a spend rather than a quantity."""
+
+    risk_amount: Decimal | None = None
+    """What a stop-out would actually cost, computed from the *final* size.
+
+    ``None`` when the sizer cannot know — a fixed fraction of equity says nothing about what
+    being wrong costs, which is the whole reason the risk-based sizer exists. Never the
+    configured budget: if a cap shrank the position, less is genuinely at risk, and
+    reporting the budget would overstate exposure and corrupt every R-multiple built on it.
+    """
+
+    capped_by: str | None = None
+    reason: str = ""
+
+
+class PositionSizer(Protocol):
+    """Decides how large a position may be. Decides nothing else.
+
+    A sizer never chooses direction, never chooses an instrument, and never decides when to
+    exit. It answers one question, from the arguments it is handed and nothing more.
+    """
+
+    def size(self, request: SizingRequest) -> SizingOutcome:
+        """Return the largest size this sizer's rule permits."""
+        ...
+
+
+class FixedFractionSizer:
+    """Spends a fixed share of equity, regardless of where the loss stops.
+
+    V1, preserved exactly. It reports no ``risk_amount`` because it genuinely cannot compute
+    one: nothing in its inputs says what being stopped out would cost.
+    """
+
+    def __init__(self, *, entry_fraction: Decimal) -> None:
+        """Configure the share of equity each entry spends."""
+        self._entry_fraction = entry_fraction
+
+    def size(self, request: SizingRequest) -> SizingOutcome:
+        """Return the notional a fixed fraction of equity funds."""
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            notional = request.equity * self._entry_fraction
+        if notional <= ZERO:
+            return SizingOutcome(reason="no equity to size against")
+        return SizingOutcome(
+            quantity=quantity_for_notional(notional, request.entry_price, request.rules),
+            notional=notional,
+            reason="fixed fraction of equity",
+        )
+
+
+class RiskBasedSizer:
+    """Sizes a position so that being stopped out costs a known, budgeted amount.
+
+    **The cost of being wrong is the whole calculation.** A stop-out does not cost
+    ``quantity * stop_distance``; it costs that plus the commission to enter, the commission
+    to exit, and whatever slippage the exit suffers. Week 5's fees were 26% of its realised
+    loss, so a budget computed on the price move alone would have been overshot by roughly a
+    quarter — silently, which is exactly the "protection that was never applied" failure the
+    risk contracts exist to make impossible.
+
+    Costs are read from the shared
+    :class:`~quantplatform.core.models.execution_policy.ExecutionPolicy` — the same object
+    the broker executes under, so the two cannot hold different numbers. The commission is
+    decomposed into a fixed part and a per-unit part by probing the policy at zero notional
+    rather than by branching on which model is configured: a flat fee is charged once per
+    leg and must be subtracted from the budget, while a rate scales with size and belongs in
+    the per-unit loss. Treating one as the other is wrong in the dangerous direction for
+    small positions.
+    """
+
+    def size(self, request: SizingRequest) -> SizingOutcome:
+        """Return the largest size whose stop-out stays inside the risk budget.
+
+        Raises:
+            RiskSizingError: If the stop cannot be reasoned about — absent, without an
+                absolute level, at or beyond the entry, or outside the budget's admissible
+                distance window. Each is a statement that cannot be true rather than a
+                market condition, so it surfaces rather than silently sizing to zero.
+        """
+        budget = self._require(request.budget, "a risk budget")
+        stop = self._require(request.stop, "a stop")
+        trigger = self._trigger_price(stop)
+        self._check_direction(request, trigger)
+
+        distance = abs(request.entry_price - trigger)
+        self._check_distance_window(distance, request.entry_price, budget)
+
+        policy = request.policy if request.policy is not None else ExecutionPolicy()
+        exit_price = policy.slippage.adjust(trigger, self._exit_side(request.side))
+        fixed_cost, unit_cost = self._decompose_costs(policy, request.entry_price, exit_price)
+
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            capital_at_risk = request.equity * budget.risk_per_trade_pct
+            spendable = capital_at_risk - fixed_cost
+            if spendable <= ZERO:
+                return SizingOutcome(reason="fixed execution cost exceeds the whole risk budget")
+            loss_per_unit = abs(request.entry_price - exit_price) + unit_cost
+            if loss_per_unit <= ZERO:  # pragma: no cover - guarded by the distance checks
+                raise RiskSizingError("the projected loss per unit is zero")
+            raw = spendable / loss_per_unit
+
+            capped, capped_by = self._apply_caps(raw, request, budget)
+
+        quantity = normalize_quantity(capped, request.rules)
+        if quantity <= ZERO or quantity * request.entry_price < request.rules.min_notional:
+            return SizingOutcome(
+                capped_by=capped_by,
+                reason="no venue-valid size remains within the risk budget",
+            )
+
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            risk_amount = quantity * loss_per_unit + fixed_cost
+        return SizingOutcome(
+            quantity=quantity,
+            risk_amount=risk_amount,
+            capped_by=capped_by,
+            reason="sized from the capital the stop puts at risk",
+        )
+
+    @staticmethod
+    def _require[T](value: T | None, what: str) -> T:
+        """Return a required input or refuse, naming what was missing.
+
+        Raises:
+            RiskSizingError: If the value is absent.
+        """
+        if value is None:
+            msg = f"risk-based sizing requires {what}"
+            raise RiskSizingError(msg)
+        return value
+
+    @staticmethod
+    def _trigger_price(stop: StopSpecification) -> Decimal:
+        """Return the stop's absolute level.
+
+        Raises:
+            RiskSizingError: If the stop is expressed as a distance. A relative level is
+                meaningful only once a fill price exists to measure from; guessing one would
+                size against a number nobody set.
+        """
+        if stop.trigger_price is None:
+            msg = (
+                f"a {stop.kind.value} stop carries no trigger price, so there is no distance "
+                "to size against"
+            )
+            raise RiskSizingError(msg, stop_kind=stop.kind.value)
+        return stop.trigger_price
+
+    @staticmethod
+    def _exit_side(side: OrderSide) -> OrderSide:
+        """Return the side the stop-out itself executes on."""
+        return OrderSide.SELL if side is OrderSide.BUY else OrderSide.BUY
+
+    @staticmethod
+    def _check_direction(request: SizingRequest, trigger: Decimal) -> None:
+        """Check the stop sits on the losing side of the entry.
+
+        Raises:
+            RiskSizingError: If the stop is at the entry, or on the profitable side of it.
+                A long protected above its entry is not protected; it is a position that
+                profits by being stopped out, which means the level was set backwards.
+        """
+        if trigger == request.entry_price:
+            msg = "the stop sits at the entry price, giving a zero distance to size against"
+            raise RiskSizingError(msg, entry_price=str(request.entry_price))
+        if request.side is OrderSide.BUY and trigger > request.entry_price:
+            msg = "a long's stop sits above its entry price, on the profitable side"
+            raise RiskSizingError(
+                msg, entry_price=str(request.entry_price), stop_price=str(trigger)
+            )
+        if request.side is OrderSide.SELL and trigger < request.entry_price:
+            msg = "a short's stop sits below its entry price, on the profitable side"
+            raise RiskSizingError(
+                msg, entry_price=str(request.entry_price), stop_price=str(trigger)
+            )
+
+    @staticmethod
+    def _check_distance_window(distance: Decimal, entry: Decimal, budget: RiskBudget) -> None:
+        """Check the stop is neither inside the noise nor so wide sizing is meaningless.
+
+        Raises:
+            RiskSizingError: If the distance falls outside the budget's window.
+        """
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            distance_bps = (distance / entry) * _BASIS_POINT_DIVISOR
+        if distance_bps < budget.min_stop_distance_bps:
+            msg = "the stop is nearer than min_stop_distance_bps permits"
+            raise RiskSizingError(
+                msg,
+                distance_bps=str(distance_bps),
+                limit=str(budget.min_stop_distance_bps),
+            )
+        if distance_bps > budget.max_stop_distance_bps:
+            msg = "the stop is further than max_stop_distance_bps permits"
+            raise RiskSizingError(
+                msg,
+                distance_bps=str(distance_bps),
+                limit=str(budget.max_stop_distance_bps),
+            )
+
+    @staticmethod
+    def _decompose_costs(
+        policy: ExecutionPolicy, entry_price: Decimal, exit_price: Decimal
+    ) -> tuple[Decimal, Decimal]:
+        """Split round-trip commission into a fixed part and a per-unit part.
+
+        Probes the policy at zero notional rather than branching on the configured model. A
+        flat fee answers the same amount at any notional, so it appears entirely in the fixed
+        term; a rate answers zero at zero, so it appears entirely in the per-unit term. The
+        decomposition is therefore exact for every affine fee model without this function
+        needing to know which one is in force.
+        """
+        at_zero = policy.fee.fee_for(ZERO, is_first_fill=True)
+        fixed = at_zero * 2
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            entry_leg = policy.fee.fee_for(entry_price, is_first_fill=True) - at_zero
+            exit_leg = policy.fee.fee_for(exit_price, is_first_fill=True) - at_zero
+        return fixed, entry_leg + exit_leg
+
+    @staticmethod
+    def _apply_caps(
+        raw: Decimal, request: SizingRequest, budget: RiskBudget
+    ) -> tuple[Decimal, str | None]:
+        """Reduce a risk-implied size to what exposure and balance actually permit.
+
+        Ordinary conditions rather than errors: the risk budget answers how much may be
+        lost, and these answer how much may be held and paid for. Either is allowed to be
+        the binding constraint.
+        """
+        allowed = raw
+        capped_by: str | None = None
+        if request.entry_price > ZERO:
+            exposure_cap = (request.equity * budget.max_position_exposure_pct) / (
+                request.entry_price
+            )
+            if exposure_cap < allowed:
+                allowed, capped_by = exposure_cap, "exposure"
+            balance_cap = request.available_quote / request.entry_price
+            if balance_cap < allowed:
+                allowed, capped_by = balance_cap, "balance"
+        return allowed, capped_by
+
+
+def select_sizer(
+    config: RiskConfiguration, *, has_stop: bool, entry_fraction: Decimal
+) -> PositionSizer:
+    """Choose the one sizer that governs a decision. Never two.
+
+    The precedence is explicit because the alternative is the failure mode where
+    ``entry_fraction`` and ``risk_per_trade_pct`` both apply to the same order and neither is
+    obviously wrong. Risk-based sizing needs **both** a budget and a stop: a budget alone
+    cannot size anything without knowing where the loss stops, and inventing a stop to
+    satisfy the configuration would fabricate the very number the budget is measured against.
+
+    Falling back is deliberate rather than silent — a caller that configured a budget and
+    received fixed-fraction sizing did so because the intent carried no stop, and the
+    returned sizer says so by its type.
+    """
+    if config.risk_budget is not None and has_stop:
+        return RiskBasedSizer()
+    return FixedFractionSizer(entry_fraction=entry_fraction)

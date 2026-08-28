@@ -30,17 +30,22 @@ from quantplatform.core.enums import (
     RiskCheckSeverity,
     RiskCheckStatus,
     RiskOutcome,
+    StopKind,
     SystemState,
 )
-from quantplatform.core.errors import RiskInvariantError
+from quantplatform.core.errors import RiskInvariantError, RiskSizingError
 from quantplatform.core.events import RiskDecisionMade
 from quantplatform.core.ids import client_order_id_from_key, deterministic_uuid
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, OrderIntent
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskCheckResult, RiskContext, RiskDecision
+from quantplatform.core.models.stops import StopSpecification
+from quantplatform.core.numeric import apply_basis_points
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.sizing import (
+    RiskBasedSizer,
+    SizingRequest,
     market_buy_price_cap,
     normalize_limit_price,
     normalize_quantity,
@@ -69,6 +74,9 @@ class _Sizing:
     reference_price: Decimal
     """Price used to value the order: the normalised limit for a limit order, the cap for a
     market buy, the reference price for a market sell."""
+
+    protective_stop: StopSpecification | None = None
+    """The level this size was chosen to survive, when risk-based sizing produced it."""
 
     @property
     def notional(self) -> Decimal:
@@ -334,6 +342,7 @@ class StandardRiskEngine:
             quantity=sizing.quantity,
             limit_price=sizing.limit_price,
             stop_price=None,
+            protective_stop=sizing.protective_stop,
             max_execution_price=sizing.max_execution_price,
             time_in_force=intent.time_in_force,
             execution_mode=intent.execution_mode,
@@ -709,7 +718,24 @@ class StandardRiskEngine:
         cap = self._market_buy_cap(recorder, intent, context)
         valuation = self._valuation_price(intent, limit_price, cap, context.reference_price)
 
-        requested = self._requested_quantity(intent, valuation, rules)
+        stop = self._derive_stop(recorder, intent, valuation)
+        if stop is None and self._config.require_stop_on_entry:
+            return None
+        try:
+            requested = self._requested_quantity(intent, valuation, rules, context, stop)
+        except RiskSizingError as exc:
+            # A stop the sizer cannot reason about is a configuration error, and the engine's
+            # contract is that a configuration error becomes a *recorded rejection* rather
+            # than an exception. Letting it escape would take down the run the way an
+            # unhandled error in the pipeline does, and would lose the audit trail that says
+            # which limit refused the trade and why.
+            recorder.record(
+                RiskCheckCode.RISK_BUDGET,
+                passed=False,
+                message=f"risk-based sizing refused this stop: {exc.message}",
+                metadata={str(key): str(value) for key, value in exc.details.items()},
+            )
+            return None
         quantity = self._constrain(requested, intent, valuation, context)
 
         recorder.record(
@@ -736,12 +762,87 @@ class StandardRiskEngine:
             limit_price=limit_price,
             max_execution_price=cap,
             reference_price=valuation,
+            protective_stop=stop,
         )
 
+    def _derive_stop(
+        self, recorder: _Recorder, intent: OrderIntent, valuation: Decimal
+    ) -> StopSpecification | None:
+        """Derive the level this position must survive, from configuration alone.
+
+        **Risk derives the stop; the strategy never proposes one.** A strategy choosing its
+        own survival level would be deciding how much of the account it may destroy, which is
+        the separation this layer exists to enforce. The intent's own ``protective_stop`` is
+        honoured when present — a future component may supply one — but nothing populates it
+        today, and the strategy is not permitted to.
+
+        Returns:
+            The stop, or ``None`` when none is configured. ``None`` is a rejection only when
+            :attr:`~quantplatform.risk.config.RiskConfiguration.require_stop_on_entry` is set;
+            otherwise it is V1, where no entry has ever carried one.
+        """
+        if intent.protective_stop is not None:
+            return intent.protective_stop
+        distance_bps = self._config.initial_stop_distance_bps
+        if distance_bps is None:
+            recorder.record(
+                RiskCheckCode.PROTECTIVE_STOP,
+                passed=not self._config.require_stop_on_entry,
+                message="no protective stop is configured and this entry requires one"
+                if self._config.require_stop_on_entry
+                else "no protective stop is configured, and none is required",
+            )
+            return None
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            offset = apply_basis_points(valuation, distance_bps)
+            trigger = valuation - offset if intent.side is OrderSide.BUY else valuation + offset
+        if trigger <= ZERO:
+            recorder.record(
+                RiskCheckCode.PROTECTIVE_STOP,
+                passed=False,
+                message="the configured stop distance places the stop at or below zero",
+                observed=trigger,
+            )
+            return None
+        recorder.record(
+            RiskCheckCode.PROTECTIVE_STOP,
+            passed=True,
+            message="protective stop derived from the configured distance",
+            observed=trigger,
+            metadata={"distance_bps": str(distance_bps), "reference": str(valuation)},
+        )
+        return StopSpecification(kind=StopKind.HARD, trigger_price=trigger)
+
     def _requested_quantity(
-        self, intent: OrderIntent, valuation: Decimal, rules: SymbolRules
+        self,
+        intent: OrderIntent,
+        valuation: Decimal,
+        rules: SymbolRules,
+        context: RiskContext,
+        stop: StopSpecification | None,
     ) -> Decimal:
-        """Return the venue-valid quantity the intent asked for, however it expressed it."""
+        """Return the quantity to constrain, from whichever sizing rule governs.
+
+        Risk-based sizing replaces what the intent *asked for*, never what the limits then
+        allow: the result flows into :meth:`_constrain` exactly as a notional-derived
+        quantity does, so every cap applies identically either way. That is what keeps the
+        engine the single owner of balance, exposure, venue bounds and lot precision.
+        """
+        if stop is not None and self._config.risk_budget is not None:
+            outcome = RiskBasedSizer().size(
+                SizingRequest(
+                    equity=context.snapshot.equity,
+                    available_quote=context.snapshot.cash,
+                    entry_price=valuation,
+                    side=intent.side,
+                    rules=rules,
+                    stop=stop,
+                    budget=self._config.risk_budget,
+                    policy=self._config.execution_policy,
+                )
+            )
+            return outcome.quantity
         if intent.requested_quantity is not None:
             return normalize_quantity(intent.requested_quantity, rules)
         notional = intent.requested_notional

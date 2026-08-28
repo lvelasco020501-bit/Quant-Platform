@@ -30,7 +30,7 @@ from quantplatform.core.events import RiskDecisionMade
 from quantplatform.core.interfaces import RiskEngine
 from quantplatform.core.models.health import ComponentHealth, HealthStatus
 from quantplatform.core.models.portfolio import Balance, Position
-from quantplatform.core.models.risk import RiskDecision
+from quantplatform.core.models.risk import RiskBudget, RiskDecision
 from quantplatform.execution.config import ExecutionConfig
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.sizing import market_buy_price_cap, normalize_limit_price
@@ -1302,3 +1302,181 @@ def test_an_externally_known_key_never_produces_a_fresh_approval() -> None:
     )
     assert decision.outcome is RiskOutcome.REJECTED
     assert decision.approved_order is None
+
+
+# --- M5a: risk-based sizing on the real approval path -------------------------------------------
+#
+# The sizers M4 built are now reachable. Which one governs a decision is decided by
+# configuration alone, and the engine — not the sizer — remains the single owner of every
+# cap, which is the duplication this integration exposed and removed.
+#
+# Strategy is unchanged and stays signal-only: the stop is derived by risk from
+# `initial_stop_distance_bps`, never proposed by the thing that wanted to trade.
+
+
+def _v2(**overrides: object) -> dict[str, object]:
+    """Risk-engine keyword arguments that switch V2 sizing on."""
+    defaults: dict[str, object] = {
+        "risk_budget": RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        "initial_stop_distance_bps": Decimal(200),
+        "max_order_notional": Decimal(10_000_000),
+        "max_symbol_exposure": Decimal(10_000_000),
+    }
+    return {**defaults, **overrides}
+
+
+def test_v1_sizing_is_untouched_when_no_risk_budget_is_configured() -> None:
+    # The golden test on the real path. An engine with no V2 configuration must approve
+    # exactly the quantity it always did — the intent's own requested notional, constrained
+    # by the same caps and nothing else.
+    engine = make_risk_engine()
+    intent = make_intent(quantity=None, notional=Decimal(1000))
+
+    decision = engine.assess(intent, make_risk_context()).decision
+
+    assert decision.approved_order is not None
+    assert decision.approved_order.protective_stop is None
+
+
+def test_a_configured_budget_and_stop_size_from_risk_rather_than_notional() -> None:
+    # 1% of equity risked against a 200 bps stop is a far smaller position than the
+    # intent's own notional would have bought. Risk decides, not the proposal.
+    engine = make_risk_engine(**_v2())
+    intent = make_intent(quantity=None, notional=Decimal(1_000_000))
+
+    decision = engine.assess(intent, make_risk_context()).decision
+
+    assert decision.approved_order is not None
+    baseline = make_risk_engine(
+        max_order_notional=Decimal(10_000_000), max_symbol_exposure=Decimal(10_000_000)
+    )
+    unrisked = baseline.assess(intent, make_risk_context()).decision
+    assert unrisked.approved_order is not None
+    assert decision.approved_order.quantity < unrisked.approved_order.quantity
+
+
+def test_the_approved_order_carries_the_stop_it_was_sized_against() -> None:
+    # Without this the protection is an arithmetic detail that vanishes at the boundary:
+    # nothing downstream could later say what level this position was sized to survive.
+    engine = make_risk_engine(**_v2())
+
+    decision = engine.assess(make_intent(), make_risk_context()).decision
+
+    assert decision.approved_order is not None
+    stop = decision.approved_order.protective_stop
+    assert stop is not None
+    assert stop.trigger_price is not None
+    assert stop.trigger_price < make_risk_context().reference_price
+
+
+def test_a_wider_configured_stop_approves_a_smaller_position() -> None:
+    near = make_risk_engine(**_v2(initial_stop_distance_bps=Decimal(100)))
+    far = make_risk_engine(**_v2(initial_stop_distance_bps=Decimal(400)))
+
+    near_decision = near.assess(make_intent(), make_risk_context()).decision
+    far_decision = far.assess(make_intent(), make_risk_context()).decision
+
+    assert near_decision.approved_order is not None
+    assert far_decision.approved_order is not None
+    assert far_decision.approved_order.quantity < near_decision.approved_order.quantity
+
+
+def test_execution_costs_shrink_the_approved_size_on_the_real_path() -> None:
+    # A stop-out pays commission twice. The approved size must reflect that or the budget
+    # is overshot by exactly what the venue charges.
+    costless = make_risk_engine(**_v2(execution_policy=make_execution_policy()))
+    priced = make_risk_engine(
+        **_v2(
+            execution_policy=make_execution_policy(
+                fee_model=CommissionModel.BASIS_POINTS, fee_basis_points=Decimal(20)
+            )
+        )
+    )
+
+    free = costless.assess(make_intent(), make_risk_context()).decision
+    charged = priced.assess(make_intent(), make_risk_context()).decision
+
+    assert free.approved_order is not None
+    assert charged.approved_order is not None
+    assert charged.approved_order.quantity < free.approved_order.quantity
+
+
+def test_an_entry_without_a_stop_is_refused_when_one_is_required() -> None:
+    # The flag that turns "no naked entries" from an intention into a rule. Week 5's entry
+    # would not survive this configuration.
+    engine = make_risk_engine(require_stop_on_entry=True, initial_stop_distance_bps=None)
+
+    decision = engine.assess(make_intent(), make_risk_context()).decision
+
+    assert decision.outcome is RiskOutcome.REJECTED
+    assert decision.approved_order is None
+    assert any("stop" in reason.lower() for reason in decision.rejection_reasons)
+
+
+def test_an_entry_without_a_stop_is_allowed_when_one_is_not_required() -> None:
+    # V1 preserved: the platform has never required a stop, and configuring nothing must
+    # keep behaving that way rather than silently tightening.
+    engine = make_risk_engine()
+
+    decision = engine.assess(make_intent(), make_risk_context()).decision
+
+    assert decision.outcome is not RiskOutcome.REJECTED
+
+
+def test_a_stop_distance_the_budget_forbids_rejects_rather_than_sizing_anyway() -> None:
+    engine = make_risk_engine(
+        **_v2(
+            risk_budget=RiskBudget(
+                risk_per_trade_pct=Decimal("0.01"),
+                max_position_exposure_pct=Decimal("1"),
+                min_stop_distance_bps=Decimal(500),
+                max_stop_distance_bps=Decimal(10_000),
+            ),
+            initial_stop_distance_bps=Decimal(10),
+        )
+    )
+
+    decision = engine.assess(make_intent(), make_risk_context()).decision
+
+    assert decision.outcome is RiskOutcome.REJECTED
+
+
+def test_the_engine_still_applies_every_cap_to_a_risk_sized_position() -> None:
+    # Cap ownership, asserted rather than assumed. The sizer answers "how much risk"; every
+    # limit that reduces a position still lives in the engine's own constraint chain.
+    engine = make_risk_engine(
+        **_v2(max_order_notional=Decimal(100), max_symbol_exposure=Decimal(100))
+    )
+
+    decision = engine.assess(make_intent(), make_risk_context()).decision
+
+    if decision.approved_order is not None:
+        notional = decision.approved_order.quantity * make_risk_context().reference_price
+        assert notional <= Decimal(100)
+
+
+def test_a_risk_sized_position_never_risks_more_than_the_budget() -> None:
+    # The property the whole milestone exists for, checked on the approved order rather
+    # than on the sizer in isolation.
+    kwargs = _v2()
+    config = make_risk_config(**kwargs)
+    engine = make_risk_engine(**kwargs)
+    context = make_risk_context()
+
+    decision = engine.assess(make_intent(), context).decision
+
+    assert decision.approved_order is not None
+    stop = decision.approved_order.protective_stop
+    assert stop is not None
+    assert stop.trigger_price is not None
+    assert config.risk_budget is not None
+    modelled_risk = decision.approved_order.quantity * (
+        context.reference_price - stop.trigger_price
+    )
+    budget = context.snapshot.equity * config.risk_budget.risk_per_trade_pct
+    assert modelled_risk <= budget

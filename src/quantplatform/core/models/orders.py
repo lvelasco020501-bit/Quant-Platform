@@ -140,6 +140,15 @@ class ApprovedOrder(DomainModel):
     quantity: Quantity
     limit_price: Price | None = None
     stop_price: Price | None = None
+    protective_stop: StopSpecification | None = None
+    """The level this position was sized to survive, carried forward from the decision.
+
+    Metadata, not an instruction: an execution adapter matches this order exactly as it
+    would without it. It travels here so that what a position was protected by does not
+    evaporate at the boundary between deciding and executing — the question "what level was
+    this size chosen against?" has to remain answerable after the fact.
+    """
+
     max_execution_price: Price | None = None
     """The worst price a **market buy** may be executed at, and the basis for reserving its
     funds.

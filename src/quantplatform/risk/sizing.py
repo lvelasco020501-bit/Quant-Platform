@@ -182,6 +182,9 @@ class SizingOutcome:
     """
 
     capped_by: str | None = None
+    """Which limit bound the result, for a sizer that applies limits. The risk-based sizer
+    applies none — see its docstring for why that ownership sits with the engine."""
+
     reason: str = ""
 
 
@@ -232,6 +235,13 @@ class RiskBasedSizer:
     quarter — silently, which is exactly the "protection that was never applied" failure the
     risk contracts exist to make impossible.
 
+    **It applies no caps.** Balance, exposure, venue minimums, lot precision and notional
+    ceilings are all owned by :meth:`~quantplatform.risk.engine.StandardRiskEngine._constrain`,
+    which has applied them to every order the platform has ever approved. An earlier draft of
+    this class reapplied two of them, which integration exposed as two owners of one rule —
+    idempotent today and a source of drift the moment either changed. This answers exactly
+    one question: how much may be bought before a stop-out exceeds its budget.
+
     Costs are read from the shared
     :class:`~quantplatform.core.models.execution_policy.ExecutionPolicy` — the same object
     the broker executes under, so the two cannot hold different numbers. The commission is
@@ -274,14 +284,9 @@ class RiskBasedSizer:
                 raise RiskSizingError("the projected loss per unit is zero")
             raw = spendable / loss_per_unit
 
-            capped, capped_by = self._apply_caps(raw, request, budget)
-
-        quantity = normalize_quantity(capped, request.rules)
-        if quantity <= ZERO or quantity * request.entry_price < request.rules.min_notional:
-            return SizingOutcome(
-                capped_by=capped_by,
-                reason="no venue-valid size remains within the risk budget",
-            )
+        quantity = normalize_quantity(raw, request.rules)
+        if quantity <= ZERO:
+            return SizingOutcome(reason="the risk budget admits no venue-valid size")
 
         with localcontext() as ctx:
             ctx.prec = DECIMAL_WORKING_PRECISION
@@ -289,7 +294,6 @@ class RiskBasedSizer:
         return SizingOutcome(
             quantity=quantity,
             risk_amount=risk_amount,
-            capped_by=capped_by,
             reason="sized from the capital the stop puts at risk",
         )
 
@@ -394,29 +398,6 @@ class RiskBasedSizer:
             entry_leg = policy.fee.fee_for(entry_price, is_first_fill=True) - at_zero
             exit_leg = policy.fee.fee_for(exit_price, is_first_fill=True) - at_zero
         return fixed, entry_leg + exit_leg
-
-    @staticmethod
-    def _apply_caps(
-        raw: Decimal, request: SizingRequest, budget: RiskBudget
-    ) -> tuple[Decimal, str | None]:
-        """Reduce a risk-implied size to what exposure and balance actually permit.
-
-        Ordinary conditions rather than errors: the risk budget answers how much may be
-        lost, and these answer how much may be held and paid for. Either is allowed to be
-        the binding constraint.
-        """
-        allowed = raw
-        capped_by: str | None = None
-        if request.entry_price > ZERO:
-            exposure_cap = (request.equity * budget.max_position_exposure_pct) / (
-                request.entry_price
-            )
-            if exposure_cap < allowed:
-                allowed, capped_by = exposure_cap, "exposure"
-            balance_cap = request.available_quote / request.entry_price
-            if balance_cap < allowed:
-                allowed, capped_by = balance_cap, "balance"
-        return allowed, capped_by
 
 
 def select_sizer(

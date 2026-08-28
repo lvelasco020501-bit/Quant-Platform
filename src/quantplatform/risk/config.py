@@ -109,6 +109,22 @@ class RiskConfiguration(BaseModel):
     anticipate.
     """
 
+    initial_stop_distance_bps: NonNegativeMoney | None = Field(
+        default=None, gt=0, le=_MAX_BASIS_POINTS
+    )
+    """How far below a long's entry its initial protective stop is placed, in basis points.
+
+    Risk derives the stop; the strategy never proposes one. A strategy that chose its own
+    survival level would be deciding how much of the account it may destroy, which is the
+    separation this whole layer exists to enforce — and week 5's strategy had no exit at all
+    beyond its own crossover, which is what the separation is being enforced against.
+
+    ``None`` means no stop is derived, which is V1. Expressed as a distance rather than an
+    absolute level because the level cannot be known before a price is: a distance applied
+    to the reference price yields a trigger, whereas an absolute level configured in advance
+    would be wrong for every price but one.
+    """
+
     require_stop_on_entry: bool = False
     """Whether an intent that carries no :class:`~quantplatform.core.models.risk.StopSpecification`
     is refused.

@@ -512,6 +512,8 @@ class RiskCheckCode(StrEnum):
     MAX_ORDER_NOTIONAL = "max_order_notional"
     MAX_POSITION_COUNT = "max_position_count"
     MAX_EXPOSURE = "max_exposure"
+    PROTECTIVE_STOP = "protective_stop"
+    RISK_BUDGET = "risk_budget"
     MAX_SYMBOL_EXPOSURE = "max_symbol_exposure"
     MARKET_BUY_CAP = "market_buy_cap"
     MAX_DAILY_ORDERS = "max_daily_orders"

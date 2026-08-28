@@ -215,46 +215,48 @@ def test_a_stop_wider_than_the_budget_permits_is_refused() -> None:
         )
 
 
-# --- Caps: ordinary market conditions, not errors ----------------------------------------------
+# --- Caps are not this sizer's job ---------------------------------------------------------------
+#
+# An earlier draft of RiskBasedSizer applied exposure and balance caps itself. Integrating it
+# exposed that as two owners of one rule: StandardRiskEngine._constrain has applied those same
+# caps to every order the platform has ever approved. Idempotent today, and a source of drift
+# the first time either changed. The sizer now answers exactly one question, and the tests
+# below pin that boundary rather than the behaviour that was removed.
 
 
-def test_exposure_limits_cap_a_position_the_risk_budget_would_allow() -> None:
-    # A tight stop makes the risk-implied size very large. Exposure is the second question,
-    # and it is allowed to be the binding one.
-    outcome = RiskBasedSizer().size(
-        _request(
-            policy=_costless(),
-            budget=_budget(max_position_exposure_pct=Decimal("0.1")),
-            stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("99900")),
-        )
+def test_the_sizer_answers_only_how_much_risk_not_how_much_is_affordable() -> None:
+    # An account with almost no free quote still receives the full risk-implied size. That is
+    # correct: whether it can be paid for is the engine's question, asked with the same
+    # balance cap it applies to every other order.
+    poor = RiskBasedSizer().size(_request(policy=_costless(), available_quote=Decimal("1")))
+    rich = RiskBasedSizer().size(_request(policy=_costless()))
+
+    assert poor.quantity == rich.quantity
+    assert poor.capped_by is None
+
+
+def test_the_sizer_does_not_apply_the_exposure_ceiling_either() -> None:
+    unconstrained = RiskBasedSizer().size(_request(policy=_costless()))
+    with_ceiling = RiskBasedSizer().size(
+        _request(policy=_costless(), budget=_budget(max_position_exposure_pct=Decimal("0.01")))
     )
 
-    # 10% of 100 000 equity at 100 000 per unit = 0.1 units.
-    assert outcome.quantity == Decimal("0.1")
-    assert outcome.capped_by == "exposure"
+    assert with_ceiling.quantity == unconstrained.quantity
+    assert with_ceiling.capped_by is None
 
 
-def test_available_balance_caps_a_position_the_budget_would_allow() -> None:
-    outcome = RiskBasedSizer().size(_request(policy=_costless(), available_quote=Decimal("20000")))
-
-    assert outcome.quantity <= Decimal("0.2")
-    assert outcome.capped_by == "balance"
-
-
-def test_the_actual_risk_is_reported_after_caps_not_the_budget() -> None:
-    # If a cap shrinks the position, less money is genuinely at risk. Reporting the budget
-    # would overstate exposure and would make every R-multiple computed from it wrong.
-    outcome = RiskBasedSizer().size(_request(policy=_costless(), available_quote=Decimal("20000")))
+def test_the_reported_risk_matches_the_size_the_sizer_returned() -> None:
+    # Whatever quantity comes out, risk_amount describes that quantity and not the budget.
+    # The engine may shrink the position afterwards; recomputing the risk it then carries is
+    # a later milestone's job, and this one must not pretend to have done it.
+    outcome = RiskBasedSizer().size(_request(policy=_costless()))
 
     assert outcome.risk_amount is not None
-    assert outcome.risk_amount < Decimal("1000")
     assert outcome.risk_amount == outcome.quantity * (_ENTRY - _STOP)
 
 
 def test_a_size_below_the_venue_minimum_is_no_size_at_all() -> None:
-    outcome = RiskBasedSizer().size(
-        _request(policy=_costless(), equity=Decimal("1"), available_quote=Decimal("1"))
-    )
+    outcome = RiskBasedSizer().size(_request(policy=_costless(), equity=Decimal("0.0000001")))
 
     assert outcome.quantity == Decimal(0)
     assert outcome.risk_amount is None

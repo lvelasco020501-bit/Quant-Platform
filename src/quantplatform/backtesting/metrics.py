@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from decimal import Decimal, localcontext
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ONE, ZERO
 from quantplatform.core.models.base import DomainModel, UtcDatetime
@@ -66,6 +66,47 @@ class TradeStatistics(DomainModel):
     expectancy: Money | None = None
     """Average realised result per closed trade; ``None`` when nothing closed."""
 
+    # --- Research metrics (M2) ------------------------------------------------------------
+    #
+    # Added so runs can be *compared*, not merely described. A win rate says how often a
+    # strategy is right; none of these say that, and all of them say more about whether it
+    # survives being wrong.
+
+    reward_risk_ratio: Money | None = None
+    """``average_win / average_loss``; ``None`` when nothing lost, so nothing to divide by.
+
+    Deliberately not clamped or defaulted: a strategy with no losing trades in its sample
+    has an undefined reward-to-risk, not an infinite one, and reporting a number here would
+    invent a comparison the data cannot support.
+    """
+
+    max_consecutive_losses: int = Field(default=0, ge=0)
+    """Longest unbroken run of losing trades.
+
+    A distinct failure from the loss *rate*: five losses spread across a month is a strategy
+    performing within expectation, and five in a row is a regime it did not anticipate. The
+    second is what exhausts an account and what a circuit breaker is sized against.
+    """
+
+    max_consecutive_wins: int = Field(default=0, ge=0)
+    """Longest unbroken run of winning trades, reported for symmetry."""
+
+    average_r: Money | None = None
+    """Mean R-multiple across closed trades, where ``R = net_pnl / risk_amount``.
+
+    ``None`` until positions record what they risked. That is not a temporary gap in the
+    computation but a real one in the data: risk_amount does not exist until a position
+    carries a stop, and no position did before this work began. Reporting ``0`` instead
+    would read as "every trade broke even", which is a different and false claim.
+    """
+
+    expectancy_r: Money | None = None
+    """Expectancy denominated in R rather than quote currency.
+
+    The comparable form: quote-currency expectancy scales with account size and position
+    sizing, so two strategies cannot be ranked by it. R-expectancy can be.
+    """
+
 
 class PerformanceSummary(DomainModel):
     """Everything the run can say about how it went.
@@ -100,6 +141,16 @@ class PerformanceSummary(DomainModel):
     bars_processed: int
     duration_seconds: int
 
+    turnover: Money | None = None
+    """Total traded notional over initial equity.
+
+    How hard the account was worked to produce the result. Two strategies with the same
+    return and very different turnover are not the same strategy: one of them is paying far
+    more in fees and slippage for it, and is far more exposed to those costs being modelled
+    optimistically. ``None`` when nothing was traded or the account had no equity to measure
+    against.
+    """
+
 
 def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly these inputs
     *,
@@ -113,6 +164,7 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
     periods_per_year: Decimal,
     risk_free_rate: Decimal,
     minimum_periods_for_ratios: int,
+    traded_notional: Decimal | None = None,
 ) -> PerformanceSummary:
     """Summarise a completed run.
 
@@ -127,6 +179,9 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
         periods_per_year: Bars per year, for annualisation.
         risk_free_rate: Annualised risk-free rate.
         minimum_periods_for_ratios: Return observations below which ratios are not computed.
+        traded_notional: Total quote-asset notional executed across every fill, for turnover.
+            Optional so that callers predating this metric keep working and receive ``None``
+            rather than a fabricated zero.
 
     Returns:
         The summary, with metrics this run cannot support left as ``None``.
@@ -144,6 +199,11 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
         sharpe = _sharpe(returns, periods_per_year, risk_free_rate, minimum_periods_for_ratios)
         sortino = _sortino(returns, periods_per_year, risk_free_rate, minimum_periods_for_ratios)
         cagr = _cagr(initial_equity, final_equity, duration)
+        turnover = (
+            traded_notional / initial_equity
+            if traded_notional is not None and initial_equity > ZERO
+            else None
+        )
 
     return PerformanceSummary(
         initial_equity=initial_equity,
@@ -160,6 +220,7 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
         trades=trades,
         bars_processed=len(curve),
         duration_seconds=duration,
+        turnover=turnover,
     )
 
 

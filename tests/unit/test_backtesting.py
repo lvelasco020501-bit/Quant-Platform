@@ -324,3 +324,140 @@ def test_a_run_without_capital_is_refused() -> None:
 def test_configuration_rejects_float_money() -> None:
     with pytest.raises(ValueError, match="binary floating point"):
         BacktestConfig(initial_capital=10_000.0)  # type: ignore[arg-type]
+
+
+# --- Research metrics (M2) ---------------------------------------------------------------------
+#
+# Ten of the metrics research needs already existed: win rate, average win and loss, profit
+# factor, expectancy, max drawdown, Sharpe, Sortino, fees and slippage. Four did not, and the
+# gap they leave is specific — without them a run can be described but not compared. R-multiple
+# in particular cannot be computed at all until a position records what it risked, which is
+# why every test below asserts `None` rather than a number for it: the wiring lands here, the
+# data arrives with hard stops.
+
+
+def _trades(**overrides: object) -> TradeStatistics:
+    defaults: dict[str, object] = {
+        "count": 0,
+        "wins": 0,
+        "losses": 0,
+        "gross_profit": Decimal(0),
+        "gross_loss": Decimal(0),
+    }
+    return TradeStatistics(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def test_the_preexisting_summary_fields_are_unchanged_by_the_new_metrics() -> None:
+    # The golden test. Every field that existed before M2 must compute exactly as it did,
+    # from exactly the same arguments — new metrics are additive or they are a regression
+    # wearing a feature's clothes.
+    summary = _summary(
+        [Decimal(10_100), Decimal(10_050), Decimal(10_300)],
+        realized_pnl=Decimal("250"),
+        unrealized_pnl=Decimal("50"),
+        commission_paid=Decimal("12.5"),
+        slippage_paid=Decimal("3.25"),
+        trades=_trades(
+            count=4,
+            wins=3,
+            losses=1,
+            gross_profit=Decimal("400"),
+            gross_loss=Decimal("150"),
+            win_rate=Decimal("0.75"),
+            average_win=Decimal("133.33"),
+            average_loss=Decimal("150"),
+            profit_factor=Decimal("2.6666"),
+            expectancy=Decimal("62.5"),
+        ),
+    )
+
+    assert summary.initial_equity == Decimal(10_000)  # type: ignore[attr-defined]
+    assert summary.final_equity == Decimal(10_300)  # type: ignore[attr-defined]
+    assert summary.total_return == Decimal("0.03")  # type: ignore[attr-defined]
+    assert summary.realized_pnl == Decimal("250")  # type: ignore[attr-defined]
+    assert summary.unrealized_pnl == Decimal("50")  # type: ignore[attr-defined]
+    assert summary.commission_paid == Decimal("12.5")  # type: ignore[attr-defined]
+    assert summary.slippage_paid == Decimal("3.25")  # type: ignore[attr-defined]
+    assert summary.max_drawdown == Decimal("0.004950495049504950495049504950")  # type: ignore[attr-defined]
+    assert summary.sharpe_ratio is not None  # type: ignore[attr-defined]
+    assert summary.bars_processed == 3  # type: ignore[attr-defined]
+    assert summary.trades.win_rate == Decimal("0.75")  # type: ignore[attr-defined]
+    assert summary.trades.profit_factor == Decimal("2.6666")  # type: ignore[attr-defined]
+    assert summary.trades.expectancy == Decimal("62.5")  # type: ignore[attr-defined]
+
+
+def test_a_run_with_no_new_arguments_reports_the_new_metrics_as_unavailable() -> None:
+    # Callers that predate M2 must keep working, and must not receive a fabricated zero for
+    # a metric their inputs cannot support.
+    summary = _summary([Decimal(10_100)])
+
+    assert summary.turnover is None  # type: ignore[attr-defined]
+    assert summary.trades.average_r is None  # type: ignore[attr-defined]
+    assert summary.trades.expectancy_r is None  # type: ignore[attr-defined]
+    assert summary.trades.reward_risk_ratio is None  # type: ignore[attr-defined]
+    assert summary.trades.max_consecutive_losses == 0  # type: ignore[attr-defined]
+
+
+def test_turnover_measures_traded_notional_against_the_account() -> None:
+    summary = _summary([Decimal(10_000)], traded_notional=Decimal(25_000))
+
+    assert summary.turnover == Decimal("2.5")  # type: ignore[attr-defined]
+
+
+def test_turnover_is_undefined_rather_than_infinite_on_a_zero_account() -> None:
+    summary = _summary([Decimal(0)], initial_equity=Decimal(0), traded_notional=Decimal(100))
+
+    assert summary.turnover is None  # type: ignore[attr-defined]
+
+
+def test_reward_to_risk_compares_the_average_winner_to_the_average_loser() -> None:
+    stats = _trades(
+        count=2,
+        wins=1,
+        losses=1,
+        gross_profit=Decimal(300),
+        gross_loss=Decimal(100),
+        average_win=Decimal(300),
+        average_loss=Decimal(100),
+        reward_risk_ratio=Decimal(3),
+    )
+
+    assert stats.reward_risk_ratio == Decimal(3)
+
+
+def test_reward_to_risk_is_undefined_when_nothing_ever_lost() -> None:
+    stats = _trades(count=1, wins=1, gross_profit=Decimal(300), average_win=Decimal(300))
+
+    assert stats.reward_risk_ratio is None
+
+
+def test_consecutive_losses_counts_the_longest_streak_not_the_total() -> None:
+    # W L L L W L L  ->  3, not 5. The distinction matters: a strategy that loses five times
+    # spread across a month is not the one that loses five times in a row.
+    stats = _trades(count=7, wins=2, losses=5, max_consecutive_losses=3)
+
+    assert stats.max_consecutive_losses == 3
+
+
+def test_r_multiples_are_unavailable_until_a_position_records_what_it_risked() -> None:
+    # Honest by construction: R = net_pnl / risk_amount, and risk_amount does not exist
+    # until a stop does. Reporting 0.0 here would read as "every trade broke even".
+    stats = _trades(count=3, wins=2, losses=1, gross_profit=Decimal(200), gross_loss=Decimal(50))
+
+    assert stats.average_r is None
+    assert stats.expectancy_r is None
+
+
+def test_r_multiples_are_computed_once_risk_amounts_are_known() -> None:
+    stats = _trades(
+        count=2,
+        wins=1,
+        losses=1,
+        gross_profit=Decimal(200),
+        gross_loss=Decimal(100),
+        average_r=Decimal("0.5"),
+        expectancy_r=Decimal("0.5"),
+    )
+
+    assert stats.average_r == Decimal("0.5")
+    assert stats.expectancy_r == Decimal("0.5")

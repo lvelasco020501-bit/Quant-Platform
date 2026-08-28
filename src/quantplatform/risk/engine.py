@@ -21,9 +21,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
+from typing import ClassVar
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
 from quantplatform.core.enums import (
+    CircuitBreakerReason,
     MarketType,
     OrderSide,
     OrderType,
@@ -381,7 +383,8 @@ class StandardRiskEngine:
         self._check_operational(recorder, context)
         self._check_duplication(recorder, intent, context, forced_exit=forced_exit)
         self._check_frequency(recorder, context, forced_exit=forced_exit)
-        self._check_drawdown(recorder, context)
+        self._check_drawdown(recorder, context, forced_exit=forced_exit)
+        self._check_circuit_breakers(recorder, intent, context)
         self._check_market_conditions(recorder, context, forced_exit=forced_exit)
         self._check_instrument(recorder, intent, context)
 
@@ -642,14 +645,22 @@ class StandardRiskEngine:
             severity=severity,
         )
 
-    def _check_drawdown(self, recorder: _Recorder, context: RiskContext) -> None:
+    def _check_drawdown(
+        self, recorder: _Recorder, context: RiskContext, *, forced_exit: bool = False
+    ) -> None:
         """Evaluate the daily and total drawdown limits.
 
         Drawdown is a positive fraction lost from the relevant peak. A peak of zero is not a
         drawdown of zero — it is an account with no reference to measure against — so it is
         treated as missing rather than silently passing.
+
+        Advisory on a forced exit. Both limits were blocking on every intent, so a deep
+        drawdown refused the very stop-out that drawdown exists to make survivable: the
+        account stayed exposed *because* it had already lost, which is the inversion the
+        frequency limit and the market-condition guards had each already been corrected for.
         """
         equity = context.snapshot.equity
+        severity = RiskCheckSeverity.ADVISORY if forced_exit else RiskCheckSeverity.BLOCKING
         self._record_drawdown(
             recorder,
             RiskCheckCode.DAILY_DRAWDOWN,
@@ -657,6 +668,7 @@ class StandardRiskEngine:
             peak=context.day_start_equity,
             limit=self._config.max_daily_drawdown_pct,
             label="daily",
+            severity=severity,
         )
         self._record_drawdown(
             recorder,
@@ -665,6 +677,7 @@ class StandardRiskEngine:
             peak=context.peak_equity,
             limit=self._config.max_total_drawdown_pct,
             label="total",
+            severity=severity,
         )
 
     def _record_drawdown(
@@ -676,6 +689,7 @@ class StandardRiskEngine:
         peak: Decimal,
         limit: Decimal,
         label: str,
+        severity: RiskCheckSeverity = RiskCheckSeverity.BLOCKING,
     ) -> None:
         """Record one drawdown check, honouring the strict-missing-metrics policy."""
         if peak <= ZERO:
@@ -684,6 +698,7 @@ class StandardRiskEngine:
                     code,
                     passed=False,
                     message=f"{label} drawdown cannot be evaluated without a positive peak",
+                    severity=severity,
                 )
             else:
                 recorder.skip(code, message=f"{label} drawdown peak is unavailable")
@@ -698,9 +713,58 @@ class StandardRiskEngine:
             message=f"{label} drawdown exceeds its limit"
             if drawdown > limit
             else f"{label} drawdown is within its limit",
+            severity=severity,
             observed=drawdown,
             limit=limit,
         )
+
+    _BREAKER_CODES: ClassVar[dict[CircuitBreakerReason, RiskCheckCode]] = {
+        CircuitBreakerReason.DAILY_LOSS_LIMIT: RiskCheckCode.MAX_DAILY_LOSS,
+        CircuitBreakerReason.EXCESSIVE_DRAWDOWN: RiskCheckCode.MAX_TOTAL_DRAWDOWN_BREAKER,
+        CircuitBreakerReason.CONSECUTIVE_LOSSES: RiskCheckCode.MAX_CONSECUTIVE_LOSSES,
+    }
+    """Which check reports which latch. Distinct from ``TOTAL_DRAWDOWN`` on purpose: that
+    code is already recorded by the instantaneous check, and a decision may carry each code
+    at most once."""
+
+    def _check_circuit_breakers(
+        self, recorder: _Recorder, intent: OrderIntent, context: RiskContext
+    ) -> None:
+        """Refuse to add exposure while a breaker is latched, and never refuse to remove it.
+
+        Expressed by side rather than by ``forced_exit``. A breaker exists to stop the
+        account taking *new* risk after a day, a decline or a streak said the strategy is
+        not working; reducing exposure is never what it protects against, so a strategic
+        exit is as exempt as a protective one. An account that may not close while halted is
+        an account the halt has trapped, which is worse than the condition that halted it.
+
+        No breaker closes anything. Liquidating on a threshold would turn a decline into a
+        realised loss at the worst moment and would be a strategy nobody researched; what
+        closes a position is its stop, which is the component whose job that is.
+        """
+        adds_risk = intent.side is OrderSide.BUY
+        severity = RiskCheckSeverity.BLOCKING if adds_risk else RiskCheckSeverity.ADVISORY
+        latched = {breaker.reason for breaker in context.breakers if breaker.is_tripped}
+        for reason, code in self._BREAKER_CODES.items():
+            if not self._breaker_configured(reason):
+                continue
+            recorder.record(
+                code,
+                passed=reason not in latched,
+                message=f"the {reason.value} circuit breaker is latched"
+                if reason in latched
+                else f"the {reason.value} circuit breaker is clear",
+                severity=severity,
+                metadata={"reason": reason.value, "adds_risk": str(adds_risk)},
+            )
+
+    def _breaker_configured(self, reason: CircuitBreakerReason) -> bool:
+        """Return whether this breaker was configured, so an unarmed one has no authority."""
+        if reason is CircuitBreakerReason.DAILY_LOSS_LIMIT:
+            return self._config.max_daily_loss_pct is not None
+        if reason is CircuitBreakerReason.EXCESSIVE_DRAWDOWN:
+            return self._config.latch_total_drawdown
+        return self._config.max_consecutive_losses is not None
 
     def _check_market_conditions(
         self, recorder: _Recorder, context: RiskContext, *, forced_exit: bool = False

@@ -161,6 +161,34 @@ class RiskContext(DomainModel):
     known_idempotency_keys: frozenset[str] = frozenset()
     """Keys of decisions already processed, used to detect duplicate intents."""
 
+    breakers: tuple[CircuitBreakerState, ...] = ()
+    """Every circuit breaker currently latched, one entry per reason.
+
+    A tuple rather than a single state because the three breakers reset differently: the
+    daily limit clears at the day rollover while a drawdown or a losing streak stays latched
+    until an operator says otherwise. One shared ``reason`` field could not hold both, and
+    the rollover would then clear a structural halt that happened to have tripped second.
+
+    Read by the engine and never written by it. Whether a latch exists is the orchestrator's
+    arithmetic over its own equity and closed trades; what a latch *means* for an order is
+    the only part risk decides.
+    """
+
+    @model_validator(mode="after")
+    def _validate_breakers(self) -> Self:
+        """Check no reason latches twice.
+
+        Raises:
+            ValueError: If a reason appears more than once, which would make "is this
+                condition halted, and since when" have two answers and leave the reset
+                depending on which entry was read first.
+        """
+        reasons = [breaker.reason for breaker in self.breakers]
+        if len(set(reasons)) != len(reasons):
+            msg = "each circuit breaker reason may latch at most once"
+            raise ValueError(msg)
+        return self
+
     @property
     def data_age_seconds(self) -> float:
         """Return how stale the most recent bar is at :attr:`as_of`."""

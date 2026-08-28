@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from quantplatform.backtesting.engine import BacktestEngine, RunState
 from quantplatform.core.enums import (
+    CircuitBreakerReason,
     CommissionModel,
     ExecutionMode,
     MarketType,
@@ -1070,3 +1071,334 @@ def test_a_v1_run_holds_an_unprotected_position_without_complaint() -> None:
 
     assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
     assert state.position_risk == {}
+
+
+# --- M7b: the bar loop keeps its arithmetic when its order changes -------------------------------
+#
+# Circuit breakers must see a loss on the bar that realised it, not one bar later, which means
+# closed trades and the equity anchors have to be updated before authorisation rather than after.
+# That moves code which every performance number is derived from. These two goldens are pinned to
+# literal values captured before the move: they exist to fail loudly if reordering the loop
+# changes a single figure, and they are expected to pass both before and after — a golden that
+# only passes afterwards would be a golden written to match the change.
+
+_GOLDEN_POLICY_SLIPPAGE_BPS = Decimal(10)
+_GOLDEN_POLICY_FEE_BPS = Decimal(20)
+
+
+def _golden_backtest(strategy: BaseStrategy) -> BacktestEngine:
+    """A run with real fees and real slippage, so the goldens have something to protect."""
+    engine, _, _ = make_backtest(
+        strategy=strategy,
+        policy=make_execution_policy(
+            slippage_bps=_GOLDEN_POLICY_SLIPPAGE_BPS,
+            fee_model=CommissionModel.BASIS_POINTS,
+            fee_basis_points=_GOLDEN_POLICY_FEE_BPS,
+        ),
+    )
+    return engine
+
+
+def test_golden_a_completed_round_trip_costs_exactly_what_it_costs() -> None:
+    engine = _golden_backtest(BuyThenSell(_Params()))
+    prices = [Decimal(50_000)] * _WARMUP_BARS + [
+        Decimal(51_000),
+        Decimal(52_000),
+        Decimal(49_000),
+        Decimal(50_500),
+    ]
+
+    result = engine.run(make_bars(prices))
+
+    assert result.bars_processed == 7
+    assert len(result.fills) == 2
+    assert len(result.orders) == 2
+    assert len(result.signals) == 2
+    performance = result.performance
+    assert performance is not None
+    assert performance.final_equity == Decimal("101250.38193904")
+    assert performance.total_return == Decimal("0.0125038193904")
+    assert performance.max_drawdown == Decimal("0.0027704113104")
+    assert performance.commission_paid == Decimal("372.75750096")
+    assert performance.slippage_paid == Decimal("186.38056")
+    assert (performance.trades.count, performance.trades.wins, performance.trades.losses) == (
+        1,
+        1,
+        0,
+    )
+    assert performance.trades.gross_profit == Decimal("1250.38193904")
+    assert [(fill.side, str(fill.price), str(fill.quantity)) for fill in result.fills] == [
+        (OrderSide.BUY, "51051", "1.80952"),
+        (OrderSide.SELL, "51948", "1.80952"),
+    ]
+    assert [str(point.equity) for point in result.equity_curve] == [
+        "100000",
+        "100000",
+        "100000.0000000",
+        "99722.95886896",
+        "101250.38193904",
+        "101250.38193904",
+        "101250.38193904",
+    ]
+
+
+def test_golden_an_open_position_draws_the_account_down_by_exactly_this_much() -> None:
+    # The complement: nothing closes, so every figure comes from marking an open position.
+    # Between them the two goldens cover realised and unrealised, closed and open.
+    engine = _golden_backtest(BuyOnce(_Params()))
+    prices = [Decimal(50_000)] * _WARMUP_BARS + [
+        Decimal(50_100),
+        Decimal(50_200),
+        Decimal(48_000),
+        Decimal(47_000),
+    ]
+
+    result = engine.run(make_bars(prices))
+
+    assert len(result.fills) == 1
+    performance = result.performance
+    assert performance is not None
+    assert performance.final_equity == Decimal("94118.335830096")
+    assert performance.total_return == Decimal("-0.05881664169904")
+    assert performance.max_drawdown == Decimal("0.05881664169904")
+    assert performance.commission_paid == Decimal("181.495217904")
+    assert performance.trades.count == 0
+    assert [str(point.drawdown) for point in result.equity_curve] == [
+        "0",
+        "0",
+        "0E-7",
+        "0.00272152169904",
+        "0.00091200169904",
+        "0.04072144169904",
+        "0.05881664169904",
+    ]
+
+
+# --- M7b: the latches, driven by the run's own arithmetic ---------------------------------------
+#
+# The engine owns the state and risk only reads it, so the trigger is computed where the equity
+# and the closed trades already live. What each breaker measures is deliberately different: the
+# daily limit counts money booked, the drawdown measures marked equity against its own high, and
+# the streak counts outcomes. An account can fail any one without failing the others.
+
+
+def _breaker_backtest(**overrides: object) -> tuple[BacktestEngine, SpotPortfolioEngine]:
+    engine, _, portfolio = make_backtest(
+        policy=make_execution_policy(
+            slippage_bps=Decimal(10),
+            fee_model=CommissionModel.BASIS_POINTS,
+            fee_basis_points=Decimal(20),
+        ),
+        **overrides,  # type: ignore[arg-type]
+    )
+    return engine, portfolio
+
+
+class LoseRepeatedly(BaseStrategy):
+    """Enters whenever flat and exits whenever long, so a falling tape loses over and over.
+
+    No shipped strategy produces a streak on demand, and the consecutive-losses breaker
+    cannot be tested without one.
+    """
+
+    METADATA: ClassVar[StrategyMetadata] = _metadata("lose_repeatedly")
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        if context.history_length < _WARMUP_BARS:
+            return ()
+        action = (
+            SignalAction.EXIT_LONG
+            if context.position_state is PositionState.LONG
+            else SignalAction.ENTER_LONG
+        )
+        return (
+            self.build_signal(
+                context=context, action=action, confidence=Decimal("0.9"), reason="cycle"
+            ),
+        )
+
+
+def _losing_streak_bars() -> tuple[MarketBar, ...]:
+    """A tape that falls gently enough to fill every order it triggers."""
+    prices = [Decimal(50_000)] * _WARMUP_BARS + [
+        Decimal(50_000) - Decimal(200) * index for index in range(12)
+    ]
+    return make_bars(prices)
+
+
+def _day_one_loss_bars() -> tuple[MarketBar, ...]:
+    return make_bars(
+        [Decimal(50_000)] * _WARMUP_BARS
+        + [Decimal(50_100), Decimal(48_000), Decimal(48_000), Decimal(48_000)]
+    )
+
+
+def _next_day_bars(price: Decimal = Decimal(48_000)) -> tuple[MarketBar, ...]:
+    """Bars on the following calendar day, which is what a rollover is measured by."""
+    return tuple(make_bar(index=index, close=price) for index in range(26, 29))
+
+
+def _reasons(state: RunState) -> set[CircuitBreakerReason]:
+    return {breaker.reason for breaker in state.breakers if breaker.reason is not None}
+
+
+def test_a_run_with_no_breaker_configured_latches_nothing() -> None:
+    # The golden. Every completed run of this platform is this run.
+    engine, _ = _breaker_backtest(strategy=BuyThenSell(_Params()))
+
+    state = _drive(engine, make_bars([Decimal(50_000)] * _WARMUP_BARS + [Decimal(45_000)] * 4))
+
+    assert state.breakers == []
+
+
+def test_a_realised_loss_past_the_daily_limit_latches() -> None:
+    engine, _ = _breaker_backtest(
+        strategy=BuyThenSell(_Params()), max_daily_loss_pct=Decimal("0.001")
+    )
+
+    state = _drive(
+        engine,
+        make_bars(
+            [Decimal(50_000)] * _WARMUP_BARS
+            + [Decimal(50_100), Decimal(48_000)]
+            + [Decimal(48_000)] * 2
+        ),
+    )
+
+    assert CircuitBreakerReason.DAILY_LOSS_LIMIT in _reasons(state)
+
+
+def test_a_realised_loss_inside_the_daily_limit_does_not_latch() -> None:
+    engine, _ = _breaker_backtest(
+        strategy=BuyThenSell(_Params()), max_daily_loss_pct=Decimal("0.90")
+    )
+
+    state = _drive(
+        engine,
+        make_bars(
+            [Decimal(50_000)] * _WARMUP_BARS
+            + [Decimal(50_100), Decimal(48_000)]
+            + [Decimal(48_000)] * 2
+        ),
+    )
+
+    assert CircuitBreakerReason.DAILY_LOSS_LIMIT not in _reasons(state)
+
+
+def test_an_open_loss_does_not_latch_the_realised_daily_limit() -> None:
+    # The distinction the two daily limits draw. Nothing has been booked, so a limit that
+    # counts booked money must stay silent; the marked decline is the drawdown's business.
+    engine, _ = _breaker_backtest(strategy=BuyOnce(_Params()), max_daily_loss_pct=Decimal("0.001"))
+
+    state = _drive(
+        engine,
+        make_bars([Decimal(50_000)] * _WARMUP_BARS + [Decimal(50_100)] + [Decimal(40_000)] * 3),
+    )
+
+    assert CircuitBreakerReason.DAILY_LOSS_LIMIT not in _reasons(state)
+
+
+def test_a_marked_decline_past_the_drawdown_limit_latches() -> None:
+    engine, _ = _breaker_backtest(
+        strategy=BuyOnce(_Params()),
+        latch_total_drawdown=True,
+        max_total_drawdown_pct=Decimal("0.05"),
+    )
+
+    state = _drive(
+        engine,
+        make_bars([Decimal(50_000)] * _WARMUP_BARS + [Decimal(50_100)] + [Decimal(40_000)] * 3),
+    )
+
+    assert CircuitBreakerReason.EXCESSIVE_DRAWDOWN in _reasons(state)
+
+
+def test_a_streak_of_losses_latches_on_the_configured_count() -> None:
+    engine, _ = _breaker_backtest(strategy=LoseRepeatedly(_Params()), max_consecutive_losses=2)
+
+    state = _drive(engine, _losing_streak_bars())
+
+    assert CircuitBreakerReason.CONSECUTIVE_LOSSES in _reasons(state)
+
+
+def test_a_streak_one_short_of_the_limit_does_not_latch() -> None:
+    engine, _ = _breaker_backtest(strategy=LoseRepeatedly(_Params()), max_consecutive_losses=9)
+
+    state = _drive(engine, _losing_streak_bars())
+
+    assert CircuitBreakerReason.CONSECUTIVE_LOSSES not in _reasons(state)
+
+
+# --- Reset: only the daily limit is daily --------------------------------------------------------
+
+
+def test_the_daily_loss_latch_clears_at_the_day_rollover() -> None:
+    # A limit that never resets is not a daily limit; it is a total one wearing the wrong
+    # name. This is the single exception to a breaker not clearing itself, and it is the
+    # metric's own definition rather than the process deciding things have improved.
+    engine, _ = _breaker_backtest(
+        strategy=BuyThenSell(_Params()), max_daily_loss_pct=Decimal("0.001")
+    )
+    state = _drive(engine, _day_one_loss_bars())
+    assert CircuitBreakerReason.DAILY_LOSS_LIMIT in _reasons(state)
+
+    for bar in _next_day_bars():
+        engine.advance(bar, state)
+
+    assert CircuitBreakerReason.DAILY_LOSS_LIMIT not in _reasons(state)
+
+
+def test_the_drawdown_latch_survives_the_day_rollover() -> None:
+    engine, _ = _breaker_backtest(
+        strategy=BuyOnce(_Params()),
+        latch_total_drawdown=True,
+        max_total_drawdown_pct=Decimal("0.05"),
+    )
+    state = _drive(
+        engine,
+        make_bars([Decimal(50_000)] * _WARMUP_BARS + [Decimal(50_100)] + [Decimal(40_000)] * 3),
+    )
+    assert CircuitBreakerReason.EXCESSIVE_DRAWDOWN in _reasons(state)
+
+    for bar in _next_day_bars(price=Decimal(40_000)):
+        engine.advance(bar, state)
+
+    assert CircuitBreakerReason.EXCESSIVE_DRAWDOWN in _reasons(state)
+
+
+def test_the_streak_latch_survives_the_day_rollover() -> None:
+    engine, _ = _breaker_backtest(strategy=LoseRepeatedly(_Params()), max_consecutive_losses=2)
+    state = _drive(engine, _losing_streak_bars())
+    assert CircuitBreakerReason.CONSECUTIVE_LOSSES in _reasons(state)
+
+    for bar in _next_day_bars():
+        engine.advance(bar, state)
+
+    assert CircuitBreakerReason.CONSECUTIVE_LOSSES in _reasons(state)
+
+
+def test_a_loss_realised_on_a_bar_gates_that_bar_rather_than_the_next() -> None:
+    # Why the loop is reordered. Closed trades and the equity anchors used to be updated
+    # after authorisation, so a breaker fed from them arrived one bar late and the entry
+    # placed on the very bar that broke the limit went through. One bar is one more position
+    # opened by an account that had already been told to stop.
+    engine, _ = _breaker_backtest(
+        strategy=LoseRepeatedly(_Params()), max_daily_loss_pct=Decimal("0.001")
+    )
+    bars = _losing_streak_bars()
+    state = engine.begin()
+
+    latched_at: int | None = None
+    entered_after_latch = 0
+    for index, bar in enumerate(bars):
+        outcome = engine.advance(bar, state)
+        if latched_at is None and state.breakers:
+            latched_at = index
+            continue
+        if latched_at is not None:
+            entered_after_latch += sum(
+                1 for order in outcome.submitted if order.side is OrderSide.BUY
+            )
+
+    assert latched_at is not None
+    assert entered_after_latch == 0

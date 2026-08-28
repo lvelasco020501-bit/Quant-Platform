@@ -38,7 +38,12 @@ from quantplatform.core.models.health import HealthStatus
 from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
 from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
-from quantplatform.core.models.risk import RiskCheckResult, RiskContext, RiskDecision
+from quantplatform.core.models.risk import (
+    CircuitBreakerState,
+    RiskCheckResult,
+    RiskContext,
+    RiskDecision,
+)
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.timeutils import bar_close_time
@@ -593,6 +598,7 @@ def make_risk_context(
     realized_volatility: Decimal | None = Decimal("0.01"),
     consecutive_api_failures: int = 0,
     known_idempotency_keys: frozenset[str] = frozenset(),
+    breakers: tuple[CircuitBreakerState, ...] = (),
 ) -> RiskContext:
     resolved_snapshot = snapshot if snapshot is not None else make_snapshot()
     return RiskContext(
@@ -614,6 +620,7 @@ def make_risk_context(
             day_start_equity if day_start_equity is not None else resolved_snapshot.equity
         ),
         peak_equity=peak_equity if peak_equity is not None else resolved_snapshot.equity,
+        breakers=breakers,
         spread_basis_points=spread_basis_points,
         realized_volatility=realized_volatility,
         consecutive_api_failures=consecutive_api_failures,

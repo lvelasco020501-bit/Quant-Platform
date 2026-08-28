@@ -328,6 +328,8 @@ class PaperTradingSession:
             blocking.append("fees paid")
         if stored.position_risk:
             blocking.append("recorded position risk")
+        if stored.breakers:
+            blocking.append("a latched circuit breaker")
         if not blocking:
             return
         raise PaperSessionStateError(
@@ -340,6 +342,9 @@ class PaperTradingSession:
             realized_pnl=str(stored.realized_pnl),
             total_fees=str(stored.total_fees),
             risk_managed_symbols=[risk.symbol for risk in stored.position_risk],
+            latched_breakers=[
+                breaker.reason.value for breaker in stored.breakers if breaker.reason is not None
+            ],
         )
 
     # --- Bar processing ---------------------------------------------------------------------
@@ -583,6 +588,7 @@ class PaperTradingSession:
             )
             if self._state is not None
             else (),
+            breakers=tuple(self._state.breakers) if self._state is not None else (),
             last_bar=self._last_bar,
             bars_processed=self._metrics.bars_processed,
             realized_pnl=snapshot.realized_pnl if snapshot is not None else ZERO,

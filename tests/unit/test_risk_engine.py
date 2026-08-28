@@ -29,7 +29,7 @@ from quantplatform.core.errors import UnsupportedFeeAssetError
 from quantplatform.core.events import RiskDecisionMade
 from quantplatform.core.interfaces import RiskEngine
 from quantplatform.core.models.health import ComponentHealth, HealthStatus
-from quantplatform.core.models.portfolio import Balance, Position
+from quantplatform.core.models.portfolio import Balance, PortfolioSnapshot, Position
 from quantplatform.core.models.risk import RiskBudget, RiskDecision
 from quantplatform.execution.config import ExecutionConfig
 from quantplatform.risk.config import RiskConfiguration
@@ -69,6 +69,11 @@ def _check(decision: RiskDecision, code: RiskCheckCode) -> object:
 
 def _failed_codes(decision: RiskDecision) -> set[RiskCheckCode]:
     return {check.code for check in decision.blocking_failures}
+
+
+def _funded_snapshot(cash: Decimal = Decimal(1_000_000)) -> PortfolioSnapshot:
+    """The same funded account as :func:`_funded`, typed for a direct keyword argument."""
+    return make_snapshot(cash=cash)
 
 
 def _funded(cash: Decimal = Decimal(1_000_000)) -> dict[str, object]:
@@ -120,7 +125,7 @@ def test_valid_limit_buy_is_approved() -> None:
     intent = make_intent(quantity=Decimal("0.1"))
     engine = make_risk_engine()
     limit_decision = engine.evaluate(
-        make_intent(quantity=Decimal("0.1")), make_risk_context(**_funded())
+        make_intent(quantity=Decimal("0.1")), make_risk_context(snapshot=_funded_snapshot())
     )
     assert limit_decision.outcome is RiskOutcome.APPROVED
     assert limit_decision.approved_order is not None
@@ -317,7 +322,8 @@ def test_a_limit_order_carries_the_normalized_price_on_the_approved_order() -> N
     )
     limit_intent = type(intent).model_validate(payload)
     decision = engine.evaluate(
-        limit_intent, make_risk_context(**{**_funded(), "symbol_rules": rules})
+        limit_intent,
+        make_risk_context(snapshot=_funded_snapshot(), symbol_rules=rules),
     )
     order = decision.approved_order
     assert order is not None
@@ -481,7 +487,7 @@ def test_market_buy_cap_check_compares_against_the_broker_worst_case() -> None:
     decision = _decide(context_kwargs=_funded())
     check = _check(decision, RiskCheckCode.MARKET_BUY_CAP)
     assert check.status is RiskCheckStatus.PASSED  # type: ignore[attr-defined]
-    assert check.observed >= check.limit  # type: ignore[attr-defined,operator]
+    assert check.observed >= check.limit  # type: ignore[attr-defined]
 
 
 def test_insufficient_quote_balance_under_the_cap_resizes_when_a_valid_order_remains() -> None:
@@ -1263,14 +1269,16 @@ def test_a_replay_at_the_limit_returns_the_prior_approval() -> None:
     engine = make_risk_engine(max_orders_per_hour=5)
     intent = make_intent()
     first = engine.assess(
-        intent, make_risk_context(**{**_funded(), "approved_orders_last_hour": 4})
-    )  # type: ignore[arg-type]
+        intent,
+        make_risk_context(snapshot=_funded_snapshot(), approved_orders_last_hour=4),
+    )
     assert first.decision.outcome is RiskOutcome.APPROVED
 
     # The counter has since reached the limit, but a replay must not re-evaluate it.
     second = engine.assess(
-        intent, make_risk_context(**{**_funded(), "approved_orders_last_hour": 5})
-    )  # type: ignore[arg-type]
+        intent,
+        make_risk_context(snapshot=_funded_snapshot(), approved_orders_last_hour=5),
+    )
 
     assert second.replayed is True
     assert second.decision is first.decision

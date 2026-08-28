@@ -39,6 +39,7 @@ from quantplatform.backtesting.metrics import (
 from quantplatform.backtesting.results import BacktestResult, BarOutcome, ComponentCallCounts
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
 from quantplatform.core.enums import (
+    CircuitBreakerReason,
     OrderSide,
     OrderType,
     PositionState,
@@ -58,6 +59,7 @@ from quantplatform.core.models.market import MarketBar, SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIntent
 from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
 from quantplatform.core.models.risk import (
+    CircuitBreakerState,
     PositionRiskState,
     RiskAction,
     RiskContext,
@@ -115,6 +117,18 @@ class RunState:
     protection has none, which is a true statement where an entry claiming otherwise would
     not be.
     """
+    breakers: list[CircuitBreakerState]
+    """Every circuit breaker currently latched, one entry per reason.
+
+    Owned here rather than by the risk engine, which holds no state and reads no clock: what
+    an account has lost today, how far it sits below its high and how many attempts in a row
+    failed are all facts about *this run*. Risk decides only what a latch means for an order.
+    """
+
+    day_start_realized_pnl: Decimal
+    """Booked PnL as the reporting day opened, so the daily limit can measure money actually
+    lost rather than a marked decline the account has not taken."""
+
     approval_times: list[datetime]
     initial_equity: Decimal
     """The equity the account genuinely held when the run opened.
@@ -302,6 +316,14 @@ class BacktestEngine:
 
         snapshot = self._snapshot(bar, state)
 
+        # Closed trades and the equity anchors are folded in *before* anything is authorised.
+        # They used to be updated at the end of the bar, which left a breaker fed from them
+        # one bar behind: the entry placed on the very bar that broke a limit still went
+        # through. One bar is one more position opened by an account already told to stop.
+        self._record_closed_trades(state)
+        self._update_equity_anchors(snapshot, state)
+        self._update_breakers(snapshot, state)
+
         # Protection is decided before opinion is asked for, and authorised before it. An exit
         # forced by risk must not lose its place in a queue to the very strategy whose position
         # it is closing — and must not have its budget spent by that strategy's next entry.
@@ -327,8 +349,7 @@ class BacktestEngine:
         state.events.extend(events)
 
         final_snapshot = self._snapshot(bar, state)
-        self._record_equity(final_snapshot, state)
-        self._record_closed_trades(state)
+        self._append_equity_point(final_snapshot, state)
         state.snapshots.append(final_snapshot)
         state.outcomes.append(
             BarOutcome(
@@ -502,6 +523,7 @@ class BacktestEngine:
             approved_orders_today=self._approvals_within(state, _SECONDS_PER_DAY, bar),
             day_start_equity=state.day_start_equity,
             peak_equity=state.peak_equity,
+            breakers=tuple(state.breakers),
             spread_basis_points=self._config.assumed_spread_basis_points,
             realized_volatility=self._realized_volatility(state.history.get(bar.symbol, ())),
             consecutive_api_failures=0,
@@ -709,18 +731,117 @@ class BacktestEngine:
                 return approved.protective_stop
         return None
 
-    def _record_equity(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
-        """Append an equity point and update the peak and daily anchors."""
+    def _update_equity_anchors(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
+        """Move the peak and the day's opening marks, and clear the day's own latch.
+
+        Split from :meth:`_append_equity_point` so the anchors a breaker measures against are
+        current before anything is authorised, while the curve still records the account as
+        the bar finally left it. Taking the peak is idempotent, so running it in both places
+        cannot move a number.
+
+        The daily reset lives here because this is where a new reporting day is recognised.
+        It is the single exception to a latch not clearing itself, and it is the metric's own
+        definition rather than the process deciding conditions have improved: a daily limit
+        that never resets is a total limit wearing the wrong name. A structural latch —
+        a drawdown, a losing streak — survives untouched, which is why each reason latches
+        separately.
+        """
+        equity = snapshot.equity
+        state.peak_equity = max(state.peak_equity, equity)
+        day = snapshot.taken_at.date()
+        if state.day_started_at == day:
+            return
+        state.day_started_at = day
+        state.day_start_equity = equity
+        state.day_start_realized_pnl = snapshot.realized_pnl
+        state.breakers = [
+            breaker
+            for breaker in state.breakers
+            if breaker.reason is not CircuitBreakerReason.DAILY_LOSS_LIMIT
+        ]
+
+    def _append_equity_point(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
+        """Record where the account finished this bar."""
         equity = snapshot.equity
         state.peak_equity = max(state.peak_equity, equity)
         drawdown = ZERO
         if state.peak_equity > ZERO:
             drawdown = (state.peak_equity - equity) / state.peak_equity
-        day = snapshot.taken_at.date()
-        if state.day_started_at != day:
-            state.day_started_at = day
-            state.day_start_equity = equity
         state.curve.append(EquityPoint(at=snapshot.taken_at, equity=equity, drawdown=drawdown))
+
+    def _update_breakers(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
+        """Latch whatever this bar's arithmetic says has broken, and latch it once.
+
+        A latched breaker is never un-latched here. Re-deriving the condition each bar and
+        clearing it when it stops holding would turn a halt into a pause, and the condition
+        that halted the account is exactly the condition under which a process should not be
+        deciding on its own that things have improved.
+
+        Nothing is closed. The breakers gate new exposure; the stop closes what is open.
+        """
+        config = self._risk.config
+        latched = {breaker.reason for breaker in state.breakers}
+        at = snapshot.taken_at
+
+        if config.max_daily_loss_pct is not None and state.day_start_equity > ZERO:
+            lost = state.day_start_realized_pnl - snapshot.realized_pnl
+            if lost > ZERO:
+                with localcontext() as ctx:
+                    ctx.prec = DECIMAL_WORKING_PRECISION
+                    fraction = lost / state.day_start_equity
+                if fraction >= config.max_daily_loss_pct:
+                    self._latch(
+                        state,
+                        latched,
+                        CircuitBreakerReason.DAILY_LOSS_LIMIT,
+                        at=at,
+                        daily_loss=lost,
+                    )
+
+        if config.latch_total_drawdown and state.peak_equity > ZERO:
+            with localcontext() as ctx:
+                ctx.prec = DECIMAL_WORKING_PRECISION
+                drawdown = (state.peak_equity - snapshot.equity) / state.peak_equity
+            if drawdown >= config.max_total_drawdown_pct:
+                self._latch(state, latched, CircuitBreakerReason.EXCESSIVE_DRAWDOWN, at=at)
+
+        if config.max_consecutive_losses is not None:
+            streak = 0
+            for result in reversed(state.trade_results):
+                if result >= ZERO:
+                    break
+                streak += 1
+            if streak >= config.max_consecutive_losses:
+                self._latch(
+                    state,
+                    latched,
+                    CircuitBreakerReason.CONSECUTIVE_LOSSES,
+                    at=at,
+                    consecutive_losses=streak,
+                )
+
+    def _latch(
+        self,
+        state: RunState,
+        latched: set[CircuitBreakerReason | None],
+        reason: CircuitBreakerReason,
+        *,
+        at: datetime,
+        daily_loss: Decimal = ZERO,
+        consecutive_losses: int = 0,
+    ) -> None:
+        """Record one halt, keeping at most one entry per reason."""
+        if reason in latched:
+            return
+        latched.add(reason)
+        state.breakers.append(
+            CircuitBreakerState(
+                tripped_at=at,
+                reason=reason,
+                daily_loss=daily_loss,
+                consecutive_losses=consecutive_losses,
+            )
+        )
 
     def _record_closed_trades(self, state: RunState) -> None:
         """Record a round trip whenever a position lifecycle has just ended.
@@ -870,6 +991,8 @@ class BacktestEngine:
             positions={},
             approved_by_id={},
             position_risk={},
+            breakers=[],
+            day_start_realized_pnl=ZERO,
             approval_times=[],
             peak_equity=equity,
             day_start_equity=equity,

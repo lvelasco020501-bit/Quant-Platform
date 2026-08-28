@@ -109,6 +109,20 @@ class RiskConfiguration(BaseModel):
     anticipate.
     """
 
+    latch_total_drawdown: bool = False
+    """Whether breaching :attr:`max_total_drawdown_pct` latches instead of merely refusing.
+
+    The instantaneous check passes again the moment equity ticks up; a latch does not. The
+    difference is the verdict's persistence, not its level, so no second threshold exists —
+    which also makes "a latched limit may never sit below its instantaneous equivalent" hold
+    by identity rather than by an invariant that could drift.
+
+    Off by default, and switching it on requires :attr:`max_total_drawdown_pct` to have been
+    set explicitly. The other two breaker thresholds are ``None`` until configured, so
+    configuring them *is* arming them; this one carries a default, and arming a breaker at a
+    number nobody chose would be implicit financial behaviour.
+    """
+
     initial_stop_distance_bps: NonNegativeMoney | None = Field(
         default=None, gt=0, le=_MAX_BASIS_POINTS
     )
@@ -187,6 +201,13 @@ class RiskConfiguration(BaseModel):
             raise ValueError(msg)
         if not self.allowed_time_in_force:
             msg = "at least one time in force must be permitted"
+            raise ValueError(msg)
+        if self.latch_total_drawdown and "max_total_drawdown_pct" not in self.model_fields_set:
+            msg = (
+                "latching the total-drawdown breaker requires max_total_drawdown_pct to be "
+                "configured explicitly: arming a latch on an inherited default would halt "
+                "the account at a threshold nobody chose"
+            )
             raise ValueError(msg)
         if self.risk_budget is not None and self.initial_stop_distance_bps is None:
             msg = (

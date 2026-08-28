@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from quantplatform.core.clock import SimulatedClock
-from quantplatform.core.enums import StopKind
+from quantplatform.core.enums import CircuitBreakerReason, StopKind
 from quantplatform.core.errors import (
     DataIntegrityError,
     PaperSessionStateError,
@@ -25,7 +25,12 @@ from quantplatform.core.errors import (
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import Balance
-from quantplatform.core.models.risk import PositionRiskState, RiskBudget, StopSpecification
+from quantplatform.core.models.risk import (
+    CircuitBreakerState,
+    PositionRiskState,
+    RiskBudget,
+    StopSpecification,
+)
 from quantplatform.core.models.telemetry import SymbolRulesTelemetry
 from quantplatform.paper import (
     InMemoryPaperStateRepository,
@@ -916,3 +921,63 @@ def test_a_position_integrity_failure_is_not_logged_as_an_unknown_symbol() -> No
 
     with pytest.raises(PositionRiskUnavailableError):
         _feed_bars(session, clock, bars[4:])
+
+
+def test_a_tripped_breaker_survives_the_snapshot_round_trip() -> None:
+    session, clock, repository, _ = _session(
+        strategy=BuyThenSell(_Params()), max_daily_loss_pct=Decimal("0.001")
+    )
+    session.start()
+    _feed_bars(
+        session,
+        clock,
+        make_bars(
+            [Decimal(50_000)] * _WARMUP_BARS
+            + [Decimal(50_100), Decimal(48_000), Decimal(48_000), Decimal(48_000)]
+        ),
+    )
+    session.save()
+
+    stored = repository.load("paper-1")
+
+    assert stored is not None
+    assert [breaker.reason for breaker in stored.breakers] == [
+        CircuitBreakerReason.DAILY_LOSS_LIMIT
+    ]
+    assert all(breaker.tripped_at is not None for breaker in stored.breakers)
+
+
+def _stored_with_breaker(reason: CircuitBreakerReason) -> InMemoryPaperStateRepository:
+    """A stopped session whose stored snapshot carries a halted account."""
+    repository = InMemoryPaperStateRepository()
+    clock = SimulatedClock(ANCHOR)
+    first, _, _, _ = _session(strategy=Silent(_Params()), clock=clock, repository=repository)
+    first.start()
+    _feed_bars(first, clock, _flat_bars(3))
+    first.stop()
+    _stored_with(
+        repository,
+        breakers=(CircuitBreakerState(tripped_at=ANCHOR, reason=reason),),
+    )
+    return repository
+
+
+def test_resuming_a_session_with_a_tripped_breaker_is_refused() -> None:
+    # A halted account is financial state exactly like an open position is. The engine is
+    # flat-start, so a resumed process would rebuild an account with no memory of why it
+    # stopped and begin trading again — which is the one thing the halt existed to prevent.
+    repository = _stored_with_breaker(CircuitBreakerReason.EXCESSIVE_DRAWDOWN)
+    session, _, _, _ = _session(strategy=Silent(_Params()), repository=repository)
+
+    with pytest.raises(PaperSessionStateError, match="circuit breaker"):
+        session.resume()
+
+
+def test_the_refusal_names_the_breaker_that_halted_the_account() -> None:
+    repository = _stored_with_breaker(CircuitBreakerReason.CONSECUTIVE_LOSSES)
+    session, _, _, _ = _session(strategy=Silent(_Params()), repository=repository)
+
+    with pytest.raises(PaperSessionStateError) as caught:
+        session.resume()
+
+    assert "consecutive_losses" in str(caught.value.details)

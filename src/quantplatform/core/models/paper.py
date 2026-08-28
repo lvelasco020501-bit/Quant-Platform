@@ -22,7 +22,7 @@ from quantplatform.core.enums import ExecutionMode
 from quantplatform.core.models.base import AssetCode, DomainModel, Text, UtcDatetime
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.portfolio import Balance, Position
-from quantplatform.core.models.risk import PositionRiskState
+from quantplatform.core.models.risk import CircuitBreakerState, PositionRiskState
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.core.numeric import Fee, Money
 
@@ -58,6 +58,18 @@ class PaperSessionState(DomainModel):
     ``risk_amount`` precisely so that it cannot claim protection it does not describe. A
     position with no quantified risk therefore has no entry here at all, which is a true
     statement, where an entry reporting ``None`` would be a misleading one.
+    """
+
+    breakers: tuple[CircuitBreakerState, ...] = ()
+    """Every circuit breaker latched when this snapshot was taken, one entry per reason.
+
+    Persisted so an operator can see *why* a session stopped, not so a process can carry the
+    halt forward: a snapshot carrying one refuses to resume. That is the same fail-closed
+    treatment :attr:`positions` and :attr:`position_risk` get, and for the same reason — the
+    portfolio engine is flat-start, so a resumed process would rebuild an account with no
+    memory of what halted it and begin trading again.
+
+    Empty for every session the platform has run.
     """
 
     last_bar: MarketBar | None = None

@@ -513,6 +513,8 @@ class RiskCheckCode(StrEnum):
     MAX_POSITION_COUNT = "max_position_count"
     MAX_EXPOSURE = "max_exposure"
     PROTECTIVE_STOP = "protective_stop"
+    TAKE_PROFIT = "take_profit"
+    TIME_STOP = "time_stop"
     RISK_BUDGET = "risk_budget"
     MAX_SYMBOL_EXPOSURE = "max_symbol_exposure"
     MARKET_BUY_CAP = "market_buy_cap"

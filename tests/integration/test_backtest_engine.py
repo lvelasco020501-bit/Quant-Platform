@@ -1415,9 +1415,11 @@ def test_a_loss_realised_on_a_bar_gates_that_bar_rather_than_the_next() -> None:
 # but a structure nobody pinned is a structure that gets reordered.
 
 
-def _m8a_backtest(**overrides: object) -> tuple[BacktestEngine, SpotPortfolioEngine]:
-    engine, _, portfolio = make_backtest(
-        strategy=BuyOnce(_Params()),
+def _m8a_backtest(
+    **overrides: object,
+) -> tuple[BacktestEngine, SimulatedBroker, SpotPortfolioEngine]:
+    overrides.setdefault("strategy", BuyOnce(_Params()))
+    engine, broker, portfolio = make_backtest(
         risk_budget=RiskBudget(
             risk_per_trade_pct=Decimal("0.01"),
             max_position_exposure_pct=Decimal("1"),
@@ -1427,14 +1429,14 @@ def _m8a_backtest(**overrides: object) -> tuple[BacktestEngine, SpotPortfolioEng
         initial_stop_distance_bps=Decimal(200),
         **overrides,  # type: ignore[arg-type]
     )
-    return engine, portfolio
+    return engine, broker, portfolio
 
 
 def test_a_trailing_level_raised_by_a_bar_does_not_fire_on_that_same_bar() -> None:
     # The bar rallies to 52 000 and closes back at 50 400. A trailing stop 200 bps under the
     # new high sits at 50 960, above that low — so applying it retroactively would close the
     # position on the very bar that created the level, at a price the account never had.
-    engine, portfolio = _m8a_backtest(
+    engine, _, portfolio = _m8a_backtest(
         trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
     )
     state = engine.begin()
@@ -1457,7 +1459,7 @@ def test_a_trailing_level_raised_by_a_bar_does_not_fire_on_that_same_bar() -> No
 def test_the_level_raised_by_one_bar_does_fire_on_the_next() -> None:
     # The other half. Without it the previous test would also pass for an engine that simply
     # never enforced a trailing stop at all.
-    engine, portfolio = _m8a_backtest(
+    engine, _, portfolio = _m8a_backtest(
         trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
     )
     state = engine.begin()
@@ -1482,7 +1484,7 @@ def test_the_anchor_survives_a_fill() -> None:
     # D1. The risk state is rebuilt from the position after every fill, and the rebuild used
     # to drop the anchor. Nothing noticed because nothing wrote it; a trailing stop would
     # have restarted from entry on every fill and trailed only the bars since the last one.
-    engine, _ = _m8a_backtest(
+    engine, _, _ = _m8a_backtest(
         trailing_activation_bps=Decimal(100),
         trailing_distance_bps=Decimal(200),
         max_open_positions=2,
@@ -1510,7 +1512,7 @@ def test_the_anchor_survives_a_fill() -> None:
 
 
 def test_moving_the_stop_preserves_when_the_position_opened() -> None:
-    engine, _ = _m8a_backtest(
+    engine, _, _ = _m8a_backtest(
         trailing_activation_bps=Decimal(100), trailing_distance_bps=Decimal(200)
     )
     state = engine.begin()
@@ -1534,7 +1536,7 @@ def test_moving_the_stop_preserves_when_the_position_opened() -> None:
 
 
 def test_a_latched_breaker_does_not_stop_a_trailing_exit() -> None:
-    engine, portfolio = _m8a_backtest(
+    engine, _, portfolio = _m8a_backtest(
         trailing_activation_bps=Decimal(100),
         trailing_distance_bps=Decimal(200),
         latch_total_drawdown=True,
@@ -1572,6 +1574,120 @@ def test_a_v1_run_moves_no_stop_because_it_has_none() -> None:
 
     for index in range(_WARMUP_BARS + 4):
         engine.advance(make_bar(index=index, close=Decimal(50_000) + Decimal(100) * index), state)
+
+    assert state.position_risk == {}
+    assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+
+
+# --- M8b: a target and a deadline, through the ordinary broker -----------------------------------
+
+
+def test_a_target_exit_fills_at_the_next_open_and_not_at_the_target() -> None:
+    # Same honesty as the stop. A target is where the position asked to leave, not a price
+    # anybody promised it; the fill lands wherever the next bar opens, and a gap through the
+    # target is worth whatever the gap is worth.
+    engine, _, portfolio = _m8a_backtest(take_profit_distance_bps=Decimal(200))
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(51_500),
+        ),
+        state,
+    )
+    engine.advance(make_bar(index=_WARMUP_BARS + 2, close=Decimal(53_000)), state)
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+    exit_fill = next(f for f in state.fills if f.side is OrderSide.SELL)
+    assert exit_fill.price == Decimal(53_000)
+
+
+def test_a_holding_limit_exits_on_the_bar_after_the_limit_completes() -> None:
+    engine, _, portfolio = _m8a_backtest(max_holding_bars=2)
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    # The entry filled on the bar at index _WARMUP_BARS, so that bar is the first held and
+    # the next completes the limit; the sell it authorises settles one bar later.
+    assert [p for p in portfolio.positions() if p.is_open] != []
+
+    # The bar after the fill completes the two-bar limit and authorises the sell; the bar
+    # after that is where it settles, at that bar's open.
+    engine.advance(make_bar(index=_WARMUP_BARS + 1, close=Decimal(50_000)), state)
+    assert [p for p in portfolio.positions() if p.is_open] != []
+
+    engine.advance(make_bar(index=_WARMUP_BARS + 2, close=Decimal(50_000)), state)
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+
+
+def test_a_forced_exit_and_a_strategy_exit_on_one_bar_sell_the_position_once() -> None:
+    # Risk authorises first and the broker reserves the base asset, so the strategy's own
+    # exit has nothing left to sell. The single sell is the property that matters; that it
+    # is enforced by the reservation rather than by a conflict check is recorded in the
+    # milestone report, because being right for an incidental reason is worth knowing.
+    engine, _, portfolio = _m8a_backtest(
+        strategy=BuyThenSell(_Params()), take_profit_distance_bps=Decimal(200)
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(51_500),
+        ),
+        state,
+    )
+    engine.advance(make_bar(index=_WARMUP_BARS + 2, close=Decimal(51_500)), state)
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+    assert len([f for f in state.fills if f.side is OrderSide.SELL]) == 1
+
+
+def test_a_latched_breaker_does_not_stop_a_target_exit() -> None:
+    engine, _, portfolio = _m8a_backtest(
+        take_profit_distance_bps=Decimal(200),
+        latch_total_drawdown=True,
+        max_total_drawdown_pct=Decimal("0.001"),
+        max_daily_drawdown_pct=Decimal("0.001"),
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS + 1,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(51_500),
+        ),
+        state,
+    )
+    engine.advance(make_bar(index=_WARMUP_BARS + 2, close=Decimal(51_500)), state)
+
+    assert [p for p in portfolio.positions() if p.is_open] == []
+
+
+def test_a_v1_run_has_no_target_and_no_deadline() -> None:
+    engine, _, portfolio = make_backtest(
+        strategy=BuyOnce(_Params()),
+        take_profit_distance_bps=Decimal(200),
+        max_holding_bars=1,
+    )
+    state = engine.begin()
+
+    for index in range(_WARMUP_BARS + 4):
+        engine.advance(make_bar(index=index, close=Decimal(50_000) + Decimal(500) * index), state)
 
     assert state.position_risk == {}
     assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]

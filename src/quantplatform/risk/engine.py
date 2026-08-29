@@ -362,19 +362,67 @@ class StandardRiskEngine:
                         msg, symbol=position.symbol, stop_kind=state.stop.kind.value
                     )
                 continue
-            # A stop at the price is a stop reached: requiring a strict breach would mean
-            # the one bar that traded exactly at the level did not count.
-            if bar.low <= trigger:
+            reason = self._exit_reason(state, bar, trigger)
+            if reason is not None:
                 actions.append(
                     RiskAction(
                         kind=RiskActionKind.CLOSE,
                         symbol=position.symbol,
                         quantity=position.quantity,
-                        reason=(f"the bar low {bar.low} reached the protective stop {trigger}"),
-                        triggered_by=RiskCheckCode.PROTECTIVE_STOP,
+                        reason=reason[1],
+                        triggered_by=reason[0],
                     )
                 )
         return tuple(actions)
+
+    def _exit_reason(
+        self, state: PositionRiskState, bar: MarketBar, trigger: Decimal
+    ) -> tuple[RiskCheckCode, str] | None:
+        """Return the one reason this bar ends the position, or ``None`` if it does not.
+
+        At most one, in a fixed order, because a position can only be sold once. Several
+        conditions on one bar used to mean several actions and therefore several sells; the
+        surplus was refused for want of an unreserved balance, which is the right outcome
+        reached by accident and reported as something else.
+
+        The order is what the reasons *mean* rather than what they cost. Every exit here
+        becomes the same market sell filled at the next bar's open, so the choice changes
+        the record and not the money — and without intrabar data the record should assume
+        the worse of two events happened first. A bar whose low reached the stop and whose
+        high reached the target is therefore recorded as a stop-out: choosing the target
+        would be choosing the favourable half of an ambiguity, every time.
+        """
+        # A level at the price is a level reached, for both directions: requiring a strict
+        # breach would mean the one bar that traded exactly there did not count.
+        if bar.low <= trigger:
+            return (
+                RiskCheckCode.PROTECTIVE_STOP,
+                f"the bar low {bar.low} reached the protective stop {trigger}",
+            )
+        target = self._take_profit_price(state)
+        if target is not None and bar.high >= target:
+            return (
+                RiskCheckCode.TAKE_PROFIT,
+                f"the bar high {bar.high} reached the take-profit target {target}",
+            )
+        limit = self._config.max_holding_bars
+        if limit is not None:
+            held = (bar.close_time - state.opened_at).total_seconds()
+            if held >= (limit - 1) * bar.timeframe.seconds:
+                return (
+                    RiskCheckCode.TIME_STOP,
+                    f"the position has been held for its full {limit}-bar limit",
+                )
+        return None
+
+    def _take_profit_price(self, state: PositionRiskState) -> Decimal | None:
+        """Return the level this position would take profit at, if one is configured."""
+        distance = self._config.take_profit_distance_bps
+        if distance is None:
+            return None
+        with localcontext() as ctx:
+            ctx.prec = DECIMAL_WORKING_PRECISION
+            return state.entry_price + apply_basis_points(state.entry_price, distance)
 
     def _decide(
         self, intent: OrderIntent, context: RiskContext, *, forced_exit: bool = False

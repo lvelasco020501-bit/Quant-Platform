@@ -124,6 +124,25 @@ class RiskConfiguration(BaseModel):
     :func:`~quantplatform.risk.sizing.break_even_price`.
     """
 
+    take_profit_distance_bps: NonNegativeMoney | None = Field(default=None, le=_MAX_BASIS_POINTS)
+    """Advance above the entry at which a position takes its profit and leaves.
+
+    Measured from what the position actually paid — the fee-inclusive average entry — rather
+    than from the reference price the intent was sized against, for the reason M5b restated
+    risk from real fills: the two differ whenever a cap, a rounding or a slippage moved the
+    execution, and a target measured from the second describes a position nobody opened.
+    """
+
+    max_holding_bars: int | None = Field(default=None, ge=1)
+    """Bars a position may stay open before it is closed regardless of price.
+
+    Counted in bars rather than seconds because bars are the unit the data arrives in: the
+    same limit expressed in seconds would silently mean something different on a different
+    timeframe while the configuration looked unchanged. The bar an entry filled on is the
+    first bar held, so a limit of one is complete when that bar closes — and, like every
+    trigger here, the sell it authorises settles at the *next* bar's open.
+    """
+
     latch_total_drawdown: bool = False
     """Whether breaching :attr:`max_total_drawdown_pct` latches instead of merely refusing.
 

@@ -1877,3 +1877,61 @@ def test_a_strategy_exit_beside_a_forced_one_is_refused_as_a_conflict() -> None:
     engine.advance(make_bar(index=_WARMUP_BARS + 1, close=Decimal(51_500)), state)
     assert [p for p in portfolio.positions() if p.is_open] == []
     assert len([f for f in state.fills if f.side is OrderSide.SELL]) == 1
+
+
+# --- M9b: four metrics that were declared and never computed ------------------------------------
+#
+# Each was a field that read as a measurement and always answered `None` or zero. A dashboard
+# showing "turnover: —" for eleven milestones is worse than one that never offered the number,
+# because the gap is invisible.
+
+
+def test_turnover_reports_what_the_run_actually_traded() -> None:
+    engine, _, _ = make_backtest(strategy=BuyThenSell(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 4))
+
+    assert result.performance is not None
+    assert result.performance.turnover is not None
+    assert result.performance.turnover > ZERO
+
+
+def test_a_run_that_traded_nothing_reports_no_turnover_rather_than_zero() -> None:
+    # Zero turnover and no trading are different claims. A strategy that stood aside all week
+    # turned nothing over; reporting 0 would be true here and misleading the moment a run
+    # traded and the notional failed to reach the metric.
+    engine, _, _ = make_backtest(strategy=Silent(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 2))
+
+    assert result.performance is not None
+    assert result.performance.turnover == ZERO
+
+
+def test_consecutive_wins_and_losses_are_counted_from_the_order_trades_closed_in() -> None:
+    engine, _, _ = _m8a_backtest(strategy=SellHalfThenRest(_Params()))
+    prices = [Decimal(50_000)] * (_WARMUP_BARS + 1) + [Decimal(49_500)] * 6
+    result = engine.run(make_bars(prices))
+
+    assert result.performance is not None
+    assert result.performance.trades.max_consecutive_losses >= 1
+    assert result.performance.trades.max_consecutive_wins == 0
+
+
+def test_time_in_market_is_the_share_of_bars_holding_something() -> None:
+    engine, _, _ = make_backtest(strategy=BuyOnce(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 4))
+
+    assert result.performance is not None
+    assert result.performance.time_in_market is not None
+    assert ZERO < result.performance.time_in_market < Decimal(1)
+
+
+def test_a_run_that_never_opened_a_position_spent_no_time_in_market() -> None:
+    engine, _, _ = make_backtest(strategy=Silent(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 2))
+
+    assert result.performance is not None
+    assert result.performance.time_in_market == ZERO

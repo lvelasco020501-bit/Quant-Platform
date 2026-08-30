@@ -20,6 +20,7 @@ from quantplatform.core.models.orders import ApprovedOrder, Fill, Order, OrderIn
 from quantplatform.core.models.portfolio import PortfolioSnapshot
 from quantplatform.core.models.risk import RiskDecision
 from quantplatform.core.models.signals import Signal
+from quantplatform.core.models.trades import ClosedTrade
 
 __all__ = ["BacktestResult", "BarOutcome", "ComponentCallCounts"]
 
@@ -81,6 +82,12 @@ class BacktestResult:
     approved_orders: tuple[ApprovedOrder, ...] = ()
     orders: tuple[Order, ...] = ()
     fills: tuple[Fill, ...] = ()
+    trades: tuple[ClosedTrade, ...] = ()
+    """Every position lifecycle that returned to flat, with what it risked opening.
+
+    Distinct from :attr:`fills`: a fill is an execution, a trade is an outcome. Only the
+    second can be right or wrong, which is why every round-trip statistic counts these."""
+
     events: tuple[DomainEvent, ...] = ()
     """Every event any component emitted, in the exact order the run produced them."""
 

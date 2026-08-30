@@ -35,6 +35,7 @@ from quantplatform.backtesting.metrics import (
     PerformanceSummary,
     TradeStatistics,
     compute_performance,
+    longest_streaks,
 )
 from quantplatform.backtesting.results import BacktestResult, BarOutcome, ComponentCallCounts
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
@@ -155,6 +156,15 @@ class RunState:
     day_started_at: date | None
     commission: Decimal
     slippage: Decimal
+    traded_notional: Decimal
+    """Quote-asset notional executed across every fill, which turnover divides by equity.
+
+    Accumulated here because nothing else sees every fill. The metric has existed since the
+    performance summary did and has reported ``None`` in every run ever made, because no
+    caller had this number to give it."""
+
+    exposed_bars: int
+    """Bars that closed holding something, for time in market."""
     trade_results: list[ClosedTrade]
     calls: dict[str, int]
 
@@ -365,6 +375,8 @@ class BacktestEngine:
         state.events.extend(events)
 
         final_snapshot = self._snapshot(bar, state)
+        if any(position.is_open for position in final_snapshot.positions):
+            state.exposed_bars += 1
         self._append_equity_point(final_snapshot, state)
         state.snapshots.append(final_snapshot)
         state.outcomes.append(
@@ -669,6 +681,7 @@ class BacktestEngine:
         """
         for fill in fills:
             state.commission += fill.fee
+            state.traded_notional += fill.notional
             order = self._broker.get_order(fill.client_order_id)
             if order.order_type is not OrderType.MARKET:
                 continue
@@ -1063,6 +1076,8 @@ class BacktestEngine:
             day_started_at=None,
             commission=ZERO,
             slippage=ZERO,
+            traded_notional=ZERO,
+            exposed_bars=0,
             trade_results=[],
             calls={
                 "feature_computations": 0,
@@ -1087,6 +1102,7 @@ class BacktestEngine:
             periods_per_year=self._config.periods_per_year,
             risk_free_rate=self._config.risk_free_rate,
             minimum_periods_for_ratios=self._config.minimum_periods_for_ratios,
+            traded_notional=ZERO,
         )
 
     def _build_result(self, state: RunState) -> BacktestResult:
@@ -1103,6 +1119,8 @@ class BacktestEngine:
             periods_per_year=self._config.periods_per_year,
             risk_free_rate=self._config.risk_free_rate,
             minimum_periods_for_ratios=self._config.minimum_periods_for_ratios,
+            traded_notional=state.traded_notional,
+            exposed_bars=state.exposed_bars,
         )
         return BacktestResult(
             config=self._config,
@@ -1115,6 +1133,7 @@ class BacktestEngine:
             approved_orders=tuple(state.approved),
             orders=tuple(state.orders),
             fills=tuple(state.fills),
+            trades=tuple(state.trade_results),
             events=tuple(state.events),
             calls=ComponentCallCounts(**state.calls),
             performance=performance,
@@ -1129,6 +1148,7 @@ def _trade_statistics(trades: Sequence[ClosedTrade]) -> TradeStatistics:
     multiples = [
         multiple for multiple in (trade.r_multiple for trade in trades) if multiple is not None
     ]
+    streak_wins, streak_losses = longest_streaks(trades)
     wins = [value for value in results if value > ZERO]
     losses = [value for value in results if value < ZERO]
     gross_profit = sum(wins, start=ZERO)
@@ -1145,6 +1165,8 @@ def _trade_statistics(trades: Sequence[ClosedTrade]) -> TradeStatistics:
         average_loss=gross_loss / Decimal(len(losses)) if losses else None,
         profit_factor=gross_profit / gross_loss if gross_loss > ZERO else None,
         expectancy=sum(results, start=ZERO) / Decimal(count) if count else None,
+        max_consecutive_wins=streak_wins,
+        max_consecutive_losses=streak_losses,
         # R is reported only over the trades that recorded a denominator. A run where none
         # did reports nothing rather than zero: zero would read as "every trade broke even
         # against its risk", which is a claim about trading rather than about missing data.

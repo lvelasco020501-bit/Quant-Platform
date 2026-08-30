@@ -18,6 +18,7 @@ from pydantic import ConfigDict, Field
 
 from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ONE, ZERO
 from quantplatform.core.models.base import DomainModel, UtcDatetime
+from quantplatform.core.models.trades import ClosedTrade
 from quantplatform.core.numeric import Money
 
 __all__ = ["EquityPoint", "PerformanceSummary", "TradeStatistics", "compute_performance"]
@@ -141,6 +142,18 @@ class PerformanceSummary(DomainModel):
     bars_processed: int
     duration_seconds: int
 
+    time_in_market: Money | None = None
+    """Share of processed bars at whose close the account held something.
+
+    Counted in bars rather than in elapsed time: a gap in the feed is not time spent holding
+    a position, and on any timeframe the two figures agree only when nothing is missing —
+    which is exactly the case where the distinction would not have mattered.
+
+    Any exposure counts as exposure. A version weighted by position size will be a *different*
+    metric under a different name when several positions become possible, not a redefinition
+    of this one, or every series recorded before that day would stop being comparable.
+    """
+
     turnover: Money | None = None
     """Total traded notional over initial equity.
 
@@ -165,6 +178,7 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
     risk_free_rate: Decimal,
     minimum_periods_for_ratios: int,
     traded_notional: Decimal | None = None,
+    exposed_bars: int = 0,
 ) -> PerformanceSummary:
     """Summarise a completed run.
 
@@ -179,6 +193,7 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
         periods_per_year: Bars per year, for annualisation.
         risk_free_rate: Annualised risk-free rate.
         minimum_periods_for_ratios: Return observations below which ratios are not computed.
+        exposed_bars: Bars that closed holding something, for time in market.
         traded_notional: Total quote-asset notional executed across every fill, for turnover.
             Optional so that callers predating this metric keep working and receive ``None``
             rather than a fabricated zero.
@@ -221,6 +236,7 @@ def compute_performance(  # noqa: PLR0913 - a summary is defined by exactly thes
         bars_processed=len(curve),
         duration_seconds=duration,
         turnover=turnover,
+        time_in_market=time_in_market(exposed_bars=exposed_bars, bars_processed=len(curve)),
     )
 
 
@@ -320,3 +336,47 @@ def _cagr(initial_equity: Decimal, final_equity: Decimal, duration_seconds: int)
 
 
 _SECONDS_PER_YEAR = 365 * 86_400
+
+
+def longest_streaks(trades: Sequence[ClosedTrade]) -> tuple[int, int]:
+    """Return the longest unbroken runs of winning and of losing trades.
+
+    A trade that broke exactly even breaks both runs. It is neither a win nor a loss, and
+    letting it continue either would report a streak that did not happen — while which of the
+    two it extended would come down to an arbitrary choice nobody could defend.
+
+    Args:
+        trades: Closed round trips, in the order they closed.
+
+    Returns:
+        ``(longest_wins, longest_losses)``, both zero when nothing closed.
+    """
+    best_wins = best_losses = wins = losses = 0
+    for trade in trades:
+        if trade.realized_pnl > ZERO:
+            wins, losses = wins + 1, 0
+        elif trade.realized_pnl < ZERO:
+            wins, losses = 0, losses + 1
+        else:
+            wins = losses = 0
+        best_wins = max(best_wins, wins)
+        best_losses = max(best_losses, losses)
+    return best_wins, best_losses
+
+
+def time_in_market(*, exposed_bars: int, bars_processed: int) -> Decimal | None:
+    """Return the share of processed bars at whose close something was held.
+
+    Args:
+        exposed_bars: Bars that closed with an open position.
+        bars_processed: Bars the run consumed, which is the denominator.
+
+    Returns:
+        The share, or ``None`` when nothing was processed — a run with no bars has no
+        exposure to report, and zero would claim it stood aside rather than never started.
+    """
+    if bars_processed <= 0:
+        return None
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        return Decimal(exposed_bars) / Decimal(bars_processed)

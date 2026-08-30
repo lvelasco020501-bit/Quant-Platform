@@ -83,8 +83,12 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     "backtesting": frozenset(
         {"core", "config", "data", "execution", "features", "portfolio", "risk", "strategies"}
     ),
+    # Research describes experiments and measures them. It embeds a risk configuration, so
+    # it sees `risk`; it never sees `execution`, which is what keeps it from being able to
+    # compose an engine and become a second orchestrator. A composition root supplies one
+    # through a port instead.
     "research": frozenset(
-        {"core", "config", "backtesting", "data", "features", "storage", "strategies"}
+        {"core", "config", "backtesting", "data", "features", "risk", "storage", "strategies"}
     ),
     # Composition roots may wire everything together.
     "orchestration": DOMAINS,
@@ -992,3 +996,24 @@ def test_only_the_allowlisted_modules_use_threading() -> None:
             if "threading" in _imported_root_modules(node):
                 offenders.append(relative)
     assert not offenders, f"threading imported outside the allowlist: {offenders}"
+
+
+def test_research_never_composes_the_trading_chain() -> None:
+    # Research defines experiments and measures them; it does not decide what happens in
+    # what order. Building an engine needs strategies, risk and execution together, which is
+    # the definition of an orchestrator — so the harness asks a composition root for one
+    # instead, through a port, exactly as every other boundary here works.
+    for path in _source_files():
+        if _domain_of(path) != "research":
+            continue
+        assert "execution" not in _imported_domains(path), path
+
+
+def test_nothing_in_the_platform_imports_research() -> None:
+    # A leaf. If a trading path could reach the harness, an experiment could influence a
+    # decision, and the record would stop being an observation of the system.
+    for path in _source_files():
+        domain = _domain_of(path)
+        if domain in {"research", "orchestration", "api", "cli"} or domain is None:
+            continue
+        assert "research" not in _imported_domains(path), path

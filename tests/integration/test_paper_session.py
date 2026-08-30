@@ -14,9 +14,10 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from quantplatform.core.clock import SimulatedClock
-from quantplatform.core.enums import CircuitBreakerReason, StopKind
+from quantplatform.core.enums import CircuitBreakerReason, ExecutionMode, StopKind
 from quantplatform.core.errors import (
     DataIntegrityError,
     PaperSessionStateError,
@@ -785,7 +786,8 @@ def _risk_state(symbol: str = SYMBOL, **overrides: object) -> PositionRiskState:
         "symbol": symbol,
         "stop": StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
         "quantity": Decimal("0.5"),
-        "risk_amount": Decimal("100"),
+        "initial_risk_amount": Decimal("100"),
+        "current_risk_amount": Decimal("100"),
         "entry_price": Decimal("72000"),
         "opened_at": ANCHOR,
     }
@@ -842,7 +844,7 @@ def test_a_persisted_risk_state_round_trips_through_json() -> None:
     )
 
     assert restored.position_risk == (_risk_state(),)
-    assert restored.position_risk[0].risk_amount == Decimal("100")
+    assert restored.position_risk[0].initial_risk_amount == Decimal("100")
     assert restored.position_risk[0].stop.trigger_price == Decimal("70000")
 
 
@@ -1019,3 +1021,70 @@ def test_a_moved_stop_and_its_anchor_survive_the_snapshot_round_trip() -> None:
     assert risk.stop.kind is StopKind.TRAILING
     assert risk.stop.trigger_price == Decimal(52_000) * Decimal("0.98")
     assert risk.highest_price_seen == Decimal(52_000)
+
+
+# --- M9a: the snapshot says which shape it is ---------------------------------------------------
+
+
+def test_a_historical_snapshot_without_a_version_loads_as_version_one() -> None:
+    # The three real files on disk predate every field added since M3. They load because each
+    # of those fields defaults to the value that was historically true — which was luck, not
+    # design, and is exactly what a version number stops depending on.
+    stored = PaperSessionState.model_validate(
+        {
+            "session_id": "paper-legacy",
+            "strategy_id": "ema_trend",
+            "execution_mode": ExecutionMode.PAPER,
+            "quote_asset": "USDT",
+            "started_at": ANCHOR,
+            "saved_at": ANCHOR,
+        }
+    )
+
+    assert stored.schema_version == 1
+    assert stored.position_risk == ()
+    assert stored.breakers == ()
+
+
+def test_a_version_one_snapshot_carrying_risk_state_is_refused() -> None:
+    # A v1 file cannot contain a risk state whose field names v1 never had. Loading it would
+    # mean guessing which of `risk_amount` and `initial_risk_amount` the numbers meant.
+    with pytest.raises(ValidationError, match="schema_version"):
+        PaperSessionState.model_validate(
+            {
+                "session_id": "paper-legacy",
+                "strategy_id": "ema_trend",
+                "execution_mode": ExecutionMode.PAPER,
+                "quote_asset": "USDT",
+                "started_at": ANCHOR,
+                "saved_at": ANCHOR,
+                "schema_version": 1,
+                "position_risk": [_risk_state().model_dump(mode="json")],
+            }
+        )
+
+
+def test_a_current_snapshot_round_trips_at_version_two() -> None:
+    session, clock, repository, _ = _session(
+        strategy=BuyOnce(_Params()),
+        risk_budget=RiskBudget(
+            risk_per_trade_pct=Decimal("0.01"),
+            max_position_exposure_pct=Decimal("1"),
+            min_stop_distance_bps=Decimal(1),
+            max_stop_distance_bps=Decimal(10_000),
+        ),
+        initial_stop_distance_bps=Decimal(200),
+    )
+    session.start()
+    _feed_bars(session, clock, make_bars([Decimal(50_000)] * (_WARMUP_BARS + 2)))
+    session.save()
+
+    stored = repository.load("paper-1")
+
+    assert stored is not None
+    assert stored.schema_version == 2
+    (risk,) = stored.position_risk
+    assert risk.initial_risk_amount > Decimal(0)
+    assert risk.current_risk_amount > Decimal(0)
+    repository.save(stored)
+    assert repository.load("paper-1") == stored

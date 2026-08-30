@@ -16,6 +16,7 @@ import pytest
 from pydantic import BaseModel
 
 from quantplatform.backtesting.engine import BacktestEngine, RunState
+from quantplatform.core.constants import ZERO
 from quantplatform.core.enums import (
     CircuitBreakerReason,
     CommissionModel,
@@ -25,6 +26,7 @@ from quantplatform.core.enums import (
     PositionState,
     RiskCheckCode,
     RiskCheckStatus,
+    RiskOutcome,
     SignalAction,
     StopKind,
     Timeframe,
@@ -49,6 +51,7 @@ from quantplatform.features import (
     NullFeaturePipeline,
 )
 from quantplatform.portfolio.engine import SpotPortfolioEngine
+from quantplatform.risk.sizing import open_risk_amount
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.registry import build_default_registry
 from tests.factories import (
@@ -821,7 +824,7 @@ def test_a_protected_entry_records_what_it_risks() -> None:
     risk = state.position_risk[SYMBOL]
     position = portfolio.positions()[0]
     assert risk.symbol == SYMBOL
-    assert risk.risk_amount > Decimal(0)
+    assert risk.initial_risk_amount > Decimal(0)
     assert risk.entry_price == position.avg_entry_price
 
 
@@ -1691,3 +1694,186 @@ def test_a_v1_run_has_no_target_and_no_deadline() -> None:
 
     assert state.position_risk == {}
     assert [p.symbol for p in portfolio.positions() if p.is_open] == [SYMBOL]
+
+
+# --- M9a: what a position risked, and what it still risks ---------------------------------------
+#
+# The denominator of an R-multiple has to survive the position it describes. It used to be
+# restated on every fill and deleted the moment the position went flat — before anything had a
+# chance to record the trade it belonged to — so R could not be computed at all, and would have
+# meant something different per trade if it had been.
+
+
+class SellHalfThenRest(BaseStrategy):
+    """Reduces once, then closes, so a position exists at three different sizes."""
+
+    METADATA: ClassVar[StrategyMetadata] = _metadata("sell_half_then_rest")
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        if context.position_state is PositionState.FLAT and context.history_length == _WARMUP_BARS:
+            return (
+                self.build_signal(
+                    context=context,
+                    action=SignalAction.ENTER_LONG,
+                    confidence=Decimal("0.9"),
+                    reason="entry",
+                ),
+            )
+        if context.position_state is PositionState.LONG:
+            return (
+                self.build_signal(
+                    context=context,
+                    action=SignalAction.EXIT_LONG,
+                    confidence=Decimal("0.9"),
+                    reason="exit",
+                ),
+            )
+        return ()
+
+
+def test_the_initial_risk_survives_a_reduction_while_the_current_risk_falls() -> None:
+    # The two questions the one field used to answer at once. A position half closed still
+    # opened risking what it opened risking; what it has at stake now is smaller.
+    engine, _, _ = _m8a_backtest(take_profit_distance_bps=Decimal(10_000))
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+    opening = state.position_risk[SYMBOL]
+
+    assert opening.initial_risk_amount == opening.current_risk_amount
+    assert opening.initial_risk_amount > ZERO
+
+
+def test_the_current_risk_is_the_postfill_figure_not_the_prefill_one() -> None:
+    # D4 reaching the record it corrupted. The figure stored against a position must be what
+    # closing it would actually cost, with the entry's commission counted once.
+    engine, _, portfolio = _m8a_backtest()
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 1):
+        engine.advance(bar, state)
+
+    recorded = state.position_risk[SYMBOL]
+    position = portfolio.positions()[0]
+    assert position.avg_entry_price is not None
+    assert recorded.current_risk_amount == open_risk_amount(
+        quantity=position.quantity,
+        avg_entry_price=position.avg_entry_price,
+        stop=recorded.stop,
+        policy=engine._risk.config.execution_policy,
+    )
+
+
+def test_a_closed_trade_carries_the_risk_the_position_opened_with() -> None:
+    # The retirement path. The risk state is deleted the moment the position goes flat, and
+    # the trade record is built afterwards, so without somewhere to put the denominator it
+    # was simply gone by the time anything wanted it.
+    engine, _, _ = _m8a_backtest(strategy=SellHalfThenRest(_Params()))
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 4):
+        engine.advance(bar, state)
+
+    assert len(state.trade_results) == 1
+    trade = state.trade_results[0]
+    assert trade.symbol == SYMBOL
+    assert trade.initial_risk_amount is not None
+    assert trade.initial_risk_amount > ZERO
+    assert state.retired_risk == {}
+
+
+def test_a_losing_trade_reports_a_negative_r_and_a_winning_one_a_positive_r() -> None:
+    losing, _, _ = _m8a_backtest(strategy=SellHalfThenRest(_Params()))
+    state = losing.begin()
+    prices = [Decimal(50_000)] * (_WARMUP_BARS + 1) + [Decimal(49_500)] * 3
+    for bar in make_bars(prices):
+        losing.advance(bar, state)
+
+    trade = state.trade_results[0]
+    assert trade.realized_pnl < ZERO
+    assert trade.r_multiple is not None
+    assert trade.r_multiple < ZERO
+
+
+def test_a_v1_trade_reports_no_r_because_it_recorded_no_risk() -> None:
+    # Not zero. Zero would read as "this trade broke even against its risk", which is a
+    # different and false claim about a run that never measured risk at all.
+    engine, _, _ = make_backtest(strategy=BuyThenSell(_Params()))
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS + 4):
+        engine.advance(bar, state)
+
+    assert len(state.trade_results) == 1
+    assert state.trade_results[0].initial_risk_amount is None
+    assert state.trade_results[0].r_multiple is None
+
+
+def test_average_r_is_reported_once_trades_carry_a_denominator() -> None:
+    engine, _, _ = _m8a_backtest(strategy=SellHalfThenRest(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 4))
+
+    assert result.performance is not None
+    assert result.performance.trades.average_r is not None
+    assert result.performance.trades.expectancy_r is not None
+
+
+def test_a_v1_run_reports_no_r_at_all() -> None:
+    engine, _, _ = make_backtest(strategy=BuyThenSell(_Params()))
+
+    result = engine.run(_flat_bars(_WARMUP_BARS + 4))
+
+    assert result.performance is not None
+    assert result.performance.trades.count == 1
+    assert result.performance.trades.average_r is None
+    assert result.performance.trades.expectancy_r is None
+
+
+# --- M9a: a working order is visible before its balance is consumed ------------------------------
+
+
+def test_a_working_order_makes_its_symbol_visible_to_the_next_decision() -> None:
+    engine, broker, _ = _m8a_backtest()
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS):
+        engine.advance(bar, state)
+
+    working = broker.open_orders()
+    context = engine._risk_context(
+        _flat_bars(1)[0], engine._snapshot(_flat_bars(1)[0], state), state
+    )
+    assert {order.symbol for order in working} == set(context.open_order_symbols)
+
+
+def test_a_strategy_exit_beside_a_forced_one_is_refused_as_a_conflict() -> None:
+    # It was already refused, but for want of an unreserved balance — the right outcome
+    # reported as a quantity failure. A reader of the decision could not tell that an exit
+    # was already in flight, which is the one fact that explains the refusal.
+    #
+    # Both exits have to land on the same bar, so the target is reached on the very bar the
+    # entry fills: risk closes the position, and the strategy — seeing itself long for the
+    # first time — asks to close it too.
+    engine, _, portfolio = _m8a_backtest(
+        strategy=BuyThenSell(_Params()), take_profit_distance_bps=Decimal(200)
+    )
+    state = engine.begin()
+    for bar in _flat_bars(_WARMUP_BARS):
+        engine.advance(bar, state)
+    engine.advance(
+        make_bar(
+            index=_WARMUP_BARS,
+            open_price=Decimal(50_000),
+            high=Decimal(52_000),
+            low=Decimal(49_900),
+            close=Decimal(51_500),
+        ),
+        state,
+    )
+
+    refused = [d for d in state.decisions if d.outcome is RiskOutcome.REJECTED]
+    assert refused
+    assert RiskCheckCode.CONFLICTING_ORDER in {
+        check.code for check in refused[-1].checks if check.blocks
+    }
+
+    engine.advance(make_bar(index=_WARMUP_BARS + 1, close=Decimal(51_500)), state)
+    assert [p for p in portfolio.positions() if p.is_open] == []
+    assert len([f for f in state.fills if f.side is OrderSide.SELL]) == 1

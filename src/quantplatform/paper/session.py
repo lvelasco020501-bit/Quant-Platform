@@ -41,7 +41,7 @@ from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
 from quantplatform.core.interfaces import PaperStateRepository
 from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.market import MarketBar
-from quantplatform.core.models.paper import PaperSessionState
+from quantplatform.core.models.paper import CURRENT_SCHEMA_VERSION, PaperSessionState
 from quantplatform.core.models.portfolio import PortfolioSnapshot
 from quantplatform.core.models.telemetry import (
     ZERO_FEED_METRICS,
@@ -573,6 +573,7 @@ class PaperTradingSession:
         started = self._clock.started_at or self._clock.mark_start()
         snapshot = self._portfolio_snapshot()
         return PaperSessionState(
+            schema_version=CURRENT_SCHEMA_VERSION,
             session_id=self._session_id,
             strategy_id=self._engine.strategy_id,
             execution_mode=self._config.execution_mode,

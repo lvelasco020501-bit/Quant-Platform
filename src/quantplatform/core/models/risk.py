@@ -391,11 +391,28 @@ class PositionRiskState(DomainModel):
     not be checked against the position it belongs to.
     """
 
-    risk_amount: NonNegativeMoney = Field(gt=0)
-    """Quote-asset amount at risk at entry: the denominator of every R-multiple.
+    initial_risk_amount: NonNegativeMoney = Field(gt=0)
+    """What this position risked when it opened: the denominator of every R-multiple.
 
-    Strictly positive. A recorded risk of zero would make R undefined by division and would
+    Fixed at the opening fill and never restated. It used to share a field with the figure
+    below, which *is* restated on every fill, so R changed meaning each time a position was
+    reduced — a denominator that moves makes two trades incomparable while looking like one
+    number.
+
+    Strictly positive: a recorded risk of zero would make R undefined by division and would
     claim protection where none was purchased.
+
+    A scale-in does not update it. R is therefore measured against what the position opened
+    risking, which is a limitation rather than a decision — no shipped strategy can scale in,
+    and the policy for one belongs with whatever introduces it.
+    """
+
+    current_risk_amount: NonNegativeMoney = Field(gt=0)
+    """What the size still open would lose at its stop, restated after every fill.
+
+    The operational figure: what is at stake right now. It falls when a position is reduced
+    and moves when its stop moves, which is exactly why it cannot also serve as the fixed
+    denominator above.
     """
 
     entry_price: Price

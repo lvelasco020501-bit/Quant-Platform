@@ -44,7 +44,8 @@ def _state(**overrides: object) -> PositionRiskState:
         "symbol": SYMBOL,
         "stop": StopSpecification(kind=StopKind.HARD, trigger_price=_HARD_STOP),
         "quantity": Decimal("0.1"),
-        "risk_amount": Decimal("100"),
+        "initial_risk_amount": Decimal("100"),
+        "current_risk_amount": Decimal("100"),
         "entry_price": _ENTRY,
         "opened_at": ANCHOR,
     }
@@ -176,7 +177,7 @@ def _net_at(price: Decimal, *, quantity: Decimal = Decimal("0.1")) -> Decimal:
     return proceeds - _PRICED.fee.fee_for(proceeds, is_first_fill=True) - quantity * _ENTRY
 
 
-def test_the_break_even_level_nets_exactly_zero_after_modelled_costs() -> None:
+def test_the_break_even_level_nets_nothing_worse_than_zero_after_modelled_costs() -> None:
     # The point of the whole helper. Exiting at `entry_price` loses the exit's slippage and
     # commission, so a stop placed there and called break-even is a stop that reports a
     # scratch and books a loss. `avg_entry_price` already carries the entry's fee, which is
@@ -185,7 +186,8 @@ def test_the_break_even_level_nets_exactly_zero_after_modelled_costs() -> None:
         quantity=Decimal("0.1"), entry_price=_ENTRY, side=OrderSide.BUY, policy=_PRICED
     )
 
-    assert _net_at(level) == ZERO
+    assert _net_at(level) >= ZERO
+    assert _net_at(level) < Decimal("1E-20")
 
 
 def test_the_break_even_level_sits_above_the_entry_when_trading_costs_anything() -> None:

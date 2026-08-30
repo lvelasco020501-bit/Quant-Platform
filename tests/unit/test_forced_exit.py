@@ -77,7 +77,8 @@ def _risk_state(**overrides: object) -> PositionRiskState:
         "symbol": SYMBOL,
         "stop": StopSpecification(kind=StopKind.HARD, trigger_price=_STOP_PRICE),
         "quantity": Decimal("0.1"),
-        "risk_amount": Decimal("100"),
+        "initial_risk_amount": Decimal("100"),
+        "current_risk_amount": Decimal("100"),
         "entry_price": Decimal("50000"),
         "opened_at": ANCHOR,
     }

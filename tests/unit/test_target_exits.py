@@ -35,7 +35,8 @@ def _state(**overrides: object) -> PositionRiskState:
         "symbol": SYMBOL,
         "stop": StopSpecification(kind=StopKind.HARD, trigger_price=_HARD_STOP),
         "quantity": Decimal("0.1"),
-        "risk_amount": Decimal("100"),
+        "initial_risk_amount": Decimal("100"),
+        "current_risk_amount": Decimal("100"),
         "entry_price": _ENTRY,
         # A real `opened_at` is the *close* of the bar an entry filled on, never its
         # open: the broker stamps fills at the bar close. Anchoring to bar 0's close

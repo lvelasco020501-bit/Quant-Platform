@@ -67,11 +67,12 @@ from quantplatform.core.models.risk import (
 )
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.stops import StopSpecification
+from quantplatform.core.models.trades import ClosedTrade
 from quantplatform.core.symbol_rules import as_symbol_rules_store
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.risk.engine import StandardRiskEngine
-from quantplatform.risk.sizing import projected_stop_out_cost
+from quantplatform.risk.sizing import open_risk_amount
 from quantplatform.strategies.base import BaseStrategy
 
 __all__ = ["BacktestEngine", "RunState"]
@@ -117,6 +118,15 @@ class RunState:
     protection has none, which is a true statement where an entry claiming otherwise would
     not be.
     """
+    retired_risk: dict[str, PositionRiskState]
+    """Risk records whose positions have just gone flat, awaiting their trade record.
+
+    A position's risk is deleted the moment it closes, and the trade that closed it is built
+    afterwards — so without somewhere to put the denominator it was already gone by the time
+    anything wanted it. Held for exactly one step of one bar and consumed by
+    :meth:`_record_closed_trades`, which empties it.
+    """
+
     breakers: list[CircuitBreakerState]
     """Every circuit breaker currently latched, one entry per reason.
 
@@ -145,7 +155,7 @@ class RunState:
     day_started_at: date | None
     commission: Decimal
     slippage: Decimal
-    trade_results: list[Decimal]
+    trade_results: list[ClosedTrade]
     calls: dict[str, int]
 
 
@@ -536,6 +546,7 @@ class BacktestEngine:
         self, bar: MarketBar, snapshot: PortfolioSnapshot, state: RunState
     ) -> RiskContext:
         """Assemble everything the risk engine observes, entirely from run state."""
+        working = self._broker.open_orders()
         return RiskContext(
             as_of=bar.close_time,
             health=self._health(bar),
@@ -544,7 +555,8 @@ class BacktestEngine:
             reference_price=bar.close,
             latest_bar_close_time=bar.close_time,
             latest_bar_is_closed=bar.is_closed,
-            open_order_count=len(self._broker.open_orders()),
+            open_order_count=len(working),
+            open_order_symbols=frozenset(order.symbol for order in working),
             pending_buy_notional=self._pending_buy_notional(state),
             approved_orders_last_hour=self._approvals_within(state, _SECONDS_PER_HOUR, bar),
             approved_orders_today=self._approvals_within(state, _SECONDS_PER_DAY, bar),
@@ -690,7 +702,9 @@ class BacktestEngine:
         for symbol in {fill.symbol for fill in fills}:
             position = held.get(symbol)
             if position is None or not position.is_open:
-                state.position_risk.pop(symbol, None)
+                retired = state.position_risk.pop(symbol, None)
+                if retired is not None:
+                    state.retired_risk[symbol] = retired
                 continue
             stop = self._approved_stop(symbol, fills, state)
             existing = state.position_risk.get(symbol)
@@ -718,14 +732,13 @@ class BacktestEngine:
                     has_entry_price=entry is not None,
                     has_opened_at=opened_at is not None,
                 )
-            risk_amount = projected_stop_out_cost(
+            current = open_risk_amount(
                 quantity=position.quantity,
-                entry_price=entry,
+                avg_entry_price=entry,
                 stop=stop,
-                side=OrderSide.BUY,
                 policy=self._risk.config.execution_policy,
             )
-            if risk_amount is None or risk_amount <= ZERO:
+            if current is None or current <= ZERO:
                 # Nothing computable, so nothing is claimed. Recording a position as
                 # protected without being able to say by how much is the failure this
                 # whole layer exists to prevent.
@@ -735,7 +748,12 @@ class BacktestEngine:
                 symbol=symbol,
                 stop=stop,
                 quantity=position.quantity,
-                risk_amount=risk_amount,
+                # Carried, never restated: what the position opened risking is the only
+                # denominator under which two trades can be compared.
+                initial_risk_amount=(
+                    existing.initial_risk_amount if existing is not None else current
+                ),
+                current_risk_amount=current,
                 entry_price=entry,
                 # Carried, not recomputed. The favourable extreme is a fact about the whole
                 # life of the position, and a rebuild that dropped it would restart a
@@ -839,8 +857,8 @@ class BacktestEngine:
 
         if config.max_consecutive_losses is not None:
             streak = 0
-            for result in reversed(state.trade_results):
-                if result >= ZERO:
+            for trade in reversed(state.trade_results):
+                if trade.realized_pnl >= ZERO:
                     break
                 streak += 1
             if streak >= config.max_consecutive_losses:
@@ -886,7 +904,20 @@ class BacktestEngine:
         for position in self._portfolio.positions():
             previous = state.positions.get(position.symbol)
             if previous is not None and previous.is_open and not position.is_open:
-                state.trade_results.append(position.realized_pnl)
+                retired = state.retired_risk.pop(position.symbol, None)
+                state.trade_results.append(
+                    ClosedTrade(
+                        symbol=position.symbol,
+                        realized_pnl=position.realized_pnl,
+                        initial_risk_amount=(
+                            retired.initial_risk_amount if retired is not None else None
+                        ),
+                        opened_at=retired.opened_at
+                        if retired is not None
+                        else (previous.opened_at or position.updated_at),
+                        closed_at=position.updated_at,
+                    )
+                )
             state.positions[position.symbol] = position
 
     # --- Setup and teardown ----------------------------------------------------------------------
@@ -1023,6 +1054,7 @@ class BacktestEngine:
             positions={},
             approved_by_id={},
             position_risk={},
+            retired_risk={},
             breakers=[],
             day_start_realized_pnl=ZERO,
             approval_times=[],
@@ -1091,8 +1123,12 @@ class BacktestEngine:
         )
 
 
-def _trade_statistics(results: Sequence[Decimal]) -> TradeStatistics:
+def _trade_statistics(trades: Sequence[ClosedTrade]) -> TradeStatistics:
     """Summarise closed round trips, leaving ratios undefined when nothing supports them."""
+    results = [trade.realized_pnl for trade in trades]
+    multiples = [
+        multiple for multiple in (trade.r_multiple for trade in trades) if multiple is not None
+    ]
     wins = [value for value in results if value > ZERO]
     losses = [value for value in results if value < ZERO]
     gross_profit = sum(wins, start=ZERO)
@@ -1109,4 +1145,9 @@ def _trade_statistics(results: Sequence[Decimal]) -> TradeStatistics:
         average_loss=gross_loss / Decimal(len(losses)) if losses else None,
         profit_factor=gross_profit / gross_loss if gross_loss > ZERO else None,
         expectancy=sum(results, start=ZERO) / Decimal(count) if count else None,
+        # R is reported only over the trades that recorded a denominator. A run where none
+        # did reports nothing rather than zero: zero would read as "every trade broke even
+        # against its risk", which is a claim about trading rather than about missing data.
+        average_r=sum(multiples, start=ZERO) / Decimal(len(multiples)) if multiples else None,
+        expectancy_r=sum(multiples, start=ZERO) / Decimal(len(multiples)) if multiples else None,
     )

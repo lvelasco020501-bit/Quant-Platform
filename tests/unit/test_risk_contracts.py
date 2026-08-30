@@ -162,12 +162,13 @@ def test_position_risk_state_records_what_was_actually_risked() -> None:
         symbol=SYMBOL,
         stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
         quantity=Decimal("0.05"),
-        risk_amount=Decimal("100"),
+        initial_risk_amount=Decimal("100"),
+        current_risk_amount=Decimal("100"),
         entry_price=Decimal("72000"),
         opened_at=ANCHOR,
     )
 
-    assert state.risk_amount == Decimal("100")
+    assert state.initial_risk_amount == Decimal("100")
     assert state.highest_price_seen is None
 
 
@@ -179,7 +180,8 @@ def test_a_position_risking_nothing_is_refused() -> None:
             symbol=SYMBOL,
             stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
             quantity=Decimal("0.05"),
-            risk_amount=Decimal(0),
+            initial_risk_amount=Decimal(0),
+            current_risk_amount=Decimal(0),
             entry_price=Decimal("72000"),
             opened_at=ANCHOR,
         )
@@ -339,7 +341,8 @@ def test_position_risk_state_round_trips_through_json() -> None:
         symbol=SYMBOL,
         stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("70000")),
         quantity=Decimal("0.05"),
-        risk_amount=Decimal("100.25"),
+        initial_risk_amount=Decimal("100.25"),
+        current_risk_amount=Decimal("100.25"),
         entry_price=Decimal("72000"),
         highest_price_seen=Decimal("73500"),
         opened_at=ANCHOR,
@@ -348,4 +351,4 @@ def test_position_risk_state_round_trips_through_json() -> None:
     restored = PositionRiskState.model_validate_json(state.model_dump_json())
 
     assert restored == state
-    assert restored.risk_amount == Decimal("100.25")
+    assert restored.initial_risk_amount == Decimal("100.25")

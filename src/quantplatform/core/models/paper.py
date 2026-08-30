@@ -26,11 +26,31 @@ from quantplatform.core.models.risk import CircuitBreakerState, PositionRiskStat
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot
 from quantplatform.core.numeric import Fee, Money
 
-__all__ = ["PaperSessionState"]
+__all__ = ["CURRENT_SCHEMA_VERSION", "PaperSessionState"]
+
+_RISK_SPLIT_SCHEMA_VERSION = 2
+"""Version at which a position's risk became two figures rather than one."""
+
+CURRENT_SCHEMA_VERSION = 2
+"""Shape this code writes. Every snapshot it produces says so explicitly, so a reader
+never has to infer a version from which fields happen to be present."""
 
 
 class PaperSessionState(DomainModel):
     """Everything needed to resume a paper session where it left off."""
+
+    schema_version: int = Field(default=1, ge=1)
+    """Shape of this snapshot, so a reader never has to infer one.
+
+    Absent means 1: the three sessions this platform has actually run predate every field
+    added since, and they load because each of those fields defaults to what was historically
+    true. That was luck rather than design — the next field whose default is *not* the
+    historical truth would misread them in silence.
+
+    Version 2 splits a position's risk into what it opened with and what it still carries. A
+    version-1 snapshot cannot contain either, so one that claims to is refused rather than
+    guessed at.
+    """
 
     session_id: Text
     strategy_id: Text
@@ -94,6 +114,23 @@ class PaperSessionState(DomainModel):
     if it had all happened today. ``None`` means no day has been reported yet, which is
     restored as a zero baseline — the same state a fresh session begins in.
     """
+
+    @model_validator(mode="after")
+    def _validate_version(self) -> Self:
+        """Check the snapshot's contents match the shape it claims.
+
+        Raises:
+            ValueError: If a version-1 snapshot carries state that only exists from version 2,
+                which would leave a reader guessing what its numbers meant.
+        """
+        if self.schema_version < _RISK_SPLIT_SCHEMA_VERSION and self.position_risk:
+            msg = (
+                "a snapshot at schema_version 1 cannot carry position risk: the split "
+                "between initial and current risk arrived with version 2, and reading these "
+                "numbers under either meaning would be a guess"
+            )
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _validate_timeline(self) -> Self:

@@ -425,12 +425,12 @@ def select_sizer(
 def projected_stop_out_cost(
     *,
     quantity: Decimal,
-    entry_price: Decimal,
+    valuation_price: Decimal,
     stop: StopSpecification,
     side: OrderSide,
     policy: ExecutionPolicy,
 ) -> Decimal | None:
-    """Return what being stopped out of an existing position would cost.
+    """Return what being stopped out would cost a position **not yet opened**.
 
     The same arithmetic :class:`RiskBasedSizer` sizes with, exposed so that the figure
     recorded against a position and the figure a position was sized to are computed by one
@@ -439,10 +439,13 @@ def projected_stop_out_cost(
     implementation of the shared middle would drift the first time either changed.
 
     Args:
-        quantity: Open size the cost is computed over.
-        entry_price: What the position actually paid, averaged across its fills.
-        stop: The level it is protected at.
-        side: Direction of the open position.
+        quantity: Size the cost is computed over.
+        valuation_price: The price the order is *valued* at, before any fill — fee-exclusive,
+            which is why the entry's commission is added below. Handing this an
+            ``avg_entry_price`` charges that commission twice, because the portfolio engine
+            already folds it in; use :func:`open_risk_amount` for a position that exists.
+        stop: The level it would be protected at.
+        side: Direction the position would take.
         policy: Fee and slippage assumptions, shared with the executing adapter.
 
     Returns:
@@ -456,9 +459,9 @@ def projected_stop_out_cost(
     at_zero = policy.fee.fee_for(ZERO, is_first_fill=True)
     with localcontext() as ctx:
         ctx.prec = DECIMAL_WORKING_PRECISION
-        entry_leg = policy.fee.fee_for(entry_price, is_first_fill=True) - at_zero
+        entry_leg = policy.fee.fee_for(valuation_price, is_first_fill=True) - at_zero
         exit_leg = policy.fee.fee_for(exit_price, is_first_fill=True) - at_zero
-        per_unit = abs(entry_price - exit_price) + entry_leg + exit_leg
+        per_unit = abs(valuation_price - exit_price) + entry_leg + exit_leg
         return quantity * per_unit + at_zero * 2
 
 
@@ -487,8 +490,11 @@ def break_even_price(
     configured. It is the same technique that decomposes a fee into fixed and per-unit parts
     elsewhere in this module.
 
-    The root is rounded *up*. A level that nets fractionally below zero is not a break-even
-    level, and of the two directions only one can be described honestly.
+    The root is rounded *up*, at the working precision. An exact root is not generally
+    representable, so the guarantee is one-sided rather than exact: the level returned nets
+    zero **or fractionally above**, never below. Of the two directions only one can honestly
+    be called break-even, and a residual of the order of 1e-25 quote units is not a claim
+    about markets — it is the price of saying which side of zero the answer falls on.
 
     Args:
         quantity: Open size that would be closed.
@@ -510,10 +516,8 @@ def break_even_price(
         raise RiskSizingError(msg, side=side.value)
 
     def _net(price: Decimal) -> Decimal:
-        exit_price = policy.slippage.adjust(price, OrderSide.SELL)
-        proceeds = quantity * exit_price
-        fee = policy.fee.fee_for(proceeds, is_first_fill=True)
-        return proceeds - fee - quantity * entry_price
+        proceeds = _net_exit_proceeds(price=price, quantity=quantity, policy=policy)
+        return proceeds - quantity * entry_price
 
     with localcontext() as ctx:
         ctx.prec = DECIMAL_WORKING_PRECISION
@@ -527,5 +531,52 @@ def break_even_price(
                 msg, slope=str(slope), entry_price=str(entry_price), quantity=str(quantity)
             )
         ctx.rounding = ROUND_CEILING
-        advance = -at_low / slope
-    return low + advance
+        return low + (-at_low / slope)
+
+
+def _net_exit_proceeds(*, price: Decimal, quantity: Decimal, policy: ExecutionPolicy) -> Decimal:
+    """Return what selling ``quantity`` at ``price`` actually puts back in the account.
+
+    The one piece of arithmetic three questions share: what a position still risks, where it
+    stops risking anything, and what a stop-out costs. Slippage moves the price against the
+    sale and the venue takes its fee out of the proceeds; nothing else happens on the way
+    out. Written once so the three answers cannot drift apart.
+    """
+    exit_price = policy.slippage.adjust(price, OrderSide.SELL)
+    proceeds = quantity * exit_price
+    return proceeds - policy.fee.fee_for(proceeds, is_first_fill=True)
+
+
+def open_risk_amount(
+    *,
+    quantity: Decimal,
+    avg_entry_price: Decimal,
+    stop: StopSpecification,
+    policy: ExecutionPolicy,
+) -> Decimal | None:
+    """Return what a position that **exists** still stands to lose at its stop.
+
+    What it paid, less what selling at the stop would return. ``avg_entry_price`` is the
+    portfolio engine's own figure, which divides ``executed_notional + fee`` by the filled
+    quantity — the entry's commission is already inside it, and adding one here would charge
+    it twice. That is the distinction from :func:`projected_stop_out_cost`, which is handed a
+    pre-fill valuation and must add it.
+
+    Args:
+        quantity: Open size still held.
+        avg_entry_price: Fee-inclusive average price the position was opened at.
+        stop: The level it is protected at.
+        policy: Fee and slippage assumptions, shared with the executing adapter.
+
+    Returns:
+        The amount at risk, or ``None`` when the stop names no level to measure against.
+        Negative when the stop sits far enough ahead that being stopped out books a gain —
+        stated rather than clamped, because a position protected above its costs genuinely
+        has nothing left to lose and saying so is not the same as saying it risks zero.
+    """
+    if stop.trigger_price is None:
+        return None
+    with localcontext() as ctx:
+        ctx.prec = DECIMAL_WORKING_PRECISION
+        proceeds = _net_exit_proceeds(price=stop.trigger_price, quantity=quantity, policy=policy)
+        return quantity * avg_entry_price - proceeds

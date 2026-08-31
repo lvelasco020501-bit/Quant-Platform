@@ -11,27 +11,25 @@ from __future__ import annotations
 
 import pytest
 
+from quantplatform.research.canonical import canonical_json
 from quantplatform.research.definition import (
     BENCHMARK_STRATEGY_ID,
-    DatasetSpec,
     ExperimentDefinition,
     ExperimentRole,
     StrategySpec,
     experiment_id,
 )
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from tests.factories import (
+    make_backtest_config,
+    make_dataset_spec,
+    make_risk_config,
+)
 
 
 def _definition(**overrides: object) -> ExperimentDefinition:
     defaults: dict[str, object] = {
         "name": "candidate",
-        "dataset": DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        "dataset": make_dataset_spec(),
         "strategy": StrategySpec(strategy_id="momentum_probe", strategy_version="1.0.0", params=()),
         "risk": make_risk_config(),
         "backtest": make_backtest_config(),
@@ -77,7 +75,7 @@ def test_the_frozen_benchmark_is_perfectly_allowed_to_be_the_benchmark() -> None
 def test_the_role_survives_a_round_trip() -> None:
     definition = _definition(role=ExperimentRole.WALK_FORWARD_TEST)
 
-    restored = ExperimentDefinition.model_validate_json(definition.model_dump_json())
+    restored = ExperimentDefinition.model_validate_json(canonical_json(definition))
 
     assert restored.role is ExperimentRole.WALK_FORWARD_TEST
     assert experiment_id(restored) == experiment_id(definition)

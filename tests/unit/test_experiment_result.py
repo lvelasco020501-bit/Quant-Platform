@@ -11,21 +11,21 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from quantplatform.research.definition import DatasetSpec, ExperimentDefinition, StrategySpec
+from quantplatform.research.canonical import canonical_json
+from quantplatform.research.definition import ExperimentDefinition, StrategySpec
 from quantplatform.research.result import ExperimentResult, ExperimentStatus, result_hash
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from tests.factories import (
+    ANCHOR,
+    make_backtest_config,
+    make_dataset_spec,
+    make_risk_config,
+)
 
 
 def _definition() -> ExperimentDefinition:
     return ExperimentDefinition(
         name="ema-benchmark",
-        dataset=DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        dataset=make_dataset_spec(),
         strategy=StrategySpec(
             strategy_id="ema_trend", strategy_version="1.0.0", params=(("fast", "20"),)
         ),
@@ -84,7 +84,7 @@ def test_the_reproducible_hash_notices_a_different_outcome() -> None:
 def test_a_result_round_trips_through_json_unchanged() -> None:
     result = _result()
 
-    restored = ExperimentResult.model_validate_json(result.model_dump_json())
+    restored = ExperimentResult.model_validate_json(canonical_json(result))
 
     assert restored == result
     assert Decimal is not None

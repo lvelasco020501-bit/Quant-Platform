@@ -14,7 +14,9 @@ that distance is before the method exists.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
@@ -22,6 +24,9 @@ from pydantic import Field
 
 from quantplatform.core.models.base import DomainModel, Text, UtcDatetime
 from quantplatform.research.result import ExperimentResult, ExperimentStatus, result_hash
+from quantplatform.research.store import ResultStore, attempt_id
+
+_ENTRY_ID_LENGTH = 32
 
 __all__ = ["ExperimentLedger", "LedgerEntry", "ReproducibilityVerdict", "verify"]
 
@@ -29,7 +34,15 @@ __all__ = ["ExperimentLedger", "LedgerEntry", "ReproducibilityVerdict", "verify"
 class LedgerEntry(DomainModel):
     """One line of the record: an experiment ran, and this is what came of it."""
 
+    entry_id: Text
+    """This line's own name, derived from its contents, so a verdict can point at what it
+    contradicts."""
+
     experiment_id: Text
+    attempt_id: Text
+    """The stored result this line describes. Written before the line, so a ledger entry never
+    points at evidence that does not exist."""
+
     name: Text
     result_hash: Text
     bars_digest: Text | None = None
@@ -48,6 +61,14 @@ class LedgerEntry(DomainModel):
     """
 
     fold_index: int | None = Field(default=None, ge=0)
+    verdict: ReproducibilityVerdict | None = None
+    """What comparing this run with a previous one established, or ``None`` on the first run
+    of an experiment — where there is nothing to compare and nothing is pretended.
+
+    Recorded on every line, so ``DATASET_CHANGED``, ``CODE_CHANGED`` and ``INDETERMINATE``
+    stay visible without raising an alarm: they are information, not accusations.
+    """
+
     compared_with: Text | None = None
     """The line this verdict disagrees with, on a reproducibility failure.
 
@@ -71,10 +92,16 @@ class ExperimentLedger:
         self,
         result: ExperimentResult,
         *,
+        store: ResultStore | None = None,
         plan_id: str | None = None,
         fold_index: int | None = None,
     ) -> LedgerEntry:
-        """Append one experiment to the record and return the line written.
+        """Store the result, append it to the record, and say whether it contradicts anything.
+
+        The order matters and is the whole of the safety here. The evidence is written first,
+        so a ledger line can never name a result that was never stored; then the line; then
+        the comparison. A verdict that could prevent a result from being recorded would be a
+        checker with the power to erase what it disagrees with.
 
         Failures are recorded exactly like successes. An experiment that blew up is evidence
         about the configuration that blew it up, and a record holding only what worked would
@@ -82,27 +109,87 @@ class ExperimentLedger:
 
         Args:
             result: What to record.
+            store: Where the result itself is kept. Optional only so that a caller holding an
+                already-stored attempt can pass its identifier instead.
             plan_id: Walk-forward plan this run belonged to, when it belonged to one.
             fold_index: Its position in that plan.
 
         Returns:
-            The line written.
+            The line written for this result. A contradiction appends a second line after it,
+            which :meth:`entries` will show.
         """
-        entry = LedgerEntry(
-            experiment_id=result.experiment_id,
-            name=result.definition.name,
-            result_hash=result_hash(result),
-            bars_digest=result.bars_digest,
-            code_revision=result.code_revision,
+        identifier = store.save(result) if store is not None else attempt_id(result)
+        previous = [
+            entry for entry in self.entries() if entry.experiment_id == result.experiment_id
+        ]
+        entry = self._build_entry(
+            result,
+            attempt=identifier,
             plan_id=plan_id,
             fold_index=fold_index,
+            verdict=None,
             status=result.status,
-            recorded_at=result.finished_at,
+            compared_with=None,
         )
+        against = _comparable(previous, entry)
+        if against is not None:
+            entry = self._build_entry(
+                result,
+                attempt=identifier,
+                plan_id=plan_id,
+                fold_index=fold_index,
+                verdict=verify(against, entry),
+                status=result.status,
+                compared_with=None,
+            )
+        self._append(entry)
+        if entry.verdict is ReproducibilityVerdict.REPRODUCIBILITY_FAILURE and against is not None:
+            self._append(
+                self._build_entry(
+                    result,
+                    attempt=identifier,
+                    plan_id=plan_id,
+                    fold_index=fold_index,
+                    verdict=ReproducibilityVerdict.REPRODUCIBILITY_FAILURE,
+                    status=ExperimentStatus.REPRODUCIBILITY_FAILURE,
+                    compared_with=against.entry_id,
+                )
+            )
+        return entry
+
+    def _build_entry(
+        self,
+        result: ExperimentResult,
+        *,
+        attempt: str,
+        plan_id: str | None,
+        fold_index: int | None,
+        verdict: ReproducibilityVerdict | None,
+        status: ExperimentStatus,
+        compared_with: str | None,
+    ) -> LedgerEntry:
+        """Assemble one line and give it the name its own contents imply."""
+        fields: dict[str, object] = {
+            "experiment_id": result.experiment_id,
+            "attempt_id": attempt,
+            "name": result.definition.name,
+            "result_hash": result_hash(result),
+            "bars_digest": result.bars_digest,
+            "code_revision": result.code_revision,
+            "plan_id": plan_id,
+            "fold_index": fold_index,
+            "verdict": verdict,
+            "compared_with": compared_with,
+            "status": status,
+            "recorded_at": result.finished_at,
+        }
+        return LedgerEntry(entry_id=_entry_id(fields), **fields)  # type: ignore[arg-type]
+
+    def _append(self, entry: LedgerEntry) -> None:
+        """Write one line. Never rewrites, never reorders."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(entry.model_dump_json() + "\n")
-        return entry
 
     def entries(self) -> tuple[LedgerEntry, ...]:
         """Return every line ever appended, oldest first."""
@@ -177,3 +264,34 @@ def verify(earlier: LedgerEntry, later: LedgerEntry) -> ReproducibilityVerdict:
     if earlier.result_hash == later.result_hash:
         return ReproducibilityVerdict.REPRODUCIBLE
     return ReproducibilityVerdict.REPRODUCIBILITY_FAILURE
+
+
+def _entry_id(fields: Mapping[str, object]) -> str:
+    """Return a line's name, derived from everything in it except the name itself."""
+    payload = "|".join(f"{key}={fields[key]!s}" for key in sorted(fields))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_ENTRY_ID_LENGTH]
+
+
+def _comparable(previous: Sequence[LedgerEntry], entry: LedgerEntry) -> LedgerEntry | None:
+    """Return the earlier run this one should be judged against.
+
+    The most recent attempt that shares both fingerprints, because that is the comparison
+    capable of accusing the engine. Only when no such attempt exists does it fall back to the
+    most recent line, and then purely to report *why* the two are not comparable — running A,
+    then B, then A again would otherwise answer "the code changed" and quietly bury the
+    contradiction with the first A.
+
+    Attempts that were themselves alarms are skipped: an alarm restates a result rather than
+    adding one, and comparing against it would count the same run twice.
+    """
+    candidates = [
+        line for line in previous if line.status is not ExperimentStatus.REPRODUCIBILITY_FAILURE
+    ]
+    if not candidates:
+        return None
+    matched = [
+        line
+        for line in candidates
+        if line.bars_digest == entry.bars_digest and line.code_revision == entry.code_revision
+    ]
+    return matched[-1] if matched else candidates[-1]

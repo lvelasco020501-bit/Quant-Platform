@@ -14,10 +14,8 @@ from decimal import Decimal
 
 import pytest
 
-from quantplatform.backtesting.metrics import PerformanceSummary, TradeStatistics
 from quantplatform.research.aggregate import aggregate_walk_forward
 from quantplatform.research.definition import (
-    DatasetSpec,
     ExperimentDefinition,
     ExperimentRole,
     StrategySpec,
@@ -28,8 +26,15 @@ from quantplatform.research.folds import (
     WindowSpec,
     derive_fold_definitions,
 )
-from quantplatform.research.result import ExperimentResult, ExperimentStatus
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from quantplatform.research.result import ExperimentStatus
+from tests.factories import (
+    ANCHOR,
+    SYMBOL,
+    make_backtest_config,
+    make_dataset_spec,
+    make_fold_run,
+    make_risk_config,
+)
 
 _DAY = timedelta(days=1)
 
@@ -38,13 +43,7 @@ def _base() -> ExperimentDefinition:
     return ExperimentDefinition(
         name="probe",
         role=ExperimentRole.IN_SAMPLE,
-        dataset=DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR + 100 * _DAY,
-            source="fixture",
-        ),
+        dataset=make_dataset_spec(),
         strategy=StrategySpec(strategy_id="probe", strategy_version="1.0.0", params=()),
         risk=make_risk_config(),
         backtest=make_backtest_config(),
@@ -171,88 +170,40 @@ def test_a_derived_definition_carries_no_lineage() -> None:
 # --- Consolidating folds without losing the bad ones ---------------------------------------------
 
 
-def _performance(total_return: str, drawdown: str, expectancy: str) -> PerformanceSummary:
-    return PerformanceSummary(
-        initial_equity=Decimal(100_000),
-        final_equity=Decimal(100_000),
-        total_return=Decimal(total_return),
-        realized_pnl=Decimal(0),
-        unrealized_pnl=Decimal(0),
-        max_drawdown=Decimal(drawdown),
-        commission_paid=Decimal(0),
-        slippage_paid=Decimal(0),
-        trades=TradeStatistics(
-            count=2,
-            wins=1,
-            losses=1,
-            gross_profit=Decimal(10),
-            gross_loss=Decimal(4),
-            expectancy=Decimal(expectancy),
-            average_r=Decimal(expectancy),
-        ),
-        bars_processed=10,
-        duration_seconds=3600,
-    )
-
-
-def _fold_result(
-    *,
-    role: ExperimentRole = ExperimentRole.WALK_FORWARD_TEST,
-    total_return: str = "0.1",
-    drawdown: str = "0.05",
-    expectancy: str = "1",
-    failed: bool = False,
-) -> ExperimentResult:
-    definition = _base().model_copy(update={"role": role})
-    if failed:
-        return ExperimentResult(
-            definition=definition,
-            status=ExperimentStatus.FAILED,
-            error="the fold raised",
-            started_at=ANCHOR,
-            finished_at=ANCHOR,
-        )
-    return ExperimentResult(
-        definition=definition,
-        status=ExperimentStatus.SUCCEEDED,
-        performance=_performance(total_return, drawdown, expectancy),
-        started_at=ANCHOR,
-        finished_at=ANCHOR,
-    )
-
-
 def test_only_the_test_folds_are_summarised() -> None:
     # A training window is an observation window here, and counting it would report the same
-    # calendar twice under two names.
-    summary = aggregate_walk_forward(
-        [
-            _fold_result(role=ExperimentRole.WALK_FORWARD_TRAIN, total_return="9"),
-            _fold_result(total_return="0.1"),
-        ]
-    )
-
-    assert summary.folds_total == 1
-    assert summary.median_return == Decimal("0.1")
+    # calendar twice under two names — so it is refused rather than quietly averaged in.
+    with pytest.raises(ValueError, match="test"):
+        aggregate_walk_forward(
+            [
+                make_fold_run(index=0, role=ExperimentRole.WALK_FORWARD_TRAIN),
+                make_fold_run(index=1),
+            ]
+        )
 
 
 def test_the_worst_fold_is_reported_and_not_averaged_away() -> None:
     summary = aggregate_walk_forward(
         [
-            _fold_result(total_return="0.5", drawdown="0.02"),
-            _fold_result(total_return="-0.4", drawdown="0.30"),
-            _fold_result(total_return="0.2", drawdown="0.05"),
+            make_fold_run(index=0, total_return="0.5"),
+            make_fold_run(index=1, total_return="-0.4"),
+            make_fold_run(index=2, total_return="0.2"),
         ]
     )
 
     assert summary.worst_return == Decimal("-0.4")
-    assert summary.worst_max_drawdown == Decimal("0.30")
     assert summary.median_return == Decimal("0.2")
 
 
 def test_a_failed_fold_is_counted_and_never_becomes_a_return_of_zero() -> None:
     # Zero is a result. A fold that blew up produced no result at all, and pretending it
     # broke even would drag every median toward a number nothing measured.
-    summary = aggregate_walk_forward([_fold_result(total_return="0.4"), _fold_result(failed=True)])
+    summary = aggregate_walk_forward(
+        [
+            make_fold_run(index=0, total_return="0.4"),
+            make_fold_run(index=1, status=ExperimentStatus.FAILED),
+        ]
+    )
 
     assert (summary.folds_total, summary.folds_completed, summary.folds_failed) == (2, 1, 1)
     assert summary.median_return == Decimal("0.4")
@@ -264,9 +215,9 @@ def test_the_positive_share_says_which_denominator_it_used() -> None:
     # subtraction away.
     summary = aggregate_walk_forward(
         [
-            _fold_result(total_return="0.4"),
-            _fold_result(total_return="0.2"),
-            *[_fold_result(failed=True) for _ in range(8)],
+            make_fold_run(index=0, total_return="0.4"),
+            make_fold_run(index=1, total_return="0.2"),
+            *[make_fold_run(index=index, status=ExperimentStatus.FAILED) for index in range(2, 10)],
         ]
     )
 
@@ -276,7 +227,7 @@ def test_the_positive_share_says_which_denominator_it_used() -> None:
 
 
 def test_dispersion_is_undefined_rather_than_zero_for_a_single_fold() -> None:
-    summary = aggregate_walk_forward([_fold_result()])
+    summary = aggregate_walk_forward([make_fold_run(index=0)])
 
     assert summary.expectancy_dispersion is None
     assert summary.r_stability is None

@@ -85,6 +85,7 @@ class ExperimentRunner:
                 code_revision=code_revision,
                 status=ExperimentStatus.FAILED,
                 error=f"{type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__,
                 bars_digest=digest,
                 started_at=started_at,
                 finished_at=self._now(),

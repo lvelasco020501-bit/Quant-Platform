@@ -17,7 +17,6 @@ from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.errors import StrategyError
 from quantplatform.core.models.market import MarketBar
 from quantplatform.research.definition import (
-    DatasetSpec,
     ExperimentDefinition,
     StrategySpec,
 )
@@ -25,11 +24,10 @@ from quantplatform.research.ledger import ExperimentLedger
 from quantplatform.research.result import ExperimentStatus, result_hash
 from quantplatform.research.runner import ExperimentRunner
 from tests.factories import (
-    ANCHOR,
-    SYMBOL,
     make_backtest,
     make_backtest_config,
     make_bars,
+    make_dataset_spec,
     make_risk_config,
 )
 from tests.integration.test_backtest_engine import _WARMUP_BARS, BuyThenSell, _Params
@@ -38,13 +36,7 @@ from tests.integration.test_backtest_engine import _WARMUP_BARS, BuyThenSell, _P
 def _definition(name: str = "ema-benchmark") -> ExperimentDefinition:
     return ExperimentDefinition(
         name=name,
-        dataset=DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        dataset=make_dataset_spec(),
         strategy=StrategySpec(strategy_id="buy_then_sell", strategy_version="1.0.0", params=()),
         risk=make_risk_config(),
         backtest=make_backtest_config(),

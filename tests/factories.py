@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from quantplatform.backtesting.config import BacktestConfig
 from quantplatform.backtesting.engine import BacktestEngine
+from quantplatform.backtesting.metrics import PerformanceSummary, TradeStatistics
 from quantplatform.core.constants import ONE
 from quantplatform.core.enums import (
     CommissionModel,
@@ -50,10 +51,21 @@ from quantplatform.core.timeutils import bar_close_time
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
 from quantplatform.features import NullFeaturePipeline
+from quantplatform.orchestration.research import ExperimentEngineFactory
 from quantplatform.portfolio.engine import SpotPortfolioEngine
+from quantplatform.research.aggregate import FoldRun
+from quantplatform.research.definition import (
+    DatasetSpec,
+    ExperimentDefinition,
+    ExperimentRole,
+    StrategySpec,
+)
+from quantplatform.research.ledger import LedgerEntry
+from quantplatform.research.result import ExperimentResult, ExperimentStatus
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.engine import StandardRiskEngine
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.registry import StrategyRegistry
 
 ANCHOR: Final[datetime] = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
 SYMBOL: Final[str] = "BTC/USDT"
@@ -770,3 +782,138 @@ def make_backtest_config(
         "assumed_spread_basis_points": Decimal(2),
     }
     return BacktestConfig(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+# --- Research harness ----------------------------------------------------------------------------
+
+
+def make_dataset_spec(**overrides: object) -> DatasetSpec:
+    """A dataset naming its market and carrying the rules the run was sized against."""
+    market_type = overrides.pop("market_type", MarketType.SPOT)
+    rules = overrides.pop("symbol_rules", None)
+    resolved = (
+        rules if rules is not None else make_symbol_rules(market_type=market_type)  # type: ignore[arg-type]
+    )
+    defaults: dict[str, object] = {
+        "symbol": SYMBOL,
+        "market_type": market_type,
+        "timeframe": "1h",
+        "start": ANCHOR,
+        "end": ANCHOR.replace(year=2027),
+        "source": "fixture",
+        "symbol_rules": resolved,
+    }
+    return DatasetSpec(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def make_experiment_definition(**overrides: object) -> ExperimentDefinition:
+    """A complete experiment definition, with the dataset details flattened for convenience."""
+    dataset_keys = ("symbol", "market_type", "timeframe", "start", "end", "source", "symbol_rules")
+    dataset_overrides = {key: overrides.pop(key) for key in dataset_keys if key in overrides}
+    strategy_id = overrides.pop("strategy_id", "probe")
+    defaults: dict[str, object] = {
+        "name": "probe",
+        "dataset": make_dataset_spec(**dataset_overrides),
+        "strategy": StrategySpec(
+            strategy_id=strategy_id,  # type: ignore[arg-type]
+            strategy_version="1.0.0",
+            params=(),
+        ),
+        "risk": make_risk_config(),
+        "backtest": make_backtest_config(assumed_spread_basis_points=Decimal(1)),
+    }
+    return ExperimentDefinition(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def make_experiment_result(**overrides: object) -> ExperimentResult:
+    """A finished experiment, successful unless told otherwise."""
+    status = overrides.pop("status", ExperimentStatus.SUCCEEDED)
+    total_return = overrides.pop("total_return", "0.1")
+    performance = (
+        None
+        if status is ExperimentStatus.FAILED
+        else make_performance_summary(total_return=total_return)  # type: ignore[arg-type]
+    )
+    defaults: dict[str, object] = {
+        "definition": make_experiment_definition(),
+        "code_revision": "abc1234",
+        "status": status,
+        "bars_digest": "d1",
+        "performance": performance,
+        "started_at": ANCHOR,
+        "finished_at": ANCHOR,
+    }
+    return ExperimentResult(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def make_performance_summary(
+    *, total_return: str = "0.1", drawdown: str = "0.05", expectancy: str = "1"
+) -> PerformanceSummary:
+    """A summary with enough shape for comparison and aggregation."""
+    return PerformanceSummary(
+        initial_equity=Decimal(100_000),
+        final_equity=Decimal(100_000),
+        total_return=Decimal(total_return),
+        realized_pnl=Decimal(0),
+        unrealized_pnl=Decimal(0),
+        max_drawdown=Decimal(drawdown),
+        commission_paid=Decimal(0),
+        slippage_paid=Decimal(0),
+        trades=TradeStatistics(
+            count=2,
+            wins=1,
+            losses=1,
+            gross_profit=Decimal(10),
+            gross_loss=Decimal(4),
+            expectancy=Decimal(expectancy),
+            average_r=Decimal(expectancy),
+        ),
+        bars_processed=10,
+        duration_seconds=3600,
+    )
+
+
+def make_fold_run(
+    *,
+    index: int | None = 0,
+    plan_id: str | None = "plan-1",
+    role: ExperimentRole = ExperimentRole.WALK_FORWARD_TEST,
+    total_return: str = "0.1",
+    status: ExperimentStatus = ExperimentStatus.SUCCEEDED,
+) -> FoldRun:
+    """One fold's evidence: the ledger line that proves membership and the result it names."""
+    result = make_experiment_result(
+        definition=make_experiment_definition(role=role),
+        total_return=total_return,
+        status=status,
+        error="the fold raised" if status is ExperimentStatus.FAILED else None,
+    )
+    entry = LedgerEntry(
+        entry_id="e" * 32,
+        experiment_id=result.experiment_id,
+        attempt_id="a" * 32,
+        name=result.definition.name,
+        result_hash="r1",
+        bars_digest=result.bars_digest,
+        code_revision=result.code_revision,
+        plan_id=plan_id,
+        fold_index=index,
+        status=result.status,
+        recorded_at=ANCHOR,
+    )
+    return FoldRun(entry=entry, result=result)
+
+
+def make_research_factory() -> ExperimentEngineFactory:
+    """A factory over a registry holding only the strategies research tests use."""
+    from tests.integration.test_backtest_engine import (  # noqa: PLC0415
+        BuyOnce,
+        BuyThenSell,
+    )
+
+    registry = StrategyRegistry()
+    registry.register(BuyThenSell)
+    registry.register(BuyOnce)
+    return ExperimentEngineFactory(
+        registry=registry, features_for=lambda _: NullFeaturePipeline(), quote_asset="USDT"
+    )

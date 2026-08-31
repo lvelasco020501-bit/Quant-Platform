@@ -22,11 +22,24 @@ from quantplatform.core.constants import ZERO
 from quantplatform.core.models.base import DomainModel
 from quantplatform.core.numeric import Money
 from quantplatform.research.definition import ExperimentRole
+from quantplatform.research.ledger import LedgerEntry
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
 
-__all__ = ["WalkForwardSummary", "aggregate_walk_forward"]
+__all__ = ["FoldRun", "WalkForwardSummary", "aggregate_walk_forward"]
 
 _MINIMUM_FOR_DISPERSION = 2
+
+
+class FoldRun(DomainModel):
+    """One fold's evidence: the ledger line proving where it came from, and its result.
+
+    A bare list of results was trusted to belong together. Two plans handed in at once would
+    have produced a summary of neither, and the numbers would have looked exactly as
+    convincing as a correct one. Membership is now demonstrated rather than assumed.
+    """
+
+    entry: LedgerEntry
+    result: ExperimentResult
 
 
 class WalkForwardSummary(DomainModel):
@@ -71,20 +84,41 @@ def _dispersion(values: Sequence[Decimal]) -> Decimal | None:
     return Decimal(str(statistics.pstdev([float(value) for value in values])))
 
 
-def aggregate_walk_forward(results: Sequence[ExperimentResult]) -> WalkForwardSummary:
-    """Summarise the test folds of a walk-forward plan.
+def aggregate_walk_forward(
+    runs: Sequence[FoldRun], *, require_complete: bool = True
+) -> WalkForwardSummary:
+    """Summarise the test folds of one walk-forward plan.
 
-    Only the test folds. A training window is an observation window in this phase, and
-    including it would report the same calendar twice under two names.
+    Membership is checked, not assumed. Every rejection below describes a set of results that
+    would still have produced a plausible-looking summary, which is exactly why each is an
+    error rather than a warning.
 
     Args:
-        results: Every fold's result, in any order. Training folds are ignored; failures are
-            counted and excluded from the arithmetic rather than dropped from the record.
+        runs: Each fold's ledger line and result. Training folds are ignored — a training
+            window is an observation window in this phase, and including it would report the
+            same calendar twice under two names. Failures are counted and excluded from the
+            arithmetic rather than dropped from the record.
+        require_complete: Whether every fold index from zero must be present. Seven folds of a
+            ten-fold plan is a different claim from the plan's result, and saying so out loud
+            is the price of making it.
 
     Returns:
-        The summary. Deliberately not a score: every field is a separate observation, and a
-        single number combining them is the thing that would be optimised within a week.
+        The summary, with no single score: a headline number is the thing everyone optimises
+        within a week.
+
+    Raises:
+        ValueError: If the runs span more than one plan, repeat a fold index, carry no
+            lineage, include a training fold, leave a hole in the plan while
+            ``require_complete``, or are empty.
     """
+    if not runs:
+        msg = "a walk-forward summary needs at least one fold"
+        raise ValueError(msg)
+    _verify_membership(runs, require_complete=require_complete)
+    results = [run.result for run in runs]
+    folds = [
+        result for result in results if result.definition.role is ExperimentRole.WALK_FORWARD_TEST
+    ]
     folds = [
         result for result in results if result.definition.role is ExperimentRole.WALK_FORWARD_TEST
     ]
@@ -129,3 +163,36 @@ def aggregate_walk_forward(results: Sequence[ExperimentResult]) -> WalkForwardSu
         expectancy_dispersion=_dispersion(expectancies),
         r_stability=_dispersion(multiples),
     )
+
+
+def _verify_membership(runs: Sequence[FoldRun], *, require_complete: bool) -> None:
+    """Check the runs are the test folds of exactly one plan.
+
+    Raises:
+        ValueError: Naming which of the conditions failed, because "these do not belong
+            together" is not actionable and "fold 3 appears twice" is.
+    """
+    if any(run.entry.plan_id is None or run.entry.fold_index is None for run in runs):
+        msg = "every fold must carry the lineage that proves which plan it belongs to"
+        raise ValueError(msg)
+    plans = {run.entry.plan_id for run in runs}
+    if len(plans) > 1:
+        msg = f"a summary describes one plan, not {len(plans)}"
+        raise ValueError(msg)
+    indices = [run.entry.fold_index for run in runs]
+    if len(set(indices)) != len(indices):
+        msg = "two folds claim the same index, so one of them is misfiled"
+        raise ValueError(msg)
+    roles = {run.result.definition.role for run in runs}
+    if ExperimentRole.WALK_FORWARD_TEST not in roles:
+        msg = "a summary needs the plan's test folds"
+        raise ValueError(msg)
+    if roles - {ExperimentRole.WALK_FORWARD_TEST}:
+        msg = "only test folds belong in a summary; a training window is not a second result"
+        raise ValueError(msg)
+    if require_complete:
+        expected = set(range(len(indices)))
+        missing = expected - {index for index in indices if index is not None}
+        if missing:
+            msg = f"the plan is missing folds {sorted(missing)}"
+            raise ValueError(msg)

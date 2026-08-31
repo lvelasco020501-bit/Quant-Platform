@@ -13,26 +13,24 @@ from decimal import Decimal
 from quantplatform.backtesting.metrics import PerformanceSummary, TradeStatistics
 from quantplatform.research.compare import COMPARISON_METRICS, compare
 from quantplatform.research.definition import (
-    DatasetSpec,
     ExperimentDefinition,
     ExperimentRole,
     StrategySpec,
 )
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from tests.factories import (
+    ANCHOR,
+    make_backtest_config,
+    make_dataset_spec,
+    make_risk_config,
+)
 
 
 def _definition(name: str, role: ExperimentRole = ExperimentRole.IN_SAMPLE) -> ExperimentDefinition:
     return ExperimentDefinition(
         name=name,
         role=role,
-        dataset=DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        dataset=make_dataset_spec(),
         strategy=StrategySpec(strategy_id="probe", strategy_version="1.0.0", params=()),
         risk=make_risk_config(),
         backtest=make_backtest_config(),

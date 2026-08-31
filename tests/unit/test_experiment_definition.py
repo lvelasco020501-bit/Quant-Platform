@@ -14,25 +14,24 @@ from decimal import Decimal
 
 import pytest
 
+from quantplatform.research.canonical import canonical_json
 from quantplatform.research.definition import (
-    DatasetSpec,
     ExperimentDefinition,
     StrategySpec,
     experiment_id,
 )
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from tests.factories import (
+    ANCHOR,
+    make_backtest_config,
+    make_dataset_spec,
+    make_risk_config,
+)
 
 
 def _definition(**overrides: object) -> ExperimentDefinition:
     defaults: dict[str, object] = {
         "name": "ema-benchmark",
-        "dataset": DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        "dataset": make_dataset_spec(),
         "strategy": StrategySpec(
             strategy_id="ema_trend",
             strategy_version="1.0.0",
@@ -101,10 +100,14 @@ def test_the_name_is_the_same_in_a_different_process_and_under_a_different_hash_
     assert seen == {expected}
 
 
-def test_a_definition_round_trips_through_json_unchanged() -> None:
+def test_a_definition_written_to_disk_can_be_read_back() -> None:
+    # Through the canonical form rather than a raw dump. `SymbolRules` publishes computed
+    # fields that serialise and are rejected on input, so `model_dump_json` produces text the
+    # definition itself refuses — which is exactly the file the command line writes and then
+    # has to reopen.
     definition = _definition()
 
-    restored = ExperimentDefinition.model_validate_json(definition.model_dump_json())
+    restored = ExperimentDefinition.model_validate_json(canonical_json(definition))
 
     assert restored == definition
     assert experiment_id(restored) == experiment_id(definition)
@@ -112,13 +115,7 @@ def test_a_definition_round_trips_through_json_unchanged() -> None:
 
 def test_a_dataset_that_ends_before_it_starts_does_not_construct() -> None:
     with pytest.raises(ValueError, match="end"):
-        DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR.replace(year=2027),
-            end=ANCHOR,
-            source="fixture",
-        )
+        make_dataset_spec(start=ANCHOR.replace(year=2027), end=ANCHOR)
 
 
 def test_a_definition_carries_no_seed_because_nothing_is_random() -> None:

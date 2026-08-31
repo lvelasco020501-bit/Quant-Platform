@@ -10,13 +10,12 @@ where it already happens for paper trading.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 
 from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.enums import ExecutionMode
 from quantplatform.core.interfaces import FeaturePipeline
-from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.portfolio import Balance
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
@@ -42,7 +41,6 @@ class ExperimentEngineFactory:
         *,
         registry: StrategyRegistry,
         features_for: Callable[[BaseStrategy], FeaturePipeline],
-        symbols: Mapping[str, SymbolRules],
         quote_asset: str,
     ) -> None:
         """Wire the registry an experiment's ``strategy_id`` is resolved against.
@@ -53,32 +51,35 @@ class ExperimentEngineFactory:
                 knows how to validate its parameters against the declared schema — building
                 the instance here instead would be a second, weaker copy of that check.
             features_for: Builds the pipeline a resolved strategy declares it needs.
-            symbols: Venue rules for every symbol an experiment may reference.
             quote_asset: Asset the account is denominated in.
         """
         self._registry = registry
         self._features_for = features_for
-        self._symbols = dict(symbols)
         self._quote_asset = quote_asset
 
     def __call__(self, definition: ExperimentDefinition) -> BacktestEngine:
         """Return an engine configured exactly as the definition describes.
 
+        The venue's trading rules come from the definition, never from a live lookup. A
+        backtest over last year that asked the exchange for today's filters would be a
+        different run every time it was repeated, and the ledger would report the difference
+        as the engine's fault.
+
         Raises:
             StrategyNotFoundError: If the definition names a strategy the registry does not
                 hold.
             StrategyParameterError: If its parameters fail the strategy's declared schema.
-            KeyError: If it names a symbol this factory was not given. All three are raised
-                rather than defaulted: an experiment that silently ran something other than
-                what it named would poison every comparison it entered.
+                Both are raised rather than defaulted: an experiment that silently ran
+                something other than what it named would poison every comparison it entered.
         """
         strategy = self._registry.create(
             definition.strategy.strategy_id, dict(definition.strategy.params)
         )
+        symbols = {definition.dataset.symbol: definition.dataset.symbol_rules}
         capital = definition.backtest.initial_capital
         portfolio = SpotPortfolioEngine(
             quote_asset=self._quote_asset,
-            symbols=self._symbols,
+            symbols=symbols,
             execution_mode=ExecutionMode.BACKTEST,
             initial_balances=(
                 Balance(
@@ -91,7 +92,7 @@ class ExperimentEngineFactory:
             source=definition.experiment_id,
         )
         broker = SimulatedBroker(
-            symbols=self._symbols,
+            symbols=symbols,
             portfolio=portfolio,
             execution_mode=ExecutionMode.BACKTEST,
             started_at=definition.dataset.start,
@@ -105,7 +106,7 @@ class ExperimentEngineFactory:
             risk_engine=StandardRiskEngine(config=definition.risk),
             broker=broker,
             portfolio=portfolio,
-            symbols=self._symbols,
+            symbols=symbols,
         )
 
 

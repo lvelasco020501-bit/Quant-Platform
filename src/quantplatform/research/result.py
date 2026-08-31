@@ -52,6 +52,10 @@ class ExperimentResult(DomainModel):
 
     status: ExperimentStatus
     error: Text | None = None
+    error_type: Text | None = None
+    """Class name of what went wrong, so a reader — or a plan deciding whether to continue —
+    can tell a strategy that raised from a platform that lost track of its own state, without
+    parsing a message written for a human."""
     bars_digest: Text | None = None
     """Fingerprint of the exact bars this run consumed.
 

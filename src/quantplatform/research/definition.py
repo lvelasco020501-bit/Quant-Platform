@@ -22,6 +22,7 @@ from typing import Self
 from pydantic import model_validator
 
 from quantplatform.backtesting.config import BacktestConfig
+from quantplatform.core.enums import MarketType
 from quantplatform.core.models.base import (
     DomainModel,
     SemanticVersion,
@@ -30,6 +31,8 @@ from quantplatform.core.models.base import (
     Text,
     UtcDatetime,
 )
+from quantplatform.core.models.market import SymbolRules
+from quantplatform.research.canonical import canonical_json as _canonical_json
 from quantplatform.risk.config import RiskConfiguration
 
 __all__ = [
@@ -75,12 +78,31 @@ class DatasetSpec(DomainModel):
     """Which bars an experiment ran over."""
 
     symbol: Symbol
+    market_type: MarketType
+    """Which market the bars came from. Stated rather than assumed: a spot backtest and a
+    perpetual one over the same symbol are different runs, and a default here would let one
+    be filed as the other."""
+
     timeframe: Text
     start: UtcDatetime
     end: UtcDatetime
     source: Text
     """Where the bars came from, so two runs over different vintages of the same range are
     two experiments rather than one that disagrees with itself."""
+
+    symbol_rules: SymbolRules
+    """The venue's trading rules, captured into the experiment rather than fetched at run
+    time.
+
+    Paper trading asks the venue for today's rules at startup, which is right: it is about to
+    send real orders. A backtest over last year asking for today's rules is a different thing
+    — re-run six months later it would size against different filters, produce a different
+    result, and be reported as irreproducible with identical bars and identical code. The
+    engine would stand accused of a change made by the exchange.
+
+    So they are captured once, by the same provider paper uses, and become part of the
+    experiment's identity. Two runs under different rules are two experiments, which is true.
+    """
 
     @model_validator(mode="after")
     def _validate_range(self) -> Self:
@@ -91,6 +113,12 @@ class DatasetSpec(DomainModel):
         """
         if self.end <= self.start:
             msg = "a dataset's end must follow its start"
+            raise ValueError(msg)
+        if self.symbol_rules.symbol != self.symbol:
+            msg = "the captured symbol_rules must describe the symbol this dataset names"
+            raise ValueError(msg)
+        if self.symbol_rules.market_type is not self.market_type:
+            msg = "the captured symbol_rules must describe the market_type this dataset names"
             raise ValueError(msg)
         return self
 
@@ -158,13 +186,16 @@ class ExperimentDefinition(DomainModel):
 def canonical_json(definition: ExperimentDefinition) -> str:
     """Return the definition's canonical form, byte-stable across processes.
 
-    Pydantic serialises in field-declaration order, and every collection in a definition is a
-    tuple rather than a set — so nothing here depends on Python's per-process hash
-    randomisation. That is a property of the models rather than of this function, which is
-    why a test proves it in a fresh interpreter under several hash seeds instead of trusting
-    the observation.
+    Sorted keys, no computed fields, every collection a tuple rather than a set — so nothing
+    here depends on Python's per-process hash randomisation, and the text can be read back as
+    a definition. That last part is not cosmetic: a file the command line writes and cannot
+    reopen is a file that fails the first time anyone uses it.
+
+    Stability is a property of the models rather than of this function, which is why a test
+    proves it in a fresh interpreter under several hash seeds instead of trusting the
+    observation.
     """
-    return definition.model_dump_json()
+    return _canonical_json(definition)
 
 
 def experiment_id(definition: ExperimentDefinition) -> str:

@@ -16,25 +16,23 @@ import pytest
 
 from quantplatform.orchestration.research import code_revision
 from quantplatform.research.definition import (
-    DatasetSpec,
     ExperimentDefinition,
     StrategySpec,
 )
 from quantplatform.research.ledger import LedgerEntry, ReproducibilityVerdict, verify
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
-from tests.factories import ANCHOR, SYMBOL, make_backtest_config, make_risk_config
+from tests.factories import (
+    ANCHOR,
+    make_backtest_config,
+    make_dataset_spec,
+    make_risk_config,
+)
 
 
 def _definition() -> ExperimentDefinition:
     return ExperimentDefinition(
         name="benchmark",
-        dataset=DatasetSpec(
-            symbol=SYMBOL,
-            timeframe="1h",
-            start=ANCHOR,
-            end=ANCHOR.replace(year=2027),
-            source="fixture",
-        ),
+        dataset=make_dataset_spec(),
         strategy=StrategySpec(strategy_id="ema_trend", strategy_version="1.0.0", params=()),
         risk=make_risk_config(),
         backtest=make_backtest_config(),
@@ -43,6 +41,8 @@ def _definition() -> ExperimentDefinition:
 
 def _entry(**overrides: object) -> LedgerEntry:
     defaults: dict[str, object] = {
+        "entry_id": "e" * 32,
+        "attempt_id": "a" * 32,
         "experiment_id": "e1",
         "name": "benchmark",
         "result_hash": "r1",

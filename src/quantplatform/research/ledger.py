@@ -18,6 +18,8 @@ import json
 from enum import StrEnum
 from pathlib import Path
 
+from pydantic import Field
+
 from quantplatform.core.models.base import DomainModel, Text, UtcDatetime
 from quantplatform.research.result import ExperimentResult, ExperimentStatus, result_hash
 
@@ -37,6 +39,15 @@ class LedgerEntry(DomainModel):
     code_revision: Text | None = None
     status: ExperimentStatus
     recorded_at: UtcDatetime
+    plan_id: Text | None = None
+    """Walk-forward plan this run belonged to, when it belonged to one.
+
+    Lineage lives here rather than in the definition: which plan a window was run under is
+    *why* it was run, not *what* was run, so the same window run alone and run inside a plan
+    keeps one identity and gains two records.
+    """
+
+    fold_index: int | None = Field(default=None, ge=0)
     compared_with: Text | None = None
     """The line this verdict disagrees with, on a reproducibility failure.
 
@@ -56,12 +67,26 @@ class ExperimentLedger:
         """
         self._path = path
 
-    def record(self, result: ExperimentResult) -> LedgerEntry:
+    def record(
+        self,
+        result: ExperimentResult,
+        *,
+        plan_id: str | None = None,
+        fold_index: int | None = None,
+    ) -> LedgerEntry:
         """Append one experiment to the record and return the line written.
 
         Failures are recorded exactly like successes. An experiment that blew up is evidence
         about the configuration that blew it up, and a record holding only what worked would
         describe a platform that never had a bad idea.
+
+        Args:
+            result: What to record.
+            plan_id: Walk-forward plan this run belonged to, when it belonged to one.
+            fold_index: Its position in that plan.
+
+        Returns:
+            The line written.
         """
         entry = LedgerEntry(
             experiment_id=result.experiment_id,
@@ -69,6 +94,8 @@ class ExperimentLedger:
             result_hash=result_hash(result),
             bars_digest=result.bars_digest,
             code_revision=result.code_revision,
+            plan_id=plan_id,
+            fold_index=fold_index,
             status=result.status,
             recorded_at=result.finished_at,
         )

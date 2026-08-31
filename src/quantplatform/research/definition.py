@@ -16,6 +16,7 @@ visible event.
 from __future__ import annotations
 
 import hashlib
+from enum import StrEnum
 from typing import Self
 
 from pydantic import model_validator
@@ -31,9 +32,43 @@ from quantplatform.core.models.base import (
 )
 from quantplatform.risk.config import RiskConfiguration
 
-__all__ = ["DatasetSpec", "ExperimentDefinition", "StrategySpec", "canonical_json", "experiment_id"]
+__all__ = [
+    "BENCHMARK_STRATEGY_ID",
+    "DatasetSpec",
+    "ExperimentDefinition",
+    "ExperimentRole",
+    "StrategySpec",
+    "canonical_json",
+    "experiment_id",
+]
 
 _IDENTIFIER_LENGTH = 32
+
+BENCHMARK_STRATEGY_ID = "ema_trend"
+"""The frozen yardstick, named here so the rule about it can be enforced rather than
+remembered.
+
+EMA20/50 was watched for the whole of week 5. It is what later work is measured against and
+it is not clean out-of-sample evidence for anything, so declaring it as such is refused
+below. A convention nobody enforces is a convention that gets broken at two in the morning.
+"""
+
+
+class ExperimentRole(StrEnum):
+    """What a run claims to be.
+
+    The rule this exists for is the one no code can check: a period used to choose something
+    has stopped being out-of-sample for that choice, and nothing can know what a person looked
+    at before deciding. What *can* be arranged is that the claim is made up front and forms
+    part of the experiment's name — so the same configuration claimed as in-sample and as
+    out-of-sample are two experiments with two names, rather than one told twice.
+    """
+
+    BENCHMARK = "benchmark"
+    IN_SAMPLE = "in_sample"
+    OUT_OF_SAMPLE = "out_of_sample"
+    WALK_FORWARD_TRAIN = "walk_forward_train"
+    WALK_FORWARD_TEST = "walk_forward_test"
 
 
 class DatasetSpec(DomainModel):
@@ -90,7 +125,29 @@ class ExperimentDefinition(DomainModel):
     limits live here already; a second block for them would be a second source of truth."""
 
     backtest: BacktestConfig
+    role: ExperimentRole = ExperimentRole.IN_SAMPLE
+    """What this run claims to be. Part of the identifier, so the claim cannot be restated
+    after the fact without becoming a different experiment."""
+
     regime_label: Text | None = None
+
+    @model_validator(mode="after")
+    def _validate_role(self) -> Self:
+        """Check the claimed role is one this configuration is entitled to make.
+
+        Raises:
+            ValueError: If the frozen benchmark claims to be out-of-sample.
+        """
+        if (
+            self.strategy.strategy_id == BENCHMARK_STRATEGY_ID
+            and self.role is ExperimentRole.OUT_OF_SAMPLE
+        ):
+            msg = (
+                f"{BENCHMARK_STRATEGY_ID} is the frozen benchmark and was observed "
+                "throughout week 5: it cannot be declared clean out-of-sample evidence"
+            )
+            raise ValueError(msg)
+        return self
 
     @property
     def experiment_id(self) -> str:

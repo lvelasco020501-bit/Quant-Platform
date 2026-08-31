@@ -9,7 +9,9 @@ where it already happens for paper trading.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import subprocess
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.enums import ExecutionMode
@@ -22,8 +24,9 @@ from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.research.definition import ExperimentDefinition
 from quantplatform.risk.engine import StandardRiskEngine
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.registry import StrategyRegistry
 
-__all__ = ["ExperimentEngineFactory"]
+__all__ = ["ExperimentEngineFactory", "code_revision", "load_definition"]
 
 
 class ExperimentEngineFactory:
@@ -37,22 +40,24 @@ class ExperimentEngineFactory:
     def __init__(
         self,
         *,
-        strategies: Mapping[str, type[BaseStrategy]],
-        features: Mapping[str, FeaturePipeline],
+        registry: StrategyRegistry,
+        features_for: Callable[[BaseStrategy], FeaturePipeline],
         symbols: Mapping[str, SymbolRules],
         quote_asset: str,
     ) -> None:
         """Wire the registry an experiment's ``strategy_id`` is resolved against.
 
         Args:
-            strategies: Strategy classes by registry identifier. A definition names a
-                strategy; it never imports one, so this is where the name becomes code.
-            features: Feature pipeline per strategy identifier.
+            registry: Where a definition's ``strategy_id`` becomes code. A definition
+                names a strategy and never imports one, and the registry is what already
+                knows how to validate its parameters against the declared schema — building
+                the instance here instead would be a second, weaker copy of that check.
+            features_for: Builds the pipeline a resolved strategy declares it needs.
             symbols: Venue rules for every symbol an experiment may reference.
             quote_asset: Asset the account is denominated in.
         """
-        self._strategies = dict(strategies)
-        self._features = dict(features)
+        self._registry = registry
+        self._features_for = features_for
         self._symbols = dict(symbols)
         self._quote_asset = quote_asset
 
@@ -60,13 +65,15 @@ class ExperimentEngineFactory:
         """Return an engine configured exactly as the definition describes.
 
         Raises:
-            KeyError: If the definition names a strategy or a symbol this factory was not
-                given. Raised rather than defaulted: an experiment that silently ran
-                something other than what it named would poison every comparison it entered.
+            StrategyNotFoundError: If the definition names a strategy the registry does not
+                hold.
+            StrategyParameterError: If its parameters fail the strategy's declared schema.
+            KeyError: If it names a symbol this factory was not given. All three are raised
+                rather than defaulted: an experiment that silently ran something other than
+                what it named would poison every comparison it entered.
         """
-        strategy_id = definition.strategy.strategy_id
-        strategy = self._strategies[strategy_id](
-            dict(definition.strategy.params)  # type: ignore[arg-type]
+        strategy = self._registry.create(
+            definition.strategy.strategy_id, dict(definition.strategy.params)
         )
         capital = definition.backtest.initial_capital
         portfolio = SpotPortfolioEngine(
@@ -94,9 +101,67 @@ class ExperimentEngineFactory:
         return BacktestEngine(
             config=definition.backtest,
             strategy=strategy,
-            features=self._features[strategy_id],
+            features=self._features_for(strategy),
             risk_engine=StandardRiskEngine(config=definition.risk),
             broker=broker,
             portfolio=portfolio,
             symbols=self._symbols,
         )
+
+
+_GIT_TIMEOUT_SECONDS = 10
+
+
+def code_revision(repo_root: Path) -> str | None:
+    """Return the revision of the code being run, or ``None`` when it cannot be established.
+
+    Lives here because the research package performs no I/O of its own and does not know that
+    git exists; it receives a string. This is the only place in the platform that shells out
+    to a version-control system, and it is deliberately the narrowest possible use of one.
+
+    A dirty working tree is reported as such, and that suffix is the point. A result produced
+    from a tree nobody can reconstruct is not reproducible, and without saying so the checker
+    would report reproducibility failures whose real cause was uncommitted code.
+
+    Args:
+        repo_root: Directory to interrogate.
+
+    Returns:
+        The commit hash, suffixed ``-dirty`` when the tree carries uncommitted changes, or
+        ``None`` when there is no repository or git cannot be run. Never raises and never
+        guesses: an unknown revision is recorded as unknown, and a fabricated one would make
+        every later comparison worthless.
+    """
+
+    def _git(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(  # noqa: S603
+                ["git", *args],  # noqa: S607
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return completed.stdout.strip()
+
+    head = _git("rev-parse", "HEAD")
+    if head is None:
+        return None
+    status = _git("status", "--porcelain")
+    if status is None:
+        return None
+    return f"{head}-dirty" if status else head
+
+
+def load_definition(path: Path) -> ExperimentDefinition:
+    """Read an experiment definition from disk.
+
+    Raises:
+        ValueError: If the file is not a complete definition. Refused rather than patched
+            with defaults: an experiment that silently ran something other than what its
+            file described would poison every comparison it entered.
+    """
+    return ExperimentDefinition.model_validate_json(path.read_text(encoding="utf-8"))

@@ -43,9 +43,9 @@ from quantplatform.core.models.portfolio import Balance
 from quantplatform.core.symbol_rules import SymbolRulesStore
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
-from quantplatform.features import ExponentialMovingAverageFeatures, NullFeaturePipeline
 from quantplatform.marketdata.config import MarketDataConfiguration
 from quantplatform.marketdata.feed import BinanceSpotMarketDataFeed
+from quantplatform.orchestration.features import features_for
 from quantplatform.orchestration.symbol_rules import SymbolRulesRefresher
 from quantplatform.paper.results import SessionResult
 from quantplatform.paper.runner import PaperTradingRunner
@@ -328,7 +328,7 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
     engine = BacktestEngine(
         config=_backtest_configuration(settings),
         strategy=resolved_strategy,
-        features=features if features is not None else _features_for(resolved_strategy),
+        features=features if features is not None else features_for(resolved_strategy),
         risk_engine=StandardRiskEngine(config=risk),
         broker=broker,
         portfolio=portfolio,
@@ -404,26 +404,6 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
 
 
 # --- Configuration translation ------------------------------------------------------------------
-
-
-def _features_for(strategy: BaseStrategy) -> FeaturePipeline:
-    """Return a pipeline that produces the features a strategy declares it needs.
-
-    Not a decision about *what* the strategy sees — the strategy already declared that in
-    its metadata — only about assembling something able to supply it. An ``ema_<n>`` name
-    is answered with an exponential pipeline of period ``n``; a strategy declaring no
-    features gets the null pipeline. Anything else is left to the engine's contract check,
-    which refuses a run whose pipeline cannot produce what the strategy requires rather
-    than letting it start and go quiet.
-    """
-    periods = [
-        int(name.removeprefix("ema_"))
-        for name in strategy.metadata.required_features
-        if name.startswith("ema_") and name.removeprefix("ema_").isdigit()
-    ]
-    if not periods:
-        return NullFeaturePipeline()
-    return ExponentialMovingAverageFeatures(periods)
 
 
 def _market_data_configuration(settings: Settings) -> MarketDataConfiguration:

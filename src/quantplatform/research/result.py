@@ -31,6 +31,12 @@ class ExperimentStatus(StrEnum):
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    REPRODUCIBILITY_FAILURE = "reproducibility_failure"
+    """A ledger verdict, never an outcome.
+
+    Produced by comparing two results, so no single run can be born with it — see the
+    validator below, which makes claiming it unrepresentable rather than merely discouraged.
+    """
 
 
 class ExperimentResult(DomainModel):
@@ -46,6 +52,14 @@ class ExperimentResult(DomainModel):
 
     status: ExperimentStatus
     error: Text | None = None
+    bars_digest: Text | None = None
+    """Fingerprint of the exact bars this run consumed.
+
+    Kept here rather than in the definition: a definition must be declarable before the data
+    exists, and folding the digest into the experiment's identity would destroy the very
+    comparison it enables — the same definition against a different vintage would stop
+    looking like the same definition.
+    """
     performance: PerformanceSummary | None = None
     trades: tuple[ClosedTrade, ...] = ()
     equity_curve: tuple[EquityPoint, ...] = ()
@@ -66,6 +80,12 @@ class ExperimentResult(DomainModel):
                 no performance — either of which would leave a reader unable to tell what
                 actually happened.
         """
+        if self.status is ExperimentStatus.REPRODUCIBILITY_FAILURE:
+            msg = (
+                "a reproducibility verdict comes from comparing two results, not from "
+                "running one: a single run cannot report one about itself"
+            )
+            raise ValueError(msg)
         if self.status is ExperimentStatus.FAILED and self.error is None:
             msg = "a failed experiment must record why it failed"
             raise ValueError(msg)

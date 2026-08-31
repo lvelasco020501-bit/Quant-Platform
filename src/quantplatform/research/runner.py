@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from quantplatform.core.errors import QuantPlatformError
 from quantplatform.research.definition import ExperimentDefinition
+from quantplatform.research.digest import bars_digest
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
 
 if TYPE_CHECKING:
@@ -74,6 +75,7 @@ class ExperimentRunner:
             configuration that blew it up, and an exception would record that nowhere.
         """
         started_at = self._now()
+        digest = bars_digest(bars)
         try:
             engine = factory(definition)
             outcome = engine.run(bars)
@@ -83,6 +85,7 @@ class ExperimentRunner:
                 code_revision=code_revision,
                 status=ExperimentStatus.FAILED,
                 error=f"{type(exc).__name__}: {exc}",
+                bars_digest=digest,
                 started_at=started_at,
                 finished_at=self._now(),
             )
@@ -90,6 +93,7 @@ class ExperimentRunner:
             definition=definition,
             code_revision=code_revision,
             status=ExperimentStatus.SUCCEEDED,
+            bars_digest=digest,
             performance=outcome.performance,
             trades=tuple(outcome.trades),
             equity_curve=tuple(outcome.equity_curve),

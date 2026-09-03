@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol, runtime_checkable
 
 import typer
 
@@ -32,12 +33,17 @@ from quantplatform.orchestration.research import (
 )
 from quantplatform.research.canonical import canonical_json
 from quantplatform.research.compare import COMPARISON_METRICS, compare
+from quantplatform.research.definition import ExperimentDefinition
 from quantplatform.research.folds import WalkForwardPlan, WindowSpec
 from quantplatform.research.ledger import ExperimentLedger
 from quantplatform.research.plan_runner import WalkForwardRunner
+from quantplatform.research.regime import RegimePlan, RegimeRunner, summarise_regime
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
+from quantplatform.research.robustness import VariationRun, summarise_variations
 from quantplatform.research.runner import ExperimentRunner
+from quantplatform.research.sensitivity import SensitivityPlan, SensitivityRunner
 from quantplatform.research.store import ResultStore
+from quantplatform.research.stress import StressPlan, StressRunner
 from quantplatform.storage.repository import SqlAlchemyMarketBarRepository
 from quantplatform.storage.session import create_engine, create_session_factory
 from quantplatform.strategies.registry import build_default_registry
@@ -56,6 +62,25 @@ app = typer.Typer(
     help="Run recorded experiments over stored bars.",
     no_args_is_help=True,
 )
+
+sensitivity_app = typer.Typer(
+    name="sensitivity",
+    help="Run a base configuration's neighbourhood, and report how spread out it was.",
+    no_args_is_help=True,
+)
+regimes_app = typer.Typer(
+    name="regimes",
+    help="Run a pre-built regime segmentation plan. Never labels bars itself.",
+    no_args_is_help=True,
+)
+stress_app = typer.Typer(
+    name="stress",
+    help="Run the same strategy over the same data under different cost or risk assumptions.",
+    no_args_is_help=True,
+)
+app.add_typer(sensitivity_app)
+app.add_typer(regimes_app)
+app.add_typer(stress_app)
 
 _DefinitionArgument = Annotated[Path, typer.Argument(help="Experiment definition, as JSON.")]
 _LedgerOption = Annotated[Path, typer.Option("--ledger", help="Append-only ledger file.")]
@@ -433,3 +458,359 @@ def walk_forward(
     )
     if failed:
         raise typer.Exit(code=EXIT_FOLD_FAILURES)
+
+
+# --- Shared by sensitivity, regimes and stress ---------------------------------------------------
+
+_PlanArgument = Annotated[Path, typer.Argument(help="Plan, as JSON.")]
+_DefinitionOption = Annotated[
+    Path, typer.Option("--definition", help="Base experiment definition, as JSON.")
+]
+_PlanIdOption = Annotated[str, typer.Option("--plan-id", help="Plan to summarise.")]
+
+
+@runtime_checkable
+class _NamesABaseExperiment(Protocol):
+    @property
+    def base_experiment_id(self) -> str: ...
+
+
+def _read_plan_against_definition[PlanT: _NamesABaseExperiment](
+    plan_path: Path, definition_path: Path, parse_plan: Callable[[str], PlanT]
+) -> tuple[ExperimentDefinition, PlanT]:
+    """Read a plan and its base definition, and check the plan actually names it.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when either file cannot be read, or the plan's
+            ``base_experiment_id`` does not name the definition it was given — in both cases
+            nothing has run yet.
+    """
+    try:
+        definition = load_definition(definition_path)
+        plan = parse_plan(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        typer.echo(f"cannot read the plan or its definition: {exc}", err=True)
+        raise typer.Exit(code=EXIT_FATAL) from exc
+    if plan.base_experiment_id != definition.experiment_id:
+        typer.echo(
+            "the plan's base_experiment_id does not name the definition it was given: "
+            f"{plan.base_experiment_id} != {definition.experiment_id}",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_FATAL)
+    return definition, plan
+
+
+# --- Sensitivity -----------------------------------------------------------------------------
+
+
+@sensitivity_app.command("run")
+def sensitivity_run(
+    plan_path: _PlanArgument,
+    definition_path: _DefinitionOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Run a sensitivity plan's baseline and every variation, over the base's own bars.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when the plan or definition cannot be read or do
+            not match. With :data:`EXIT_PLAN_ABORTED` when a data-integrity failure ends the
+            plan early. With :data:`EXIT_FOLD_FAILURES` when the plan finished but at least
+            one variation failed on its own account.
+    """
+    definition, plan = _read_plan_against_definition(
+        plan_path, definition_path, SensitivityPlan.model_validate_json
+    )
+    settings = load_settings()
+    bars = asyncio.run(
+        _stored_bars(
+            settings=settings,
+            symbol=definition.dataset.symbol,
+            market_type=definition.dataset.market_type,
+            timeframe=definition.dataset.timeframe,
+            start=definition.dataset.start,
+            end=definition.dataset.end,
+        )
+    )
+    outcome = SensitivityRunner().run(
+        definition,
+        plan,
+        bars=bars,
+        factory=_engine_factory(settings),
+        store=ResultStore(results),
+        ledger=ExperimentLedger(ledger),
+        code_revision=code_revision(Path.cwd()),
+    )
+
+    if outcome.aborted:
+        typer.echo(
+            json.dumps(
+                {
+                    "plan_id": outcome.plan_id,
+                    "variations_run": len(outcome.variations),
+                    "aborted": True,
+                    "abort_reason": outcome.abort_reason,
+                },
+                indent=2,
+            )
+        )
+        raise typer.Exit(code=EXIT_PLAN_ABORTED)
+
+    failed = [run for run in outcome.variations if run.result.status is ExperimentStatus.FAILED]
+    typer.echo(
+        json.dumps(
+            {
+                "plan_id": outcome.plan_id,
+                "baseline_status": outcome.baseline.result.status.value,
+                "variations_run": len(outcome.variations),
+                "aborted": False,
+                "summary": json.loads(outcome.summarise().model_dump_json()),
+            },
+            indent=2,
+        )
+    )
+    if failed:
+        raise typer.Exit(code=EXIT_FOLD_FAILURES)
+
+
+@sensitivity_app.command("report")
+def sensitivity_report(
+    plan_id: _PlanIdOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Re-summarise an already-run sensitivity plan from the ledger.
+
+    Reads the persisted record rather than re-running anything, the same discipline
+    ``verify`` follows.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when nothing was recorded under this plan.
+    """
+    experiment_ledger = ExperimentLedger(ledger)
+    store = ResultStore(results)
+    entries = experiment_ledger.entries_in_variation_plan(plan_id)
+    variations = [
+        VariationRun(entry=entry, result=store.load(entry.attempt_id))
+        for entry in entries
+        if entry.derived_from is not None
+    ]
+    if not variations:
+        typer.echo(f"no recorded variations for plan {plan_id}", err=True)
+        raise typer.Exit(code=EXIT_FATAL)
+    summary = summarise_variations(variations, expected_plan_id=plan_id)
+    typer.echo(json.dumps(json.loads(summary.model_dump_json()), indent=2))
+
+
+# --- Stress ------------------------------------------------------------------------------------
+
+
+@stress_app.command("run")
+def stress_run(
+    plan_path: _PlanArgument,
+    definition_path: _DefinitionOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Run a stress plan's baseline and every scenario, over the base's own bars.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when the plan or definition cannot be read or do
+            not match. With :data:`EXIT_PLAN_ABORTED` when a data-integrity failure ends the
+            plan early. With :data:`EXIT_FOLD_FAILURES` when the plan finished but at least
+            one scenario failed on its own account.
+    """
+    definition, plan = _read_plan_against_definition(
+        plan_path, definition_path, StressPlan.model_validate_json
+    )
+    settings = load_settings()
+    bars = asyncio.run(
+        _stored_bars(
+            settings=settings,
+            symbol=definition.dataset.symbol,
+            market_type=definition.dataset.market_type,
+            timeframe=definition.dataset.timeframe,
+            start=definition.dataset.start,
+            end=definition.dataset.end,
+        )
+    )
+    outcome = StressRunner().run(
+        definition,
+        plan,
+        bars=bars,
+        factory=_engine_factory(settings),
+        store=ResultStore(results),
+        ledger=ExperimentLedger(ledger),
+        code_revision=code_revision(Path.cwd()),
+    )
+
+    if outcome.aborted:
+        typer.echo(
+            json.dumps(
+                {
+                    "plan_id": outcome.plan_id,
+                    "scenarios_run": len(outcome.scenarios),
+                    "aborted": True,
+                    "abort_reason": outcome.abort_reason,
+                },
+                indent=2,
+            )
+        )
+        raise typer.Exit(code=EXIT_PLAN_ABORTED)
+
+    failed = [run for run in outcome.scenarios if run.result.status is ExperimentStatus.FAILED]
+    typer.echo(
+        json.dumps(
+            {
+                "plan_id": outcome.plan_id,
+                "baseline_status": outcome.baseline.result.status.value,
+                "scenarios_run": len(outcome.scenarios),
+                "aborted": False,
+                "summary": json.loads(outcome.summarise().model_dump_json()),
+            },
+            indent=2,
+        )
+    )
+    if failed:
+        raise typer.Exit(code=EXIT_FOLD_FAILURES)
+
+
+@stress_app.command("report")
+def stress_report(
+    plan_id: _PlanIdOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Re-summarise an already-run stress plan from the ledger.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when nothing was recorded under this plan.
+    """
+    experiment_ledger = ExperimentLedger(ledger)
+    store = ResultStore(results)
+    entries = experiment_ledger.entries_in_variation_plan(plan_id)
+    scenarios = [
+        VariationRun(entry=entry, result=store.load(entry.attempt_id))
+        for entry in entries
+        if entry.derived_from is not None
+    ]
+    if not scenarios:
+        typer.echo(f"no recorded scenarios for plan {plan_id}", err=True)
+        raise typer.Exit(code=EXIT_FATAL)
+    summary = summarise_variations(scenarios, expected_plan_id=plan_id)
+    typer.echo(json.dumps(json.loads(summary.model_dump_json()), indent=2))
+
+
+# --- Regimes -------------------------------------------------------------------------------------
+
+
+@regimes_app.command("run")
+def regimes_run(
+    plan_path: Annotated[
+        Path, typer.Argument(help="Regime plan, as JSON — pre-built, never labelled here.")
+    ],
+    definition_path: _DefinitionOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Run every episode of a pre-built regime plan.
+
+    Never labels bars: a :class:`~quantplatform.research.regime.RegimeLabeller` is invoked
+    exactly once, offline, to build the plan file this command reads — reinvoking it here
+    would be a second, less scrutinised place for a labeller to see data it should not.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when the plan or definition cannot be read or do
+            not match. With :data:`EXIT_PLAN_ABORTED` when a data-integrity failure ends the
+            plan early. With :data:`EXIT_FOLD_FAILURES` when the plan finished but at least
+            one episode failed on its own account.
+    """
+    definition, plan = _read_plan_against_definition(
+        plan_path, definition_path, RegimePlan.model_validate_json
+    )
+    settings = load_settings()
+    span_start = min(episode.window.start for episode in plan.episodes)
+    span_end = max(episode.window.end for episode in plan.episodes)
+    bars = asyncio.run(
+        _stored_bars(
+            settings=settings,
+            symbol=definition.dataset.symbol,
+            market_type=definition.dataset.market_type,
+            timeframe=definition.dataset.timeframe,
+            start=span_start,
+            end=span_end,
+        )
+    )
+    outcome = RegimeRunner().run(
+        definition,
+        plan,
+        bars=bars,
+        factory=_engine_factory(settings),
+        store=ResultStore(results),
+        ledger=ExperimentLedger(ledger),
+        code_revision=code_revision(Path.cwd()),
+    )
+
+    if outcome.aborted:
+        typer.echo(
+            json.dumps(
+                {
+                    "plan_id": outcome.plan_id,
+                    "episodes_run": len(outcome.episodes),
+                    "aborted": True,
+                    "abort_reason": outcome.abort_reason,
+                },
+                indent=2,
+            )
+        )
+        raise typer.Exit(code=EXIT_PLAN_ABORTED)
+
+    failed = [run for run in outcome.episodes if run.result.status is ExperimentStatus.FAILED]
+    summary_by_label = outcome.summarise()
+    typer.echo(
+        json.dumps(
+            {
+                "plan_id": outcome.plan_id,
+                "episodes_run": len(outcome.episodes),
+                "aborted": False,
+                "summary": {
+                    label: json.loads(summary.model_dump_json())
+                    for label, summary in summary_by_label.items()
+                },
+            },
+            indent=2,
+        )
+    )
+    if failed:
+        raise typer.Exit(code=EXIT_FOLD_FAILURES)
+
+
+@regimes_app.command("report")
+def regimes_report(
+    plan_id: _PlanIdOption,
+    ledger: _LedgerOption,
+    results: _ResultsOption = Path("var/research/results"),
+) -> None:
+    """Re-summarise an already-run regime plan from the ledger, one distribution per label.
+
+    Raises:
+        typer.Exit: With :data:`EXIT_FATAL` when nothing was recorded under this plan.
+    """
+    experiment_ledger = ExperimentLedger(ledger)
+    store = ResultStore(results)
+    entries = experiment_ledger.entries_in_variation_plan(plan_id)
+    episodes = [VariationRun(entry=entry, result=store.load(entry.attempt_id)) for entry in entries]
+    if not episodes:
+        typer.echo(f"no recorded episodes for plan {plan_id}", err=True)
+        raise typer.Exit(code=EXIT_FATAL)
+    summary_by_label = summarise_regime(episodes, expected_plan_id=plan_id)
+    typer.echo(
+        json.dumps(
+            {
+                label: json.loads(summary.model_dump_json())
+                for label, summary in summary_by_label.items()
+            },
+            indent=2,
+        )
+    )

@@ -17,6 +17,7 @@ from quantplatform.core.timeutils import ensure_utc
 __all__ = [
     "AssetCode",
     "DomainModel",
+    "RegimeLabel",
     "SemanticVersion",
     "StrategyId",
     "Symbol",
@@ -70,6 +71,19 @@ Text = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
 """Short non-empty human-readable text, such as the reason for a decision."""
+
+RegimeLabel = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, pattern=r"^[a-z][a-z0-9_]{1,31}$"),
+]
+"""A regime name, shaped like :data:`StrategyId` rather than drawn from a closed set.
+
+No concrete label lives in the platform. What is fixed is only the *shape* a label may
+take — the categories themselves (``trend_up``, ``range``, ``high_vol``, or anything else) are
+invented by whoever writes a :class:`~quantplatform.research.regime.RegimeLabeller`, later,
+with evidence. Fixing the vocabulary here would be choosing a financial threshold before any
+research justifies one.
+"""
 
 
 class DomainModel(BaseModel):

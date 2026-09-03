@@ -25,6 +25,7 @@ from quantplatform.backtesting.config import BacktestConfig
 from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.base import (
     DomainModel,
+    RegimeLabel,
     SemanticVersion,
     StrategyId,
     Symbol,
@@ -160,7 +161,13 @@ class ExperimentDefinition(DomainModel):
     """What this run claims to be. Part of the identifier, so the claim cannot be restated
     after the fact without becoming a different experiment."""
 
-    regime_label: Text | None = None
+    regime_label: RegimeLabel | None = None
+    """Which regime this run covers, when it covers one.
+
+    Part of the identifier: two definitions identical except for this are, correctly, two
+    experiments. Set by :mod:`quantplatform.research.regime` when a definition is narrowed to
+    one episode of a :class:`~quantplatform.research.regime.RegimePlan`; ``None`` for every
+    other run, including a plain in-sample or out-of-sample one."""
 
     @model_validator(mode="after")
     def _validate_role(self) -> Self:

@@ -18,7 +18,16 @@ from quantplatform.core.constants import DECIMAL_WORKING_PRECISION, ZERO
 from quantplatform.core.errors import ConfigurationError
 from quantplatform.core.models.market import MarketBar
 
-__all__ = ["CompositeFeaturePipeline", "MovingAverageFeatures", "NullFeaturePipeline"]
+__all__ = [
+    "CompositeFeaturePipeline",
+    "DonchianChannelFeatures",
+    "ExponentialMovingAverageFeatures",
+    "MovingAverageFeatures",
+    "NullFeaturePipeline",
+]
+
+_MINIMUM_BARS_FOR_A_PRIOR_WINDOW = 2
+"""One bar to decide on, plus at least one strictly before it to build a level from."""
 
 
 class NullFeaturePipeline:
@@ -187,6 +196,85 @@ def _exponential_average(closes: Sequence[Decimal], period: int) -> Decimal:
     for close in closes[period:]:
         average = (close - average) * smoothing + average
     return average
+
+
+class DonchianChannelFeatures:
+    """Rolling highest-high and lowest-low over a window ending *before* the decided-on bar.
+
+    Emits ``donchian_high_<period>`` and ``donchian_low_<period>`` for each configured period.
+    Unlike :class:`MovingAverageFeatures` and :class:`ExponentialMovingAverageFeatures`, whose
+    windows legitimately include the bar being decided on — an average including today's own
+    close is not look-ahead, it is the strategy asking "what happened including today" — a
+    breakout level exists to be tested *against* today, and would stop meaning that the moment
+    today's own high or low could move it. So the window this pipeline reads is ``bars[:-1]``,
+    never ``bars``: the last bar is excluded before anything is computed, unconditionally.
+
+    That exclusion is also why :attr:`required_history` is ``period + 1`` rather than
+    ``period`` — one bar more than :class:`MovingAverageFeatures` needs for the same period,
+    because the bar being decided on does not count toward the window here.
+    """
+
+    def __init__(self, periods: Sequence[int]) -> None:
+        """Configure the periods to compute.
+
+        Args:
+            periods: Strictly positive lookbacks, in bars, each counted over the bars
+                strictly preceding the one being decided on.
+
+        Raises:
+            ConfigurationError: If a period is not strictly positive, or none were given.
+        """
+        if not periods:
+            raise ConfigurationError("a Donchian-channel pipeline needs at least one period")
+        if any(period <= 0 for period in periods):
+            raise ConfigurationError(
+                "Donchian-channel periods must be strictly positive", periods=list(periods)
+            )
+        self._periods = tuple(sorted(set(periods)))
+
+    @property
+    def periods(self) -> tuple[int, ...]:
+        """Return the configured periods, ascending and deduplicated."""
+        return self._periods
+
+    @property
+    def feature_names(self) -> Sequence[str]:
+        """Return one ``donchian_high_<period>`` and one ``donchian_low_<period>`` per period."""
+        return tuple(
+            name
+            for period in self._periods
+            for name in (f"donchian_high_{period}", f"donchian_low_{period}")
+        )
+
+    @property
+    def required_history(self) -> int:
+        """Return the longest period plus one: that many prior bars, plus the current one."""
+        return self._periods[-1] + 1
+
+    def compute(self, bars: Sequence[MarketBar]) -> Mapping[str, Decimal]:
+        """Return the highest high and lowest low of the bars strictly before the last one.
+
+        Args:
+            bars: Closed bars in ascending open-time order; the last is the bar being decided
+                and is excluded from every window computed here.
+
+        Returns:
+            ``donchian_high_<period>``/``donchian_low_<period>`` for each period the *prior*
+            window is long enough to support. A period the prior window cannot fill is
+            omitted, never approximated from a shorter window.
+        """
+        if len(bars) < _MINIMUM_BARS_FOR_A_PRIOR_WINDOW:
+            return {}
+        prior = bars[:-1]
+        highs = [bar.high for bar in prior]
+        lows = [bar.low for bar in prior]
+        features: dict[str, Decimal] = {}
+        for period in self._periods:
+            if len(prior) < period:
+                continue
+            features[f"donchian_high_{period}"] = max(highs[-period:])
+            features[f"donchian_low_{period}"] = min(lows[-period:])
+        return features
 
 
 class CompositeFeaturePipeline:

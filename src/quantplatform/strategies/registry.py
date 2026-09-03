@@ -20,15 +20,21 @@ from quantplatform.core.errors import (
 )
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.breakout import BreakoutStrategy
 from quantplatform.strategies.ema_trend import EmaTrendStrategy
 
 __all__ = ["BUILTIN_STRATEGIES", "StrategyRegistry", "build_default_registry"]
 
-BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy,)
+BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy, BreakoutStrategy)
 """Strategies shipped with the platform.
 
-One, deliberately. A paper run needs a strategy to exercise the chain, and more than one
-would invite a comparison this platform is not yet set up to make honestly.
+``ema_trend`` was the only one for a reason that no longer holds: comparing two strategies
+honestly needs a research harness capable of measuring both without picking a favourite, and
+until M9c.3b nothing here could do that. The harness exists now — walk-forward, sensitivity,
+regime segmentation, stress testing and a neutral ``compare()`` that ranks nothing — so a
+second strategy is what it gets used for, not a comparison the platform still has to be
+talked out of making dishonestly. ``ema_trend`` stays frozen as the benchmark regardless of
+how many strategies are added here.
 """
 
 

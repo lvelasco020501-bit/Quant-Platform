@@ -768,12 +768,17 @@ def test_the_production_strategy_reaches_nothing_but_the_domain() -> None:
     assert not used & forbidden, f"the strategy reaches for {sorted(used & forbidden)}"
 
 
-def test_the_platform_ships_exactly_one_builtin_strategy() -> None:
-    # More than one invites a comparison this platform is not set up to make honestly.
+def test_the_platform_ships_exactly_the_strategies_it_declares() -> None:
+    # The literal line, not just the count: any change to this tuple is a decision about
+    # what the platform can run, and this test is what makes that decision unavoidable to
+    # notice rather than a silent drift. A single strategy was "the one, deliberately" until
+    # M9c.3b's research harness (walk-forward, sensitivity, regime, stress, a neutral
+    # compare()) made comparing two of them honestly possible; breakout is that second one.
     registry = PACKAGE_ROOT / "strategies" / "registry.py"
-    assert "BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy,)" in (
-        registry.read_text(encoding="utf-8")
-    )
+    assert (
+        "BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = "
+        "(EmaTrendStrategy, BreakoutStrategy)"
+    ) in registry.read_text(encoding="utf-8")
 
 
 def test_the_metadata_provider_cannot_reach_execution_or_sign_a_request() -> None:

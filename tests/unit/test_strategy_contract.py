@@ -190,13 +190,15 @@ def test_position_state_carries_no_account_financials() -> None:
 # --- Registry ------------------------------------------------------------------------------------
 
 
-def test_the_default_registry_carries_the_one_builtin_strategy() -> None:
-    # Was "empty before phase six". The platform now ships exactly one strategy, so a paper
-    # run has something to execute; more than one would invite a comparison this platform is
-    # not yet set up to make honestly.
-    assert len(BUILTIN_STRATEGIES) == 1
-    assert len(build_default_registry()) == 1
+def test_the_default_registry_carries_the_declared_builtin_strategies() -> None:
+    # Was "empty before phase six", then "exactly one" until M9c.3b's research harness made
+    # comparing two strategies honestly possible. Now it's exactly the two declared —
+    # ema_trend (frozen as the benchmark) and breakout — named explicitly so a third
+    # appearing here is a deliberate edit to this test, not a silent drift.
+    assert len(BUILTIN_STRATEGIES) == 2
+    assert len(build_default_registry()) == 2
     assert "ema_trend" in build_default_registry()
+    assert "breakout" in build_default_registry()
 
 
 def test_registry_registers_and_resolves() -> None:

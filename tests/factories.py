@@ -210,11 +210,18 @@ def make_subscription_ack(request_id: int = 1) -> str:
 def make_context(
     *,
     closes: Sequence[Decimal] = (Decimal(50_000), Decimal(51_000)),
+    bars: Sequence[MarketBar] | None = None,
     features: Mapping[str, Decimal] | None = None,
     position_state: PositionState = PositionState.FLAT,
     timeframe: Timeframe = TIMEFRAME,
 ) -> StrategyContext:
-    bars = make_bars(closes, timeframe=timeframe)
+    """Build a context from `closes`, or from `bars` directly when given.
+
+    `bars` is for tests that need control over a bar's own high/low — a moving-average
+    strategy only ever reads `features`, but a breakout-style one also reads
+    `latest_bar.high`/`.low` directly, and `closes` alone cannot express that.
+    """
+    bars = tuple(bars) if bars is not None else make_bars(closes, timeframe=timeframe)
     return StrategyContext(
         symbol=SYMBOL,
         market_type=MarketType.SPOT,

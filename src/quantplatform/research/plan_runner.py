@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from quantplatform.core.errors import (
     DataIntegrityError,
+    DatasetMismatchError,
     PositionRiskAmbiguityError,
     PositionRiskUnavailableError,
 )
@@ -40,6 +41,7 @@ FATAL_ERRORS: frozenset[str] = frozenset(
     error.__name__
     for error in (
         DataIntegrityError,
+        DatasetMismatchError,
         PositionRiskAmbiguityError,
         PositionRiskUnavailableError,
     )
@@ -47,11 +49,14 @@ FATAL_ERRORS: frozenset[str] = frozenset(
 """Failures that end a plan rather than a fold.
 
 Each one says the platform cannot describe its own state — a position it cannot account for,
-a record that contradicts itself. Every later fold would run against that same unexplained
-state, so the honest outcome is a short plan with a reason rather than a full one nobody can
-defend. Listed explicitly so that adding to it is a decision someone makes on purpose, and matched
-by name rather than caught, so the fold that failed is *recorded* before the plan stops —
-an aborted plan whose final fold left no evidence would be the least useful of all.
+a record that contradicts itself, or a loader serving bars that are not the dataset a fold
+asked for. That last one belongs here specifically because the loader is shared across every
+fold of a plan: a mismatch in fold 3 means the same broken loader is about to be asked for
+fold 4, and every later fold would run against that same unexplained state. The honest
+outcome is a short plan with a reason rather than a full one nobody can defend. Listed
+explicitly so that adding to it is a decision someone makes on purpose, and matched by name
+rather than caught, so the fold that failed is *recorded* before the plan stops — an aborted
+plan whose final fold left no evidence would be the least useful of all.
 """
 
 
@@ -152,7 +157,7 @@ class WalkForwardRunner:
                 bars = loader(
                     symbol=definition.dataset.symbol,
                     market_type=definition.dataset.market_type,
-                    timeframe=definition.dataset.timeframe,  # type: ignore[arg-type]
+                    timeframe=definition.dataset.timeframe,
                     window=window,
                 )
                 result = self._runner.run(

@@ -27,7 +27,7 @@ is the only place that decision lives.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Final, Protocol, runtime_checkable
@@ -40,15 +40,19 @@ from quantplatform.core.errors import (
     DataIntegrityError,
     DataProviderError,
     MarketDataSubscriptionError,
+    UnsupportedMarketError,
 )
+from quantplatform.core.interfaces import SymbolRulesProvider
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.numeric import to_decimal
 from quantplatform.core.timeutils import ensure_utc
 
 __all__ = [
+    "SYMBOL_RULES_PROVIDERS",
     "BinanceSpotSymbolRulesProvider",
     "ExchangeInfoTransport",
     "HttpExchangeInfoTransport",
+    "symbol_rules_provider_for",
 ]
 
 DEFAULT_EXCHANGE_INFO_URL: Final[str] = "https://api.binance.com/api/v3/exchangeInfo"
@@ -290,6 +294,39 @@ class BinanceSpotSymbolRulesProvider:
             source=f"binance_spot:{venue_symbol}",
             updated_at=fetched_at,
         )
+
+
+SYMBOL_RULES_PROVIDERS: Final[Mapping[MarketType, Callable[[Clock], SymbolRulesProvider]]] = {
+    MarketType.SPOT: lambda clock: BinanceSpotSymbolRulesProvider(clock=clock),
+}
+"""Every market type this platform can fetch trading rules for, named explicitly.
+
+A dictionary rather than an ``if``/``else`` with a spot default, so that adding margin,
+futures or perpetual support is the one-line act of adding an entry — and so that *not*
+supporting them is equally visible as their simple absence, rather than a branch someone has
+to read to notice is missing.
+"""
+
+
+def symbol_rules_provider_for(market_type: MarketType, *, clock: Clock) -> SymbolRulesProvider:
+    """Return the provider that fetches trading rules for this market type.
+
+    Fail-closed. There is no fallback to the spot provider for a market type this platform
+    does not yet support: a perpetual or futures backtest sized against spot filters would
+    look like a normal run and be a wrong one, and the whole point of pinning
+    :class:`~quantplatform.core.models.market.SymbolRules` into an experiment is that its
+    numbers are never quietly substituted.
+
+    Raises:
+        UnsupportedMarketError: If no provider is wired for this market type, naming every
+            market type that *is*.
+    """
+    factory = SYMBOL_RULES_PROVIDERS.get(market_type)
+    if factory is None:
+        implemented = ", ".join(sorted(kind.value for kind in SYMBOL_RULES_PROVIDERS))
+        msg = f"no trading-rules provider is implemented for market type {market_type.value!r}"
+        raise UnsupportedMarketError(msg, market_type=market_type.value, implemented=implemented)
+    return factory(clock)
 
 
 def _validate_endpoint(url: str) -> None:

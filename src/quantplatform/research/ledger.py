@@ -208,7 +208,49 @@ class ExperimentLedger:
         first attempt and one found on the twelfth are different kinds of evidence, and only
         this count distinguishes them.
         """
-        return sum(1 for entry in self.entries() if entry.experiment_id == experiment_id)
+        return len(self.attempts_for(experiment_id))
+
+    def attempts_for(self, experiment_id: str) -> tuple[LedgerEntry, ...]:
+        """Return every real attempt at this experiment, oldest first.
+
+        A ``REPRODUCIBILITY_FAILURE`` line is not a second look at the question: it
+        *restates* an attempt already on this list to raise an alarm about it, sharing that
+        attempt's own ``attempt_id``. Counting it as a third attempt would overstate how many
+        times the question was actually asked, exactly when a contradiction is already the
+        thing most likely to mislead a reader who skims the count.
+        """
+        return tuple(
+            entry
+            for entry in self.entries()
+            if entry.experiment_id == experiment_id and _is_a_real_attempt(entry)
+        )
+
+    def latest_attempt(self, experiment_id: str) -> LedgerEntry:
+        """Return the most recent real attempt at this experiment.
+
+        Raises:
+            LookupError: If the experiment never ran. Answering with an empty or synthetic
+                entry would let a caller compare against a run that never happened.
+        """
+        attempts = self.attempts_for(experiment_id)
+        if not attempts:
+            msg = f"experiment {experiment_id} never ran"
+            raise LookupError(msg)
+        return attempts[-1]
+
+    def entry_for_attempt(self, attempt_id: str) -> LedgerEntry:
+        """Return the line that first recorded this attempt.
+
+        Raises:
+            LookupError: If no line names this attempt. A ``compare`` asking for a specific
+                attempt is asking about a specific run, and a run that was never recorded is
+                a question with no evidence to answer it, not zero rows.
+        """
+        for entry in self.entries():
+            if entry.attempt_id == attempt_id and _is_a_real_attempt(entry):
+                return entry
+        msg = f"no recorded attempt {attempt_id}"
+        raise LookupError(msg)
 
 
 class ReproducibilityVerdict(StrEnum):
@@ -272,6 +314,16 @@ def _entry_id(fields: Mapping[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_ENTRY_ID_LENGTH]
 
 
+def _is_a_real_attempt(entry: LedgerEntry) -> bool:
+    """Return whether this line is a run rather than an alarm restating one.
+
+    A ``REPRODUCIBILITY_FAILURE`` line shares its ``attempt_id`` with the attempt it is
+    raising an alarm about — it names no evidence of its own. Shared by every place that
+    counts, lists or looks up attempts, so "what counts as an attempt" is answered once.
+    """
+    return entry.status is not ExperimentStatus.REPRODUCIBILITY_FAILURE
+
+
 def _comparable(previous: Sequence[LedgerEntry], entry: LedgerEntry) -> LedgerEntry | None:
     """Return the earlier run this one should be judged against.
 
@@ -284,9 +336,7 @@ def _comparable(previous: Sequence[LedgerEntry], entry: LedgerEntry) -> LedgerEn
     Attempts that were themselves alarms are skipped: an alarm restates a result rather than
     adding one, and comparing against it would count the same run twice.
     """
-    candidates = [
-        line for line in previous if line.status is not ExperimentStatus.REPRODUCIBILITY_FAILURE
-    ]
+    candidates = [line for line in previous if _is_a_real_attempt(line)]
     if not candidates:
         return None
     matched = [

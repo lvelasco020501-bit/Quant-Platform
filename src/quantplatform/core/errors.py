@@ -16,6 +16,7 @@ __all__ = [
     "DataGapError",
     "DataIntegrityError",
     "DataProviderError",
+    "DatasetMismatchError",
     "DomainValidationError",
     "DuplicateFillError",
     "DuplicateOrderError",
@@ -62,6 +63,7 @@ __all__ = [
     "TelemetryNotConfiguredError",
     "UnknownOrderStateError",
     "UnsupportedFeeAssetError",
+    "UnsupportedMarketError",
     "UnsupportedMarketTypeError",
     "UnsupportedOrderTypeError",
     "UnsupportedRiskInputError",
@@ -163,6 +165,20 @@ class DataProviderError(DataError):
     code = "data_provider_error"
 
 
+class UnsupportedMarketError(DataProviderError):
+    """Raised when no provider is wired for a requested market type.
+
+    Distinct from :class:`~quantplatform.core.errors.UnsupportedMarketTypeError`, which is
+    raised by the portfolio and execution layers when a *fill* names a market type they do
+    not settle. This one is raised earlier and elsewhere: when nothing knows how to fetch a
+    venue's trading rules for the market type at all. Raised rather than answered with the
+    spot provider, which would size every future perpetual or margin backtest against the
+    wrong filters without saying so.
+    """
+
+    code = "unsupported_market_error"
+
+
 class DataIntegrityError(DataError):
     """Raised when a bar or series violates structural integrity rules."""
 
@@ -173,6 +189,18 @@ class DataGapError(DataError):
     """Raised when an expected bar is missing from a contiguous series."""
 
     code = "data_gap_error"
+
+
+class DatasetMismatchError(DataError):
+    """Raised when the bars handed to a run do not match the dataset they claim to be.
+
+    A wrong symbol, market type or timeframe, a bar outside the declared range, an open bar,
+    or bars out of order — any of these means the loader served something other than what the
+    experiment's definition names, and running the engine over it would produce a result that
+    is evidence about the wrong question.
+    """
+
+    code = "dataset_mismatch_error"
 
 
 class StaleDataError(DataError):

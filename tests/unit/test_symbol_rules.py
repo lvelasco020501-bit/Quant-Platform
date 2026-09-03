@@ -21,11 +21,13 @@ from quantplatform.core.errors import (
     DataIntegrityError,
     DataProviderError,
     MarketDataSubscriptionError,
+    UnsupportedMarketError,
 )
 from quantplatform.marketdata.symbol_rules import (
     DEFAULT_EXCHANGE_INFO_URL,
     BinanceSpotSymbolRulesProvider,
     ExchangeInfoTransport,
+    symbol_rules_provider_for,
 )
 from tests.factories import ANCHOR
 
@@ -315,3 +317,24 @@ def test_the_provider_never_sends_a_credential() -> None:
     assert transport.url == DEFAULT_EXCHANGE_INFO_URL
     assert "key" not in transport.url.lower()
     assert "signature" not in transport.url.lower()
+
+
+# --- Selecting a provider by market type -----------------------------------------------
+
+
+def test_spot_resolves_to_the_binance_spot_provider() -> None:
+    provider = symbol_rules_provider_for(MarketType.SPOT, clock=SimulatedClock(ANCHOR))
+
+    assert isinstance(provider, BinanceSpotSymbolRulesProvider)
+
+
+@pytest.mark.parametrize(
+    "market_type", [MarketType.MARGIN, MarketType.FUTURES, MarketType.PERPETUAL]
+)
+def test_an_unimplemented_market_type_is_refused_rather_than_defaulted_to_spot(
+    market_type: MarketType,
+) -> None:
+    # No provider exists for these yet. A fallback to spot here would size a perpetual or
+    # futures backtest against spot filters and never say so.
+    with pytest.raises(UnsupportedMarketError, match=market_type.value):
+        symbol_rules_provider_for(market_type, clock=SimulatedClock(ANCHOR))

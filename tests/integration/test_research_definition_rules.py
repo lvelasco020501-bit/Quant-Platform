@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import pytest
 
-from quantplatform.core.enums import MarketType
+from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.features import NullFeaturePipeline
 from quantplatform.orchestration.research import ExperimentEngineFactory
 from quantplatform.research.definition import DatasetSpec, experiment_id
@@ -30,7 +30,7 @@ def test_a_dataset_must_say_which_rules_the_experiment_ran_under() -> None:
         DatasetSpec(  # type: ignore[call-arg]
             symbol=SYMBOL,
             market_type=MarketType.SPOT,
-            timeframe="1h",
+            timeframe=Timeframe.H1,
             start=ANCHOR,
             end=ANCHOR.replace(year=2027),
             source="fixture",
@@ -41,7 +41,7 @@ def test_a_dataset_must_say_which_market_it_ran_on() -> None:
     with pytest.raises(ValueError, match="market_type"):
         DatasetSpec(  # type: ignore[call-arg]
             symbol=SYMBOL,
-            timeframe="1h",
+            timeframe=Timeframe.H1,
             start=ANCHOR,
             end=ANCHOR.replace(year=2027),
             source="fixture",

@@ -119,9 +119,6 @@ def aggregate_walk_forward(
     folds = [
         result for result in results if result.definition.role is ExperimentRole.WALK_FORWARD_TEST
     ]
-    folds = [
-        result for result in results if result.definition.role is ExperimentRole.WALK_FORWARD_TEST
-    ]
     completed = [
         result
         for result in folds

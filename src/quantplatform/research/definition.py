@@ -22,7 +22,7 @@ from typing import Self
 from pydantic import model_validator
 
 from quantplatform.backtesting.config import BacktestConfig
-from quantplatform.core.enums import MarketType
+from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.base import (
     DomainModel,
     SemanticVersion,
@@ -83,7 +83,10 @@ class DatasetSpec(DomainModel):
     perpetual one over the same symbol are different runs, and a default here would let one
     be filed as the other."""
 
-    timeframe: Text
+    timeframe: Timeframe
+    """The declared timeframe, typed rather than a bare string, so a dataset naming a
+    timeframe that does not exist fails to construct instead of failing later, deep inside
+    validation against bars that were never going to match it."""
     start: UtcDatetime
     end: UtcDatetime
     source: Text

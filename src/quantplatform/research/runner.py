@@ -15,7 +15,8 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
-from quantplatform.core.errors import QuantPlatformError
+from quantplatform.core.errors import DatasetMismatchError, QuantPlatformError
+from quantplatform.research.dataset import validate_dataset
 from quantplatform.research.definition import ExperimentDefinition
 from quantplatform.research.digest import bars_digest
 from quantplatform.research.result import ExperimentResult, ExperimentStatus
@@ -75,10 +76,23 @@ class ExperimentRunner:
             configuration that blew it up, and an exception would record that nowhere.
         """
         started_at = self._now()
-        digest = bars_digest(bars)
+        try:
+            validated = validate_dataset(definition, bars)
+        except DatasetMismatchError as exc:
+            return ExperimentResult(
+                definition=definition,
+                code_revision=code_revision,
+                status=ExperimentStatus.FAILED,
+                error=f"{type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__,
+                bars_digest=None,
+                started_at=started_at,
+                finished_at=self._now(),
+            )
+        digest = bars_digest(validated)
         try:
             engine = factory(definition)
-            outcome = engine.run(bars)
+            outcome = engine.run(validated)
         except (QuantPlatformError, ValueError, ArithmeticError) as exc:
             return ExperimentResult(
                 definition=definition,

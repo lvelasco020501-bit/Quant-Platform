@@ -20,7 +20,7 @@ from quantplatform.research.definition import (
     ExperimentDefinition,
     StrategySpec,
 )
-from quantplatform.research.ledger import ExperimentLedger
+from quantplatform.research.ledger import ExperimentLedger, ReproducibilityVerdict
 from quantplatform.research.result import ExperimentStatus, result_hash
 from quantplatform.research.runner import ExperimentRunner
 from tests.factories import (
@@ -115,6 +115,35 @@ def test_a_run_that_blows_up_becomes_a_failed_result_rather_than_an_exception() 
     assert result.status is ExperimentStatus.FAILED
     assert result.error is not None
     assert result.performance is None
+
+
+def test_a_dataset_that_does_not_match_becomes_a_failed_result_with_no_digest() -> None:
+    # Validation runs before the digest is taken. There is no honest fingerprint for bars
+    # that were rejected, so None is recorded rather than a digest over data nobody validated.
+    result = ExperimentRunner().run(_definition(), bars=(), factory=_factory)
+
+    assert result.status is ExperimentStatus.FAILED
+    assert result.error_type == "DatasetMismatchError"
+    assert result.bars_digest is None
+
+
+def test_two_dataset_mismatches_of_the_same_experiment_compare_as_indeterminate(
+    tmp_path: Path,
+) -> None:
+    # code_revision is pinned identically on both runs so the only fingerprint in question
+    # is bars_digest. Neither run carries one to compare, so the honest answer is "I cannot
+    # tell" rather than a false REPRODUCIBILITY_FAILURE manufactured from comparing two
+    # absences — and, before dataset validation existed, a false REPRODUCIBLE manufactured
+    # from comparing two runs that both happened to digest an empty sequence the same way.
+    ledger = ExperimentLedger(tmp_path / "ledger.jsonl")
+    runner = ExperimentRunner()
+
+    ledger.record(runner.run(_definition(), bars=(), factory=_factory, code_revision="abc1234"))
+    entry = ledger.record(
+        runner.run(_definition(), bars=(), factory=_factory, code_revision="abc1234")
+    )
+
+    assert entry.verdict is ReproducibilityVerdict.INDETERMINATE
 
 
 # --- The ledger ---------------------------------------------------------------------------------

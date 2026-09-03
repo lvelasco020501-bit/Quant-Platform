@@ -47,6 +47,14 @@ def test_the_same_definition_always_names_the_same_experiment() -> None:
     assert experiment_id(_definition()) == experiment_id(_definition())
 
 
+def test_the_identifier_is_the_one_every_earlier_milestone_relied_on() -> None:
+    # DatasetSpec.timeframe changed from a bare string to a Timeframe in M9c.3a.1. A
+    # StrEnum serialises to the same value either way, so this pins the one thing that
+    # actually matters: every experiment_id computed before the change still means the
+    # same experiment after it.
+    assert experiment_id(_definition()) == "a9aa6c2fb26ceb30db1f8f60b7b7389c"
+
+
 def test_changing_one_field_changes_the_name() -> None:
     other = _definition(
         strategy=StrategySpec(

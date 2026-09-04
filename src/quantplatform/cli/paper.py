@@ -67,6 +67,13 @@ _SessionOption = Annotated[
 _StrategyOption = Annotated[
     str | None, typer.Option("--strategy", help="Registered strategy identifier.")
 ]
+_ParamOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--param",
+        help="Strategy parameter as KEY=VALUE; repeat for several. Overrides settings.",
+    ),
+]
 _MaxBarsOption = Annotated[
     int | None, typer.Option("--max-bars", help="Stop after this many received bars.")
 ]
@@ -75,7 +82,33 @@ _ResumeOption = Annotated[
 ]
 
 
-def _overrides(
+def _strategy_params(pairs: list[str]) -> dict[str, str]:
+    """Turn repeated ``KEY=VALUE`` options into the mapping configuration expects.
+
+    Only the split is performed here. Whether a key is one the strategy declares, and
+    whether its value is usable, are questions for the strategy's own schema — asking them
+    here would put a second opinion about parameters in front of the one that decides.
+
+    Raises:
+        ValueError: If an option is not ``KEY=VALUE``, or names a key twice. A repeated key
+            is refused rather than resolved by precedence, because either answer silently
+            discards something the operator typed.
+    """
+    parsed: dict[str, str] = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key.strip():
+            msg = f"strategy parameter {pair!r} must be written as KEY=VALUE"
+            raise ValueError(msg)
+        name = key.strip()
+        if name in parsed:
+            msg = f"strategy parameter {name!r} was given more than once"
+            raise ValueError(msg)
+        parsed[name] = value.strip()
+    return parsed
+
+
+def _overrides(  # noqa: PLR0913 - one keyword per CLI option, by construction
     *,
     symbols: list[str] | None,
     timeframe: str | None,
@@ -85,6 +118,7 @@ def _overrides(
     session_id: str | None,
     strategy: str | None,
     max_bars: int | None,
+    params: list[str] | None = None,
 ) -> dict[str, Any]:
     """Collect the command-line overrides that were actually supplied.
 
@@ -94,6 +128,8 @@ def _overrides(
     supplied: dict[str, Any] = {}
     if symbols:
         supplied["symbols"] = tuple(symbols)
+    if params:
+        supplied["strategy_params"] = _strategy_params(params)
     if timeframe is not None:
         supplied["timeframe"] = timeframe
     if reports_dir is not None:
@@ -157,6 +193,7 @@ def check(
     log_dir: _LogsOption = None,
     session_id: _SessionOption = None,
     strategy: _StrategyOption = None,
+    param: _ParamOption = None,
 ) -> None:
     """Run every startup validation and exit without opening a socket.
 
@@ -174,10 +211,14 @@ def check(
                 session_id=session_id,
                 strategy=strategy,
                 max_bars=None,
+                params=param,
             )
         )
         rules = _symbol_rules(settings)
-        validate_startup(settings, symbol_rules=rules, registry=build_default_registry())
+        # The same construction `run` performs. If the strategy cannot be built with the
+        # configured parameters, this is where it is discovered — before a socket, and
+        # before READY_FOR_PAPER_RUN is printed.
+        built = validate_startup(settings, symbol_rules=rules, registry=build_default_registry())
     except QuantPlatformError as exc:
         typer.echo(json.dumps(exc.to_dict(), default=str, indent=2), err=True)
         raise typer.Exit(code=EXIT_CONFIGURATION_ERROR) from exc
@@ -186,7 +227,17 @@ def check(
         raise typer.Exit(code=EXIT_CONFIGURATION_ERROR) from exc
 
     typer.echo("READY_FOR_PAPER_RUN")
-    typer.echo(json.dumps(_summarise(settings, symbol_rules=rules), indent=2, default=str))
+    typer.echo(
+        json.dumps(
+            _summarise(
+                settings,
+                symbol_rules=rules,
+                strategy_parameters=built.parameters.model_dump(),
+            ),
+            indent=2,
+            default=str,
+        )
+    )
 
 
 @app.command("run")
@@ -198,6 +249,7 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
     log_dir: _LogsOption = None,
     session_id: _SessionOption = None,
     strategy: _StrategyOption = None,
+    param: _ParamOption = None,
     max_bars: _MaxBarsOption = None,
     resume: _ResumeOption = False,  # noqa: FBT002 - a CLI flag needs its default here
 ) -> None:
@@ -209,18 +261,21 @@ def run(  # noqa: PLR0913, PLR0917 - typer derives the CLI from this signature
     Raises:
         typer.Exit: With a non-zero code when startup or the run itself fails.
     """
-    overrides = _overrides(
-        symbols=symbols,
-        timeframe=timeframe,
-        reports_dir=reports_dir,
-        state_dir=state_dir,
-        log_dir=log_dir,
-        session_id=session_id,
-        strategy=strategy,
-        max_bars=max_bars,
-    )
     lock: SessionLock | None = None
     try:
+        # Inside the guard, because a malformed --param is a configuration mistake and must
+        # leave the same clean non-zero exit as any other, not a traceback.
+        overrides = _overrides(
+            symbols=symbols,
+            timeframe=timeframe,
+            reports_dir=reports_dir,
+            state_dir=state_dir,
+            log_dir=log_dir,
+            session_id=session_id,
+            strategy=strategy,
+            max_bars=max_bars,
+            params=param,
+        )
         settings = _settings_with(overrides)
         log_paths = configure_file_logging(
             directory=settings.paper.log_directory,
@@ -304,14 +359,24 @@ def _outcome(deployment: PaperDeployment, *, result_bars: int) -> dict[str, obje
 
 
 def _summarise(
-    settings: Settings, *, symbol_rules: Mapping[str, SymbolRules] | None = None
+    settings: Settings,
+    *,
+    symbol_rules: Mapping[str, SymbolRules] | None = None,
+    strategy_parameters: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build a summary of the deployment that contains no secret material."""
+    """Build a summary of the deployment that contains no secret material.
+
+    ``strategy_parameters`` are the values the strategy was actually *constructed* with,
+    read back off the built instance rather than off configuration. Reporting the request
+    instead of the result is what let a check claim readiness for a strategy that was never
+    built: an operator reading this needs to see the numbers the session will trade on.
+    """
     paper = settings.paper
     rules = symbol_rules or {}
     return {
         "status": "READY_FOR_PAPER_RUN" if rules else "NOT_READY",
         "strategy": paper.strategy_id,
+        "strategy_parameters": dict(strategy_parameters or {}),
         "symbol_rules": {
             symbol: {
                 "price_tick": str(rule.price_tick),

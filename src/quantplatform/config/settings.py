@@ -317,6 +317,22 @@ class PaperSettings(_SettingsSection):
     nobody chose. Startup refuses until this is set and resolvable.
     """
 
+    strategy_params: dict[str, str] = Field(default_factory=dict)
+    """Parameters handed to the configured strategy, as raw strings.
+
+    Deliberately untyped here and deliberately not validated here. Which parameters exist,
+    which are required and what each may hold are properties of the strategy, declared by its
+    own schema, and a second copy of that knowledge in configuration would be a second thing
+    to keep in step. Strings because that is what an environment variable carries; the
+    strategy's schema is what turns ``"20"`` into ``20`` and refuses ``"twenty"``.
+
+    Empty is the honest default rather than a convenience: a strategy whose parameters all
+    declare defaults resolves from it unchanged, and one that requires a parameter is refused
+    at startup instead of being handed a number nobody configured. That refusal is the whole
+    point — ``breakout`` could not be started at all before this existed, because there was
+    no way to say 20 and 10.
+    """
+
     symbols: tuple[Symbol, ...] = ("BTC/USDT",)
     timeframe: Timeframe = Timeframe.H1
 

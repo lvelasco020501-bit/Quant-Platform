@@ -158,21 +158,34 @@ def validate_startup(
     *,
     symbol_rules: Mapping[str, SymbolRules],
     registry: StrategyRegistry,
-) -> None:
+) -> BaseStrategy:
     """Refuse to start on anything that can be known to be wrong beforehand.
 
     Everything here is cheap and everything here is fatal. A paper run is expected to last
     a week; the cost of discovering a missing directory or an unresolvable strategy on day
     four is the whole week, and none of these checks need a network to perform.
 
+    **Returns the strategy it built, and building it is the point.** Asking whether an
+    identifier is present in the registry is not the same question as whether the thing it
+    names can be constructed, and answering the cheap one was how ``paper check`` came to
+    report a deployment ready that could not build its own strategy: ``breakout`` declares
+    no default lookbacks, so it was unconstructable while the membership test passed
+    happily. The instance is returned rather than discarded so the caller wires the very
+    object validation approved, instead of building a second one that agrees by coincidence.
+
     Args:
         settings: Effective configuration.
         symbol_rules: Venue trading rules for every configured instrument.
         registry: Strategy registry the configured identifier is resolved against.
 
+    Returns:
+        The constructed strategy, ready to be wired.
+
     Raises:
         ConfigurationError: If the configuration is incoherent, the strategy cannot be
             resolved, or venue rules are missing for a configured instrument.
+        StrategyNotFoundError: If the configured identifier is not registered.
+        StrategyParameterError: If the configured parameters fail the strategy's own schema.
         StorageError: If a required directory is unusable.
     """
     paper = settings.paper
@@ -241,6 +254,34 @@ def validate_startup(
             strategy_id=paper.strategy_id,
             registered=sorted(item.strategy_id for item in registry.list_metadata()),
         )
+    return resolve_strategy(settings, registry=registry)
+
+
+def resolve_strategy(settings: Settings, *, registry: StrategyRegistry) -> BaseStrategy:
+    """Build the configured strategy from the configured parameters.
+
+    The single place a paper session's strategy comes into existence. ``check`` and ``run``
+    both reach it through :func:`validate_startup`, which is what makes a passing check a
+    statement about the run rather than about a different code path that resembles it.
+
+    Nothing here knows what any particular strategy's parameters mean. The mapping is
+    forwarded as configured and the strategy's declared schema decides — which is why adding
+    a strategy that needs three parameters, or none, requires no change to this function.
+
+    Args:
+        settings: Effective configuration.
+        registry: Strategy registry the configured identifier is resolved against.
+
+    Returns:
+        The constructed strategy.
+
+    Raises:
+        StrategyNotFoundError: If the configured identifier is not registered.
+        StrategyParameterError: If the parameters fail the strategy's declared schema —
+            missing, unknown or out of range alike.
+    """
+    paper = settings.paper
+    return registry.create(str(paper.strategy_id), dict(paper.strategy_params))
 
 
 def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters are its seams
@@ -287,14 +328,17 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
         StorageError: If a required directory is unusable.
     """
     resolved_registry = registry if registry is not None else build_default_registry()
-    if strategy is None:
-        validate_startup(settings, symbol_rules=symbol_rules, registry=resolved_registry)
+    # One construction, not two. Validation builds the strategy and hands it over, so the
+    # session runs the instance that was approved rather than a second one built from the
+    # same identifier — which is how an empty parameter mapping went unnoticed here while
+    # `check` reported the deployment ready.
+    resolved_strategy = (
+        strategy
+        if strategy is not None
+        else validate_startup(settings, symbol_rules=symbol_rules, registry=resolved_registry)
+    )
     resolved_clock = clock if clock is not None else SystemClock()
     paper = settings.paper
-
-    resolved_strategy = (
-        strategy if strategy is not None else resolved_registry.create(str(paper.strategy_id), {})
-    )
 
     # One store, shared by reference with the portfolio engine, the broker and the
     # pipeline. Handing each of them its own copy is what would let a refresh reach one and

@@ -33,7 +33,15 @@ on the same tailnet, which is the exposure this service is designed for."""
 class WebSettings(BaseSettings):
     """Runtime configuration for the read-only dashboard."""
 
-    model_config = SettingsConfigDict(env_prefix="QP_WEB_", extra="forbid", frozen=True)
+    model_config = SettingsConfigDict(env_prefix="MISSION_CONTROL_", extra="forbid", frozen=True)
+    """Prefixed outside the platform's own ``QP_`` namespace, deliberately.
+
+    ``Settings`` reads every ``QP_`` variable and forbids extras, so a dashboard variable
+    named ``QP_WEB_HOST`` is not merely ignored by it — it makes the whole platform
+    configuration refuse to load, and the page 500s with a message about a field nobody
+    was asking it to validate. Control Center v1 used its own prefix for this reason; the
+    lesson is cheaper to keep than to relearn.
+    """
 
     host: str = "127.0.0.1"
     """Bind address. Loopback by default: a monitoring page must never end up reachable

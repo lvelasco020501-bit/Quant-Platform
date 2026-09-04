@@ -228,6 +228,37 @@ def test_a_wildcard_bind_is_refused_and_cannot_be_opted_into() -> None:
             WebSettings(host=wildcard, allow_public_bind=True)
 
 
+def test_dashboard_variables_do_not_collide_with_the_platforms_namespace(
+    tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live 500 taught this: the platform's Settings reads every QP_ variable and forbids
+    # extras, so a dashboard variable under that prefix does not get ignored — it stops the
+    # whole platform configuration from loading, and the page fails with a message about a
+    # field nobody asked it to validate.
+    monkeypatch.setenv("MISSION_CONTROL_HOST", "127.0.0.1")
+    monkeypatch.setenv("MISSION_CONTROL_PORT", "8800")
+    monkeypatch.setenv("MISSION_CONTROL_SESSION_ID", SESSION)
+    monkeypatch.setenv("MISSION_CONTROL_STATE_DIRECTORY", str(tree["state"]))
+    monkeypatch.setenv("MISSION_CONTROL_REPORTS_DIRECTORY", str(tree["reports"]))
+    monkeypatch.setenv("MISSION_CONTROL_LOG_DIRECTORY", str(tree["logs"]))
+    monkeypatch.setenv("MISSION_CONTROL_SMOKE_HOURS", "72")
+    _persist(tree, _state())
+
+    # Both must construct with those variables present: the dashboard's from them, and the
+    # platform's despite them.
+    settings = WebSettings()
+    assert settings.session_id == SESSION
+    assert settings.smoke_hours == 72
+
+    response = TestClient(create_app(settings)).get("/api/status")
+    assert response.status_code == 200
+    assert response.json()["smoke"]["progress"] is not None
+
+
+def test_no_setting_uses_the_platform_prefix() -> None:
+    assert not WebSettings.model_config["env_prefix"].startswith("QP_")
+
+
 def test_a_tailscale_address_binds_without_an_override() -> None:
     settings = WebSettings(host="100.65.149.67")
 

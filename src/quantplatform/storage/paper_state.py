@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
 from pydantic import ValidationError
 
@@ -59,16 +59,22 @@ suite fails if a new computed field appears and this map is not updated.
 class FilePaperStateRepository:
     """Stores paper-session snapshots as atomically replaced JSON files."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, writable: bool = True) -> None:
         """Create a repository rooted at a directory.
 
         Args:
             directory: Where session documents live. Created if absent.
+            writable: Whether this repository will be written through. A writer is checked
+                here rather than at its first ``save``, because discovering an unwritable
+                state directory after a week of trading is discovering it too late. Use
+                :meth:`for_reading` instead of passing ``False``.
 
         Raises:
             StorageError: If the directory cannot be created or is not usable.
         """
         self._directory = directory
+        if not writable:
+            return
         try:
             directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -77,6 +83,28 @@ class FilePaperStateRepository:
             ) from exc
         if not os.access(directory, os.W_OK):
             raise StorageError("paper state directory is not writable", directory=str(directory))
+
+    @classmethod
+    def for_reading(cls, directory: Path) -> Self:
+        """Open a repository that will only ever be read from.
+
+        Neither creates the directory nor requires it to be writable, because a reader needs
+        neither. That is not a convenience: a monitoring process that had to hold write
+        permission on the trading system's state directory in order to read it would be
+        over-privileged by construction, and the operating system could no longer be used to
+        guarantee it cannot write there.
+
+        A ``save`` through the returned instance is not blocked here — the filesystem will
+        refuse it — because a second guard duplicating a permission the OS already enforces
+        is a second thing that can disagree with it.
+
+        Args:
+            directory: Where session documents live.
+
+        Returns:
+            A repository suitable for reads.
+        """
+        return cls(directory, writable=False)
 
     @property
     def directory(self) -> Path:

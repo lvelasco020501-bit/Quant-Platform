@@ -279,7 +279,9 @@ def _load_state(
 ) -> PaperSessionState | None:
     """Load the persisted snapshot, reporting a refusal rather than raising through it."""
     try:
-        state = FilePaperStateRepository(directory).load(session_id)
+        # Read-only: an observer that needed write permission on the trading system's
+        # state directory in order to read it could not be confined by the OS.
+        state = FilePaperStateRepository.for_reading(directory).load(session_id)
     except Exception as exc:
         _both(
             notes,

@@ -255,6 +255,23 @@ def test_dashboard_variables_do_not_collide_with_the_platforms_namespace(
     assert response.json()["smoke"]["progress"] is not None
 
 
+def test_a_read_only_state_directory_is_still_readable(tree: dict[str, Path]) -> None:
+    # Found in deployment: the dashboard's systemd unit mounts the trading tree with
+    # ReadOnlyPaths, which is exactly the confinement wanted — and the state repository
+    # refused to open at all, because its constructor demanded write access it would never
+    # use. An observer must not need write permission on what it observes.
+    _persist(tree, _state())
+    tree["state"].chmod(0o555)
+    try:
+        payload = _client(tree).get("/api/status").json()
+
+        assert payload["portfolio"]["cash"] == "10000"
+        assert payload["market"]["bars_processed"] == 5
+        assert not any("not writable" in note for note in payload["notes"])
+    finally:
+        tree["state"].chmod(0o755)
+
+
 def test_no_setting_uses_the_platform_prefix() -> None:
     assert not WebSettings.model_config["env_prefix"].startswith("QP_")
 

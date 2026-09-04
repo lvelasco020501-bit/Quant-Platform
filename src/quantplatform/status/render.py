@@ -266,18 +266,18 @@ def _infrastructure(status: SessionStatus, paint: _Paint) -> list[str]:
     out.append(_row("Restarts", _int(status.restarts)))
     report = status.report
     if report is None:
-        out.append(_row("Reconnects (today)", "N/A"))
-        out.append(_row("Data gaps (today)", "N/A"))
-        out.append(_row("Runtime errors (today)", "N/A"))
+        out.append(_row("Reconnects today", "N/A"))
+        out.append(_row("Data gaps today", "N/A"))
+        out.append(_row("Runtime errors today", "N/A"))
         return out
     # Per-day figures, and labelled as such. The feed's own counters are cumulative for the
     # life of the session; the report subtracts the day's opening reading precisely so that
     # yesterday's reconnects do not haunt today, and flattening that back out here would
     # undo the distinction.
     stats = report.statistics
-    out.append(_row("Reconnects (today)", _int(stats.daily_reconnects)))
-    out.append(_row("Data gaps (today)", _flagged(stats.daily_gaps, paint)))
-    out.append(_row("Runtime errors (today)", _flagged(stats.runtime_exceptions, paint)))
+    out.append(_row("Reconnects today", _int(stats.daily_reconnects)))
+    out.append(_row("Data gaps today", _flagged(stats.daily_gaps, paint)))
+    out.append(_row("Runtime errors today", _flagged(stats.runtime_exceptions, paint)))
     return out
 
 
@@ -344,7 +344,14 @@ def _heading(text: str) -> str:
 
 
 def _row(label: str, value: str) -> str:
-    """Return one aligned label/value line."""
+    """Return one aligned label/value line.
+
+    A label at or over the column width still gets one space, so an over-long label pushes
+    its value right instead of running into it. Losing the alignment is survivable; losing
+    the gap makes ``Runtime errors0`` look like a number.
+    """
+    if len(label) >= _LABEL:
+        return f"{label} {value}"
     return f"{label:<{_LABEL}}{value}"
 
 

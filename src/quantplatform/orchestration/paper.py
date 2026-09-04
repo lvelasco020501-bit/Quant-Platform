@@ -40,6 +40,7 @@ from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.execution_policy import ExecutionPolicy, FeePolicy, SlippagePolicy
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.portfolio import Balance
+from quantplatform.core.models.risk import RiskBudget
 from quantplatform.core.symbol_rules import SymbolRulesStore
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
@@ -500,6 +501,26 @@ def _risk_configuration(settings: Settings, policy: ExecutionPolicy) -> RiskConf
     """
     risk = settings.risk
     interval = settings.paper.timeframe.seconds
+
+    # Risk V2 is a pure configuration fact (see `RiskConfiguration.risk_v2_active`): a
+    # `risk_budget` is built only when all four of its fields are set, which `RiskSettings`
+    # itself already guarantees is all-or-nothing. Every other M7/M8 field is passed through
+    # exactly as configured — `None` when unset, so V1 behaviour is untouched unless `.env`
+    # says otherwise.
+    risk_budget: RiskBudget | None = None
+    if (
+        risk.risk_per_trade_pct is not None
+        and risk.max_position_exposure_pct is not None
+        and risk.min_stop_distance_bps is not None
+        and risk.max_stop_distance_bps is not None
+    ):
+        risk_budget = RiskBudget(
+            risk_per_trade_pct=risk.risk_per_trade_pct,
+            max_position_exposure_pct=risk.max_position_exposure_pct,
+            min_stop_distance_bps=risk.min_stop_distance_bps,
+            max_stop_distance_bps=risk.max_stop_distance_bps,
+        )
+
     return RiskConfiguration(
         execution_policy=policy,
         max_open_positions=risk.max_open_positions,
@@ -516,6 +537,16 @@ def _risk_configuration(settings: Settings, policy: ExecutionPolicy) -> RiskConf
         # wants it in seconds. Converting here keeps one source of truth rather than a
         # second staleness setting that could disagree with the first.
         stale_market_data_seconds=int(interval * risk.data_staleness_multiplier),
+        risk_budget=risk_budget,
+        initial_stop_distance_bps=risk.initial_stop_distance_bps,
+        trailing_activation_bps=risk.trailing_activation_bps,
+        trailing_distance_bps=risk.trailing_distance_bps,
+        break_even_activation_bps=risk.break_even_activation_bps,
+        take_profit_distance_bps=risk.take_profit_distance_bps,
+        max_holding_bars=risk.max_holding_bars,
+        max_daily_loss_pct=risk.max_daily_loss_pct,
+        max_consecutive_losses=risk.max_consecutive_losses,
+        latch_total_drawdown=risk.latch_total_drawdown,
     )
 
 

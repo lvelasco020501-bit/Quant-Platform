@@ -38,6 +38,7 @@ from quantplatform.core.models.base import (
     UtcDatetime,
     VenueId,
 )
+from quantplatform.core.models.execution_policy import MAX_BASIS_POINTS
 from quantplatform.core.numeric import Money, NonNegativeMoney, Rate
 
 __all__ = [
@@ -111,6 +112,32 @@ class RiskSettings(_SettingsSection):
     require_reconciliation: bool = True
     min_signal_confidence: Rate = Decimal(0)
 
+    # --- Risk V2 (M7/M8) ---------------------------------------------------------------
+    #
+    # Every field below defaults to `None`/`False`: an unconfigured deployment is bit for
+    # bit the V1 engine, exactly as `RiskConfiguration` itself already guarantees. Setting
+    # one is what activates it — there is no separate "enable V2" flag to forget.
+
+    risk_per_trade_pct: Rate | None = Field(default=None, gt=0, le=Decimal("0.5"))
+    max_position_exposure_pct: Rate | None = Field(default=None, gt=0, le=1)
+    min_stop_distance_bps: NonNegativeMoney | None = None
+    max_stop_distance_bps: NonNegativeMoney | None = None
+    """The four `RiskBudget` fields. All four or none: a partial budget is refused below,
+    the same way a partial one built in code already is by `RiskBudget` itself."""
+
+    initial_stop_distance_bps: NonNegativeMoney | None = Field(
+        default=None, gt=0, le=MAX_BASIS_POINTS
+    )
+    trailing_activation_bps: NonNegativeMoney | None = Field(default=None, le=MAX_BASIS_POINTS)
+    trailing_distance_bps: NonNegativeMoney | None = Field(default=None, le=MAX_BASIS_POINTS)
+    break_even_activation_bps: NonNegativeMoney | None = Field(default=None, le=MAX_BASIS_POINTS)
+    take_profit_distance_bps: NonNegativeMoney | None = Field(default=None, le=MAX_BASIS_POINTS)
+    max_holding_bars: int | None = Field(default=None, ge=1)
+
+    max_daily_loss_pct: Rate | None = Field(default=None, gt=0, le=1)
+    max_consecutive_losses: int | None = Field(default=None, ge=1)
+    latch_total_drawdown: bool = False
+
     @model_validator(mode="after")
     def _validate_restrictions(self) -> Self:
         """Enforce the platform's initial spot-only, long-only restrictions."""
@@ -146,6 +173,20 @@ class RiskSettings(_SettingsSection):
             raise ValueError(msg)
         if self.target_position_fraction > self.max_exposure_fraction:
             msg = "target_position_fraction must not exceed max_exposure_fraction"
+            raise ValueError(msg)
+        budget_fields = {
+            "risk_per_trade_pct": self.risk_per_trade_pct,
+            "max_position_exposure_pct": self.max_position_exposure_pct,
+            "min_stop_distance_bps": self.min_stop_distance_bps,
+            "max_stop_distance_bps": self.max_stop_distance_bps,
+        }
+        configured = [name for name, value in budget_fields.items() if value is not None]
+        if configured and len(configured) != len(budget_fields):
+            msg = (
+                "risk_per_trade_pct, max_position_exposure_pct, min_stop_distance_bps and "
+                "max_stop_distance_bps must all four be set to activate Risk V2, or none of "
+                "them; only got: " + ", ".join(configured)
+            )
             raise ValueError(msg)
         return self
 

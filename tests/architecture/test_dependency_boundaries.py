@@ -37,6 +37,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "status",
         "storage",
         "strategies",
+        "web",
     }
 )
 
@@ -97,6 +98,11 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     # cannot import anything able to. Reporting and storage are how a session already wrote
     # itself down; strategies supplies warm-up requirements from metadata alone.
     "status": frozenset({"core", "config", "storage", "reporting", "strategies"}),
+    # Mission Control renders what `status` gathered and nothing else. It reaches neither
+    # storage nor reporting directly — everything arrives through the status domain, so
+    # there is exactly one place that decides what a session's numbers mean — and like
+    # `status` it cannot import anything capable of trading.
+    "web": frozenset({"core", "config", "status", "strategies"}),
     # Composition roots may wire everything together.
     "orchestration": DOMAINS,
     "api": DOMAINS,

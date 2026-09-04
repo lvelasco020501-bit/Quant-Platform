@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>Quant Platform — Mission Control</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b1220'/%3E%3Cpath d='M7 21l5-7 4 4 9-11' stroke='%234ade80' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <!-- Rendered before any data arrives, so the first paint is the page rather than a
+         blank screen that could be mistaken for a dead service. -->
+    <div id="app" class="app" aria-busy="true">
+      <header class="masthead">
+        <div class="masthead__identity">
+          <h1>Quant&nbsp;Platform</h1>
+          <p class="masthead__subtitle" id="subtitle">Paper Trading · Risk V2 · BTC/USDT</p>
+        </div>
+        <div class="masthead__state">
+          <span class="health health--unknown" id="health">CONNECTING</span>
+          <span class="updated" id="updated">contacting the service…</span>
+        </div>
+      </header>
+
+      <div class="badges" id="badges"></div>
+
+      <div class="banner banner--hidden" id="banner" role="status"></div>
+
+      <main class="grid" id="grid">
+        <section class="card card--wide" id="card-smoke" hidden>
+          <h2 class="card__title">72&nbsp;Hour Paper Smoke Test</h2>
+          <div class="progress"><div class="progress__fill" id="smoke-fill"></div></div>
+          <p class="progress__label" id="smoke-pct">—</p>
+          <dl class="pairs" id="smoke-pairs"></dl>
+        </section>
+
+        <section class="card" id="card-portfolio" hidden>
+          <h2 class="card__title">Portfolio</h2>
+          <div class="figure">
+            <span class="figure__label">Equity</span>
+            <span class="figure__value" id="equity">—</span>
+            <span class="figure__delta" id="equity-delta"></span>
+          </div>
+          <dl class="pairs" id="portfolio-pairs"></dl>
+        </section>
+
+        <section class="card" id="card-position" hidden>
+          <h2 class="card__title">Position</h2>
+          <div id="position-body"></div>
+        </section>
+
+        <section class="card" id="card-market" hidden>
+          <h2 class="card__title">Market</h2>
+          <div class="figure">
+            <span class="figure__label" id="market-symbol">—</span>
+            <span class="figure__value" id="last-close">—</span>
+          </div>
+          <div class="warmup">
+            <div class="warmup__head">
+              <span id="warmup-label">Warm-up</span><span id="warmup-count">—</span>
+            </div>
+            <div class="progress progress--slim">
+              <div class="progress__fill" id="warmup-fill"></div>
+            </div>
+            <p class="hint" id="warmup-hint"></p>
+          </div>
+          <dl class="pairs" id="market-pairs"></dl>
+        </section>
+
+        <section class="card" id="card-risk" hidden>
+          <h2 class="card__title">Risk</h2>
+          <dl class="pairs" id="risk-pairs"></dl>
+          <ul class="breakers" id="breakers"></ul>
+        </section>
+
+        <section class="card" id="card-activity" hidden>
+          <h2 class="card__title">
+            Activity <span class="tag tag--log" title="Read from the session's structured logs, not from its persisted state">log-derived</span>
+          </h2>
+          <div class="stats" id="activity-stats"></div>
+          <p class="hint" id="activity-hint"></p>
+        </section>
+
+        <section class="card" id="card-infra" hidden>
+          <h2 class="card__title">Infrastructure</h2>
+          <dl class="pairs" id="infra-pairs"></dl>
+        </section>
+
+        <section class="card card--wide" id="card-timeline" hidden>
+          <h2 class="card__title">
+            Timeline <span class="tag tag--log" title="Read from the session's structured logs, not from its persisted state">log-derived</span>
+          </h2>
+          <ol class="timeline" id="timeline"></ol>
+        </section>
+      </main>
+
+      <details class="details" id="details-block" hidden>
+        <summary>System details</summary>
+        <dl class="pairs pairs--dense" id="details-pairs"></dl>
+        <h3 class="details__heading">Where each number comes from</h3>
+        <dl class="pairs pairs--dense" id="sources-pairs"></dl>
+      </details>
+
+      <footer class="footer">
+        <span>Read-only observer · no control actions available</span>
+        <span id="schema"></span>
+      </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

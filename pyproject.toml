@@ -26,8 +26,14 @@ dependencies = [
     "matplotlib>=3.9,<4",
 ]
 
+[project.optional-dependencies]
+# Mission Control (src/quantplatform/web/). Isolated in its own extra so the trading
+# system's install footprint is unchanged unless an operator opts into running the UI.
+web = ["fastapi>=0.115,<1", "uvicorn>=0.32,<1"]
+
 [project.scripts]
 quantplatform = "quantplatform.cli.main:app"
+quantplatform-web = "quantplatform.web.server:main"
 
 [dependency-groups]
 dev = [
@@ -38,6 +44,9 @@ dev = [
     "ruff>=0.9,<1",
     "mypy>=1.14,<2",
     "pandas-stubs>=2.2",
+    # Starlette's TestClient drives the Mission Control app in-process; it needs an HTTP
+    # client even though no socket is opened. This starlette requires httpx2 specifically.
+    "httpx2>=0.29",
     # SQLite is only used to exercise the repository and migrations in tests without a
     # running PostgreSQL instance; the production target remains PostgreSQL via psycopg.
     "aiosqlite>=0.20,<1",

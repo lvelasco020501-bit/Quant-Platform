@@ -34,6 +34,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "reporting",
         "research",
         "risk",
+        "status",
         "storage",
         "strategies",
     }
@@ -90,6 +91,12 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     "research": frozenset(
         {"core", "config", "backtesting", "data", "features", "risk", "storage", "strategies"}
     ),
+    # Status observes and never decides. The absence of execution, risk, portfolio, paper
+    # and backtesting from this set is the read-only guarantee itself: a status command
+    # cannot place an order, move a stop, reset a breaker or resume a session, because it
+    # cannot import anything able to. Reporting and storage are how a session already wrote
+    # itself down; strategies supplies warm-up requirements from metadata alone.
+    "status": frozenset({"core", "config", "storage", "reporting", "strategies"}),
     # Composition roots may wire everything together.
     "orchestration": DOMAINS,
     "api": DOMAINS,
@@ -671,7 +678,11 @@ def test_nothing_the_platform_trades_with_imports_reporting() -> None:
     # report would become a description partly of itself.
     for path in _source_files():
         domain = _domain_of(path)
-        if domain in {"orchestration", "api", "cli", "reporting"} or domain is None:
+        # `status` reads reports to describe a session and cannot decide anything with
+        # them: it is barred from execution, risk, portfolio, paper and backtesting, so the
+        # path this test guards against — a report reaching a trading decision — does not
+        # exist for it any more than it does for a composition root.
+        if domain in {"orchestration", "api", "cli", "reporting", "status"} or domain is None:
             continue
         assert "reporting" not in _imported_domains(path), (
             f"{path.relative_to(PACKAGE_ROOT)} may not import reporting"

@@ -25,6 +25,7 @@ from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import PaperSessionState
 from quantplatform.core.models.portfolio import Position
 from quantplatform.core.models.risk import CircuitBreakerState, PositionRiskState
+from quantplatform.core.models.warm_start import WarmStartRecord
 from quantplatform.reporting.config import ReportingConfiguration
 from quantplatform.reporting.models import DailyReport
 from quantplatform.reporting.writer import DailyReportWriter
@@ -104,6 +105,9 @@ class SessionStatus:
 
     state_present: bool
     lock: SessionLockRecord | None
+    warm_start: WarmStartRecord | None = None
+    """How this session obtained its market context, when it was restored. Audit only:
+    a session carrying one is no more resumable than one without."""
 
     @property
     def warmup_complete(self) -> bool | None:
@@ -219,6 +223,7 @@ def gather_status(
         notes=tuple(notes),
         state_present=state is not None,
         lock=lock,
+        warm_start=state.warm_start if state else None,
     )
 
 

@@ -1064,7 +1064,7 @@ def test_a_version_one_snapshot_carrying_risk_state_is_refused() -> None:
         )
 
 
-def test_a_current_snapshot_round_trips_at_version_two() -> None:
+def test_a_current_snapshot_round_trips_at_version_three() -> None:
     session, clock, repository, _ = _session(
         strategy=BuyOnce(_Params()),
         risk_budget=RiskBudget(
@@ -1082,7 +1082,7 @@ def test_a_current_snapshot_round_trips_at_version_two() -> None:
     stored = repository.load("paper-1")
 
     assert stored is not None
-    assert stored.schema_version == 2
+    assert stored.schema_version == 3
     (risk,) = stored.position_risk
     assert risk.initial_risk_amount > Decimal(0)
     assert risk.current_risk_amount > Decimal(0)

@@ -34,6 +34,7 @@ from quantplatform.core.models.risk import RiskContext, RiskDecision
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot, SymbolRulesTelemetry
+from quantplatform.core.models.warm_start import MarketHistory, MarketHistoryManifest
 
 __all__ = [
     "CandleStreamTransport",
@@ -629,6 +630,29 @@ class PaperMarketDataFeed(Protocol):
 
     def close(self) -> None:
         """Release the feed's resources; safe to call more than once."""
+        ...
+
+
+@runtime_checkable
+class MarketHistoryRepository(Protocol):
+    """Keeps the candles a session has processed, so a restart is not blind.
+
+    Deliberately narrow. A session hands it market data and asks for market data back;
+    there is no operation here through which an account could be written or read, which is
+    what keeps restoring context and restoring money separate contracts rather than two
+    settings on one.
+    """
+
+    def start(self, manifest: MarketHistoryManifest) -> None:
+        """Begin a history, binding it to a session and an instrument."""
+        ...
+
+    def append(self, session_id: str, bar: MarketBar) -> None:
+        """Record one processed candle."""
+        ...
+
+    def load(self, session_id: str) -> MarketHistory | None:
+        """Return a session's validated history, or ``None`` when it has none."""
         ...
 
 

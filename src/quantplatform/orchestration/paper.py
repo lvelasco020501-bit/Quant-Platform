@@ -33,6 +33,7 @@ from quantplatform.core.enums import CommissionModel, ExecutionMode, SlippageMod
 from quantplatform.core.errors import ConfigurationError, StorageError
 from quantplatform.core.interfaces import (
     FeaturePipeline,
+    MarketHistoryRepository,
     PaperStateRepository,
     SymbolRulesProvider,
 )
@@ -41,6 +42,7 @@ from quantplatform.core.models.execution_policy import ExecutionPolicy, FeePolic
 from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.portfolio import Balance
 from quantplatform.core.models.risk import RiskBudget
+from quantplatform.core.models.warm_start import MarketHistoryManifest
 from quantplatform.core.symbol_rules import SymbolRulesStore
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.execution.config import ExecutionConfig
@@ -51,6 +53,7 @@ from quantplatform.orchestration.symbol_rules import SymbolRulesRefresher
 from quantplatform.paper.results import SessionResult
 from quantplatform.paper.runner import PaperTradingRunner
 from quantplatform.paper.session import PaperTradingSession
+from quantplatform.paper.warm_start import evaluate_warm_start
 from quantplatform.paper.watchdog import StallWatchdog
 from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.reporting.config import ReportingConfiguration
@@ -58,6 +61,7 @@ from quantplatform.reporting.daily import DailyReportBuilder, DailyReportRecorde
 from quantplatform.reporting.writer import DailyReportWriter
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.engine import StandardRiskEngine
+from quantplatform.storage.market_history import FileMarketHistoryRepository
 from quantplatform.storage.paper_state import FilePaperStateRepository
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.registry import StrategyRegistry, build_default_registry
@@ -85,25 +89,41 @@ class PaperDeployment:
     writer: DailyReportWriter
     repository: PaperStateRepository
     symbol_rules: SymbolRulesStore
+    history_repository: MarketHistoryRepository | None = None
+    required_history: int = 1
     refresher: SymbolRulesRefresher | None = None
     watchdog: StallWatchdog | None = None
     log_paths: tuple[Path, ...] = ()
 
-    def run(self, *, resume: bool = False) -> SessionResult:
+    def run(self, *, resume: bool = False, warm_start: bool = True) -> SessionResult:
         """Drive the session until the feed ends or a stop is requested.
 
         Args:
             resume: Restore persisted state and continue rather than starting fresh.
+            warm_start: Restore market context from a persisted history when one is usable.
+                Independent of ``resume`` in every direction: this restores candles, that
+                restores an account, and neither is a precondition or a consequence of the
+                other.
 
         Returns:
             Everything the session produced.
         """
+        # Before the feed. Everything about the history is decided while no socket is open,
+        # because a connection held by a deployment that cannot start is of use to nobody.
+        if warm_start:
+            self._apply_warm_start()
+        else:
+            self.session.record_warm_start_outcome(
+                "warm-start was disabled for this run; starting cold deliberately"
+            )
+
         _LOGGER.info(
             "paper session starting",
             extra={
                 "session_id": self.session.session_id,
                 "symbols": list(self.feed.symbols),
                 "resume": resume,
+                "warm_start": self.session.warm_start_record is not None,
             },
         )
         if self.watchdog is not None:
@@ -123,6 +143,61 @@ class PaperDeployment:
                     "feed_state": self.feed.state.value,
                 },
             )
+
+    def _apply_warm_start(self) -> None:
+        """Load, judge and, if it survives every check, apply a persisted market history.
+
+        A refusal is recorded and the session starts cold. It is never fatal: a deployment
+        that cannot restore its context can still trade correctly after warming up, and
+        refusing to run at all would turn a lost convenience into an outage. What must never
+        happen is applying a history that is wrong, and that is what the checks are for.
+        """
+        if self.history_repository is None:
+            self.session.record_warm_start_outcome("no market history is being kept")
+            return
+
+        paper = self.settings.paper
+        session_id = self.session.session_id
+        try:
+            history = self.history_repository.load(session_id)
+        except StorageError as exc:
+            reason = f"the persisted market history could not be read: {exc}"
+            _LOGGER.warning("warm-start refused", extra={"session_id": session_id, "why": reason})
+            self.session.record_warm_start_outcome(reason)
+            return
+
+        source_state = None
+        if history is not None:
+            try:
+                source_state = self.repository.load(history.manifest.source_session_id)
+            except StorageError as exc:
+                reason = (
+                    "the snapshot of the session that wrote this history could not be read "
+                    f"({exc}), so its financial state cannot be shown to be clean"
+                )
+                _LOGGER.warning(
+                    "warm-start refused", extra={"session_id": session_id, "why": reason}
+                )
+                self.session.record_warm_start_outcome(reason)
+                return
+
+        decision = evaluate_warm_start(
+            history,
+            source_state=source_state,
+            symbol=paper.symbols[0],
+            market_type=self.settings.market.market_type,
+            timeframe=paper.timeframe,
+            required_history=self.required_history,
+        )
+        self.session.record_warm_start_outcome(decision.reason)
+        if decision.history is None:
+            log = _LOGGER.warning if decision.refused else _LOGGER.info
+            log(
+                "warm-start not applied",
+                extra={"session_id": session_id, "why": decision.reason},
+            )
+            return
+        self.session.warm_start(decision.history, required_history=self.required_history)
 
     def request_stop(self, reason: str = "requested") -> None:
         """Ask the feed and the runner to wind down at their next boundary.
@@ -344,6 +419,21 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
     # pipeline. Handing each of them its own copy is what would let a refresh reach one and
     # not the others, leaving the broker rounding to a lot size the risk engine no longer
     # believes in.
+    # Market history lives beside the session state, and is market data only: the
+    # repository has no operation capable of writing an account. The manifest is written
+    # once, binding the file to this session and this instrument so a history can never be
+    # loaded into a deployment it does not belong to.
+    history_repository = FileMarketHistoryRepository(paper.state_directory)
+    history_repository.start(
+        MarketHistoryManifest(
+            source_session_id=paper.session_id,
+            symbol=paper.symbols[0],
+            market_type=settings.market.market_type,
+            timeframe=paper.timeframe,
+            created_at=resolved_clock.now(),
+        )
+    )
+
     rules = SymbolRulesStore({symbol: symbol_rules[symbol] for symbol in paper.symbols})
     policy = _execution_policy(settings)
     # Read once and shared: the refresher's schedule is validated against the very same
@@ -401,6 +491,7 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
         state_repository=resolved_repository,
         close_grace_seconds=paper.close_grace_seconds,
         day_rollover_observer=recorder,
+        history_repository=history_repository,
     )
     feed = BinanceSpotMarketDataFeed(
         config=_market_data_configuration(settings), clock=resolved_clock
@@ -442,6 +533,8 @@ def build_paper_deployment(  # noqa: PLR0913 - a composition root's parameters a
         writer=writer,
         repository=resolved_repository,
         symbol_rules=rules,
+        history_repository=history_repository,
+        required_history=resolved_strategy.metadata.required_history,
         refresher=refresher,
         watchdog=watchdog,
         log_paths=log_paths,

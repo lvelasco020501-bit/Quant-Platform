@@ -24,6 +24,7 @@ from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.portfolio import Balance, Position
 from quantplatform.core.models.risk import CircuitBreakerState, PositionRiskState
 from quantplatform.core.models.telemetry import FeedMetricsSnapshot
+from quantplatform.core.models.warm_start import WarmStartRecord
 from quantplatform.core.numeric import Fee, Money
 
 __all__ = ["CURRENT_SCHEMA_VERSION", "PaperSessionState"]
@@ -31,7 +32,10 @@ __all__ = ["CURRENT_SCHEMA_VERSION", "PaperSessionState"]
 _RISK_SPLIT_SCHEMA_VERSION = 2
 """Version at which a position's risk became two figures rather than one."""
 
-CURRENT_SCHEMA_VERSION = 2
+_WARM_START_SCHEMA_VERSION = 3
+"""Version at which a snapshot began recording that its market context was restored."""
+
+CURRENT_SCHEMA_VERSION = 3
 """Shape this code writes. Every snapshot it produces says so explicitly, so a reader
 never has to infer a version from which fields happen to be present."""
 
@@ -50,6 +54,10 @@ class PaperSessionState(DomainModel):
     Version 2 splits a position's risk into what it opened with and what it still carries. A
     version-1 snapshot cannot contain either, so one that claims to is refused rather than
     guessed at.
+
+    Version 3 records whether the session's *market context* was restored at start-up. That
+    record is audit only: it describes what happened and authorises nothing, and in
+    particular it neither relaxes nor participates in the decision to resume an account.
     """
 
     session_id: Text
@@ -106,6 +114,17 @@ class PaperSessionState(DomainModel):
     """How many times this session has been resumed, recorded so an operator can tell a
     long-running session apart from one that keeps dying and coming back."""
 
+    warm_start: WarmStartRecord | None = None
+    """Audit of how this session's market context was obtained, when it was restored.
+
+    Present only from :data:`_WARM_START_SCHEMA_VERSION`. It describes a start-up and
+    authorises nothing: a snapshot carrying it is no more resumable than one without, and
+    :attr:`financial_state_carried` neither reads it nor is affected by it. Keeping the two
+    apart is the point — warm-start restores candles, resume restores an account, and a
+    field that blurred them would be the first step towards a session that quietly traded a
+    rebuilt account because its market history looked fine.
+    """
+
     feed_baseline: FeedMetricsSnapshot | None = None
     """The feed reading the current reporting day started from.
 
@@ -115,6 +134,40 @@ class PaperSessionState(DomainModel):
     restored as a zero baseline — the same state a fresh session begins in.
     """
 
+    @property
+    def financial_state_carried(self) -> tuple[str, ...]:
+        """Return every irrecoverable financial condition this snapshot holds.
+
+        One definition, two consumers, deliberately. :meth:`PaperTradingSession.resume`
+        refuses when this is non-empty because the portfolio engine is flat-start and a
+        resumed process would trade a rebuilt account instead of this one; warm-start
+        refuses to reuse such a session's market history because starting fresh from it
+        would present an unreconciled account as a recovery. The judgement is the same
+        judgement and the consequences differ, so copying the list into a second place would
+        guarantee the two drift the day a seventh condition is added.
+
+        Empty means the snapshot describes an account a fresh engine already matches.
+
+        Returns:
+            The conditions found, in a fixed order, phrased for an operator.
+        """
+        open_positions = [position for position in self.positions if position.is_open]
+        reserved = [balance for balance in self.balances if balance.locked > Decimal(0)]
+        blocking: list[str] = []
+        if open_positions:
+            blocking.append("an open position")
+        if reserved:
+            blocking.append("balance reserved against a working order")
+        if self.realized_pnl != Decimal(0):
+            blocking.append("realised pnl")
+        if self.total_fees != Decimal(0):
+            blocking.append("fees paid")
+        if self.position_risk:
+            blocking.append("recorded position risk")
+        if self.breakers:
+            blocking.append("a latched circuit breaker")
+        return tuple(blocking)
+
     @model_validator(mode="after")
     def _validate_version(self) -> Self:
         """Check the snapshot's contents match the shape it claims.
@@ -123,6 +176,13 @@ class PaperSessionState(DomainModel):
             ValueError: If a version-1 snapshot carries state that only exists from version 2,
                 which would leave a reader guessing what its numbers meant.
         """
+        if self.schema_version < _WARM_START_SCHEMA_VERSION and self.warm_start is not None:
+            msg = (
+                "a snapshot below schema_version 3 cannot carry a warm-start record: the "
+                "field arrived with version 3, and a snapshot claiming both is describing "
+                "itself inconsistently"
+            )
+            raise ValueError(msg)
         if self.schema_version < _RISK_SPLIT_SCHEMA_VERSION and self.position_risk:
             msg = (
                 "a snapshot at schema_version 1 cannot carry position risk: the split "

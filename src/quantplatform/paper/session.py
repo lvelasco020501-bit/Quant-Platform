@@ -38,7 +38,7 @@ from quantplatform.backtesting.results import BacktestResult, BarOutcome
 from quantplatform.core.clock import Clock
 from quantplatform.core.constants import ZERO
 from quantplatform.core.errors import DataIntegrityError, PaperSessionStateError
-from quantplatform.core.interfaces import PaperStateRepository
+from quantplatform.core.interfaces import MarketHistoryRepository, PaperStateRepository
 from quantplatform.core.logging_config import get_logger
 from quantplatform.core.models.market import MarketBar
 from quantplatform.core.models.paper import CURRENT_SCHEMA_VERSION, PaperSessionState
@@ -48,6 +48,7 @@ from quantplatform.core.models.telemetry import (
     FeedMetricsSnapshot,
     SymbolRulesTelemetry,
 )
+from quantplatform.core.models.warm_start import MarketHistory, WarmStartRecord
 from quantplatform.execution.broker import SimulatedBroker
 from quantplatform.paper.clock import SessionClock
 from quantplatform.paper.results import (
@@ -128,6 +129,7 @@ class PaperTradingSession:
         close_grace_seconds: float = 0.0,
         save_every_bar: bool = True,
         day_rollover_observer: DayRolloverObserver | None = None,
+        history_repository: MarketHistoryRepository | None = None,
     ) -> None:
         """Wire a session.
 
@@ -144,6 +146,9 @@ class PaperTradingSession:
                 feed exactly, so the two layers never disagree about the same candle.
             save_every_bar: Persist after each processed bar. Off means a crash loses
                 everything since the last explicit :meth:`save`.
+            history_repository: Where processed candles are appended so a restart can
+                recover its market context, or ``None`` to keep none. Market data only;
+                it has no way to record an account.
             day_rollover_observer: Notified when a bar begins a new reporting day. Purely
                 observational and cannot influence the pipeline.
         """
@@ -156,6 +161,7 @@ class PaperTradingSession:
         self._repository = state_repository
         self._save_every_bar = save_every_bar
         self._rollover_observer = day_rollover_observer
+        self._history_repository = history_repository
 
         self._state: RunState | None = None
         self._running = False
@@ -166,6 +172,8 @@ class PaperTradingSession:
         self._feed_metrics: FeedMetricsSnapshot | None = None
         self._feed_baseline: FeedMetricsSnapshot = ZERO_FEED_METRICS
         self._symbol_rules_telemetry: SymbolRulesTelemetry | None = None
+        self._warm_start: WarmStartRecord | None = None
+        self._warm_start_reason = "warm-start was not attempted"
 
     # --- Lifecycle --------------------------------------------------------------------------
 
@@ -213,6 +221,91 @@ class PaperTradingSession:
         self._stopped_at = self._clock.now()
         self.save()
         return self.status()
+
+    def warm_start(self, history: MarketHistory, *, required_history: int) -> WarmStartRecord:
+        """Seed the session's market context with candles it has already lived through.
+
+        **Restores candles and nothing else.** No balance, position, order, fill, fee or
+        breaker is read or written here, and none could be: the argument is a window of
+        market data and has no shape for money to travel in. The session still begins flat
+        with the capital configuration declares — warm-start changes what the strategy can
+        *see*, never what the account *is*.
+
+        The candles are placed in the pipeline's history and are deliberately **not
+        evaluated**. Running the strategy over them would be trading a past that has already
+        happened, which is the definition of look-ahead; they exist to make the next live
+        candle computable, and that is all.
+
+        Args:
+            history: A validated window, already checked against this session's instrument
+                and against the financial state of the session that wrote it.
+            required_history: What the strategy declares it needs, recorded for audit. Taken
+                from the caller rather than reached for through the engine, so seeding market
+                context needs no access to the object that makes trading decisions.
+
+        Returns:
+            The audit record of what was restored.
+
+        Raises:
+            PaperSessionStateError: If the session is already running, or has already
+                processed a candle. Seeding history under a session that has begun deciding
+                would rewrite the window it decided from.
+        """
+        if self._running:
+            raise PaperSessionStateError(
+                "cannot warm-start a running session", session_id=self._session_id
+            )
+        if self._last_bar is not None:
+            raise PaperSessionStateError(
+                "cannot warm-start a session that has already processed a candle",
+                session_id=self._session_id,
+            )
+        if self._state is None:
+            self._state = self._engine.begin()
+
+        bars = list(history.bars)
+        self._state.history[history.manifest.symbol] = bars
+        self._state.last_close[history.manifest.symbol] = bars[-1].close
+        # The seam is anchored here: the next candle offered must follow this one, and
+        # `_is_actionable` already refuses anything at or before it.
+        self._last_bar = bars[-1]
+
+        record = WarmStartRecord(
+            applied_at=self._clock.now(),
+            source_session_id=history.manifest.source_session_id,
+            symbol=history.manifest.symbol,
+            market_type=history.manifest.market_type,
+            timeframe=history.manifest.timeframe,
+            bars_loaded=history.bars_count,
+            required_history=required_history,
+            first_bar_close_time=history.first_bar_close_time,
+            last_bar_close_time=history.last_bar_close_time,
+            digest=history.digest,
+        )
+        self._warm_start = record
+        _LOGGER.info(
+            "market context restored",
+            extra={
+                "session_id": self._session_id,
+                "source_session_id": record.source_session_id,
+                "bars_loaded": record.bars_loaded,
+                "required_history": record.required_history,
+                "first_bar_close_time": record.first_bar_close_time.isoformat(),
+                "last_bar_close_time": record.last_bar_close_time.isoformat(),
+                "digest": record.digest,
+                "financial_state_restored": False,
+            },
+        )
+        return record
+
+    def record_warm_start_outcome(self, reason: str) -> None:
+        """Record why market context was or was not restored, for reporting."""
+        self._warm_start_reason = reason
+
+    @property
+    def warm_start_record(self) -> WarmStartRecord | None:
+        """Return the audit of a restored market context, if one was restored."""
+        return self._warm_start
 
     def resume(self) -> SessionStatus:
         """Restore a persisted session and begin accepting bars again.
@@ -311,27 +404,17 @@ class PaperTradingSession:
         Raises:
             PaperSessionStateError: If any irrecoverable financial state is present.
         """
+        # The list of conditions lives on the state itself, because warm-start has to make
+        # the same judgement with a different consequence and two copies would drift.
+        blocking = stored.financial_state_carried
+        if not blocking:
+            return
         open_positions = [position for position in stored.positions if position.is_open]
         reserved = {
             balance.asset: str(balance.locked)
             for balance in stored.balances
             if balance.locked > ZERO
         }
-        blocking: list[str] = []
-        if open_positions:
-            blocking.append("an open position")
-        if reserved:
-            blocking.append("balance reserved against a working order")
-        if stored.realized_pnl != ZERO:
-            blocking.append("realised pnl")
-        if stored.total_fees != ZERO:
-            blocking.append("fees paid")
-        if stored.position_risk:
-            blocking.append("recorded position risk")
-        if stored.breakers:
-            blocking.append("a latched circuit breaker")
-        if not blocking:
-            return
         raise PaperSessionStateError(
             "cannot resume a session carrying financial state: the portfolio engine is "
             "flat-start and the broker holds no persisted orders, so a resumed process "
@@ -414,7 +497,14 @@ class PaperTradingSession:
             )
             raise
 
+        # The seam is proven the first time a live candle follows restored context: the
+        # candle was accepted, so it is closed, final, and strictly after the last warm bar.
+        if self._warm_start is not None and self._warm_start.first_live_bar_close_time is None:
+            self._warm_start = self._warm_start.model_copy(
+                update={"first_live_bar_close_time": bar.close_time}
+            )
         self._last_bar = bar
+        self._append_history(bar)
         self._record(outcome)
         _LOGGER.info(
             "bar processed",
@@ -529,6 +619,29 @@ class PaperTradingSession:
             return False
         return not (self._last_bar is not None and bar.close_time <= self._last_bar.close_time)
 
+    def _append_history(self, bar: MarketBar) -> None:
+        """Record a processed candle so a restart can recover this window.
+
+        A failure to write is logged and swallowed rather than raised. The history is a
+        convenience for the *next* process; letting a full disk stop the session that is
+        currently trading correctly would trade a real outage for a hypothetical one. The
+        loss is not silent — the next load cross-checks the history against the snapshot's
+        own candle count and refuses a short file rather than warm-starting from it.
+        """
+        if self._history_repository is None:
+            return
+        try:
+            self._history_repository.append(self._session_id, bar)
+        except Exception:
+            _LOGGER.warning(
+                "processed candle could not be appended to market history; a restart will "
+                "start cold rather than resume this window",
+                extra={
+                    "session_id": self._session_id,
+                    "close_time": bar.close_time.isoformat(),
+                },
+            )
+
     def _record(self, outcome: BarOutcome) -> None:
         """Fold one bar's outcome into the runtime metrics."""
         metrics = self._metrics
@@ -596,6 +709,7 @@ class PaperTradingSession:
             total_fees=snapshot.total_fees if snapshot is not None else ZERO,
             restarts=self._restarts,
             feed_baseline=self._feed_baseline,
+            warm_start=self._warm_start,
         )
 
     # --- Reporting --------------------------------------------------------------------------

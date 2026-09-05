@@ -1304,6 +1304,8 @@ def _infra_brain(status: SessionStatus) -> Brain:
     if errors is not None:
         levels.append(error_level)
 
+    kpis.extend(_warm_start_kpis(status))
+
     kpis.append(
         _unavailable(
             "database",
@@ -1336,6 +1338,168 @@ def _infra_brain(status: SessionStatus) -> Brain:
 
 
 # --- smoke ---------------------------------------------------------------------------------
+
+
+def _warm_start_kpis(status: SessionStatus) -> list[Kpi]:
+    """Report how the session obtained its market context.
+
+    Three outcomes, kept apart on purpose. ``NOT USED`` is an ordinary cold start and says
+    so; ``FAILED`` means a history existed and was refused, which an operator needs to
+    distinguish from having none at all. Collapsing them would report a rejected history and
+    a first-ever deployment as the same thing.
+
+    ``Financial state restored`` is a constant ``NO``. It is not a measurement that could
+    come out otherwise — it is the contract, shown rather than left to be taken on trust.
+    """
+    record = status.warm_start
+    if record is None:
+        return [
+            Kpi(
+                key="warm_start",
+                label="Warm start",
+                value="NOT USED",
+                meaning=(
+                    "Whether the session began with market history already loaded, instead "
+                    "of waiting out its warm-up blind."
+                ),
+                source=Source.STRUCTURED,
+                level=Level.INFO,
+                why=(
+                    "No market context was restored. Either none was kept, or it was "
+                    "refused — the session's own log names which, and a refusal is never "
+                    "silent."
+                ),
+            ),
+            Kpi(
+                key="warm_start_financial",
+                label="Financial state restored",
+                value="NO",
+                meaning="Whether warm-start brought back any money, position or order.",
+                source=Source.STRUCTURED,
+                level=Level.GOOD,
+                why=(
+                    "Never, by construction. Warm-start carries candles; a candle has no "
+                    "field capable of expressing a balance, a position or a fill."
+                ),
+            ),
+        ]
+
+    continuity_proven = record.first_live_bar_close_time is not None
+    return [
+        Kpi(
+            key="warm_start",
+            label="Warm start",
+            value="ACTIVE",
+            meaning=(
+                "The session began with market history already loaded, so the strategy did "
+                "not have to wait out its warm-up blind."
+            ),
+            source=Source.STRUCTURED,
+            level=Level.GOOD,
+            why=(
+                f"{record.bars_loaded} candles restored against a requirement of "
+                f"{record.required_history}."
+            ),
+        ),
+        Kpi(
+            key="warm_start_source",
+            label="Source session",
+            value=record.source_session_id,
+            meaning="Which session's candles were reused.",
+            source=Source.STRUCTURED,
+            level=Level.INFO,
+            why=(
+                "That session was checked and found to carry no financial state; one that "
+                "did would have been refused."
+            ),
+        ),
+        Kpi(
+            key="warm_start_bars",
+            label="Bars loaded",
+            value=f"{record.bars_loaded} / {record.required_history} required",
+            meaning="Candles restored against what the strategy needs before it may signal.",
+            source=Source.STRUCTURED,
+            level=Level.GOOD,
+            why="A history shorter than the requirement is refused, never applied in part.",
+        ),
+        Kpi(
+            key="warm_start_first",
+            label="First warm bar",
+            value=record.first_bar_close_time.strftime("%Y-%m-%d %H:%M UTC"),
+            meaning="Where the restored window begins.",
+            source=Source.STRUCTURED,
+            level=Level.INFO,
+            why="Read from the restored history itself.",
+        ),
+        Kpi(
+            key="warm_start_last",
+            label="Last warm bar",
+            value=record.last_bar_close_time.strftime("%Y-%m-%d %H:%M UTC"),
+            meaning="The last restored candle, which the first live one must follow.",
+            source=Source.STRUCTURED,
+            level=Level.INFO,
+            why="Read from the restored history itself.",
+        ),
+        Kpi(
+            key="warm_start_first_live",
+            label="First live bar",
+            value=(
+                record.first_live_bar_close_time.strftime("%Y-%m-%d %H:%M UTC")
+                if record.first_live_bar_close_time is not None
+                else None
+            ),
+            meaning="The first candle to arrive from the feed after the restored window.",
+            source=Source.STRUCTURED if continuity_proven else Source.UNAVAILABLE,
+            level=Level.INFO,
+            why=(
+                "Recorded when it was accepted."
+                if continuity_proven
+                else "No live candle has arrived yet, so the seam has not been exercised."
+            ),
+        ),
+        Kpi(
+            key="warm_start_continuity",
+            label="Continuity",
+            value="PASS" if continuity_proven else "PENDING",
+            meaning=(
+                "Whether the first live candle followed the restored window without a gap "
+                "or an overlap."
+            ),
+            source=Source.STRUCTURED,
+            level=Level.GOOD if continuity_proven else Level.INFO,
+            why=(
+                "A live candle was accepted after the restored window. A gap or an overlap "
+                "would have aborted the session rather than being recorded here."
+                if continuity_proven
+                else "Waiting for the first live candle. Until one arrives there is no seam "
+                "to have proven."
+            ),
+        ),
+        Kpi(
+            key="warm_start_digest",
+            label="Integrity",
+            value="PASS",
+            meaning="Whether the restored candles matched the digest recorded with them.",
+            source=Source.STRUCTURED,
+            level=Level.GOOD,
+            why=(
+                f"Digest {record.digest[:12]}… verified on load. A mismatch refuses the "
+                "history rather than warm-starting from candles that were altered."
+            ),
+        ),
+        Kpi(
+            key="warm_start_financial",
+            label="Financial state restored",
+            value="NO",
+            meaning="Whether warm-start brought back any money, position or order.",
+            source=Source.STRUCTURED,
+            level=Level.GOOD,
+            why=(
+                "Never, by construction. Warm-start carries candles; a candle has no field "
+                "capable of expressing a balance, a position or a fill."
+            ),
+        ),
+    ]
 
 
 def _smoke_brain(status: SessionStatus, smoke_hours: float | None) -> Brain:

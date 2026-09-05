@@ -64,20 +64,41 @@ class ActivityCounts:
     log_derived: bool = True
 
 
+def _rotated_then_current(path: Path) -> list[Path]:
+    """Return a log's rotated files oldest-first, followed by the live one.
+
+    Logs roll over at midnight UTC: ``marketdata.log`` becomes
+    ``marketdata.log.2026-09-04`` and a fresh file starts. Reading only the live file means
+    that at 00:01 the dashboard forgets the feed ever connected and reports the session's
+    fifth candle as its first — which is exactly what happened the night this was written.
+    Rotated names sort chronologically because the suffix is an ISO date.
+    """
+    try:
+        rotated = sorted(path.parent.glob(f"{path.name}.*"))
+    except OSError:
+        rotated = []
+    return [*rotated, path]
+
+
 def _tail(path: Path, limit: int = _MAX_LINES) -> list[dict[str, object]]:
     """Return the last parseable JSON records of a log, newest last.
+
+    Reads across the rotation boundary, so a run that spans midnight still has one history
+    rather than two.
 
     A line that will not parse is skipped rather than fatal: a log being appended to while
     it is read can hand back a half-written final line, and refusing the whole timeline over
     it would make the dashboard fail exactly when the session is busiest.
     """
-    try:
-        with path.open(encoding="utf-8") as handle:
-            lines = handle.readlines()[-limit:]
-    except OSError:
-        return []
+    lines: list[str] = []
+    for candidate in _rotated_then_current(path):
+        try:
+            with candidate.open(encoding="utf-8") as handle:
+                lines.extend(handle.readlines())
+        except OSError:
+            continue
     records: list[dict[str, object]] = []
-    for line in lines:
+    for line in lines[-limit:]:
         try:
             parsed = json.loads(line)
         except (ValueError, TypeError):

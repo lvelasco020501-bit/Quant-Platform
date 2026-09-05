@@ -706,3 +706,73 @@ def test_a_tripped_breaker_reaches_the_summary_as_a_blocker(tree: dict[str, Path
         assert summary["blockers"]
     finally:
         lock.release()
+
+
+def test_history_survives_the_midnight_log_rotation(tree: dict[str, Path]) -> None:
+    # Logs roll over at midnight UTC: marketdata.log becomes marketdata.log.2026-09-04 and
+    # a fresh file starts. Reading only the live file made the dashboard forget the feed had
+    # ever connected and report the session's fifth candle as its first, one minute past
+    # midnight, while the session was perfectly healthy.
+    _persist(tree, _state())
+    (tree["logs"] / "marketdata.log.2026-09-04").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-09-04T20:35:56+00:00",
+                "message": "feed state transition",
+                "extra": {"from": "connecting", "to": "streaming"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _log(
+        tree,
+        "marketdata.log",
+        [
+            {
+                "timestamp": "2026-09-05T00:00:00+00:00",
+                "message": "closed bar emitted",
+                "extra": {"symbol": SYMBOL, "close_time": "2026-09-05T00:00:00+00:00"},
+            }
+        ],
+    )
+    (tree["logs"] / "paper.log.2026-09-04").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "timestamp": f"2026-09-04T2{hour}:00:00+00:00",
+                    "message": "bar processed",
+                    "extra": {"session_id": SESSION, "signals": 0, "intents": 0, "fills": 0},
+                }
+            )
+            for hour in (1, 2, 3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _log(
+        tree,
+        "paper.log",
+        [
+            {
+                "timestamp": "2026-09-05T00:00:00+00:00",
+                "message": "bar processed",
+                "extra": {"session_id": SESSION, "signals": 0, "intents": 0, "fills": 0},
+            }
+        ],
+    )
+
+    payload = _client(tree).get("/api/status").json()
+
+    # The feed's connection is remembered across the rotation.
+    feed = next(
+        kpi
+        for brain in payload["brains"]
+        if brain["key"] == "market"
+        for kpi in brain["kpis"]
+        if kpi["key"] == "feed_state"
+    )
+    assert feed["value"] == "STREAMING"
+    # And all four candles are counted, not just the one after midnight.
+    assert payload["activity"]["bars_seen"] == 4
+    assert any(event["title"] == "Market feed streaming" for event in payload["timeline"])

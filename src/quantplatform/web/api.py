@@ -24,7 +24,13 @@ from fastapi.staticfiles import StaticFiles
 from quantplatform.config.settings import load_settings
 from quantplatform.core.models.risk import CircuitBreakerState
 from quantplatform.status import gather_status
-from quantplatform.status.events import ActivityCounts, read_activity, read_timeline
+from quantplatform.status.brains import Brain, Summary, build_brains, summarise
+from quantplatform.status.events import (
+    ActivityCounts,
+    read_activity,
+    read_feed_state,
+    read_timeline,
+)
 from quantplatform.status.model import SessionStatus
 from quantplatform.strategies.registry import build_default_registry
 from quantplatform.web.config import SCHEMA_VERSION, WebSettings
@@ -90,11 +96,18 @@ def _payload(settings: WebSettings) -> dict[str, Any]:
     )
     activity = read_activity(settings.log_directory, session_id=gathered.session_id)
     timeline = read_timeline(settings.log_directory, session_id=gathered.session_id)
+    feed_state = read_feed_state(settings.log_directory)
+    brains = build_brains(
+        gathered, activity, feed_state=feed_state, smoke_hours=settings.smoke_hours
+    )
+    summary = summarise(gathered, brains)
 
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
         "refresh_seconds": settings.refresh_seconds,
+        "summary": _summary(summary),
+        "brains": [_brain(brain) for brain in brains],
         "system": _system(gathered),
         "smoke": _smoke(gathered, settings.smoke_hours),
         "portfolio": _portfolio(gathered),
@@ -116,6 +129,42 @@ def _payload(settings: WebSettings) -> dict[str, Any]:
         ],
         "details": _details(gathered),
         "notes": list(gathered.notes),
+    }
+
+
+def _summary(summary: Summary) -> dict[str, Any]:
+    """The paragraph at the top, exactly as the brains stated it."""
+    return {
+        "level": summary.level.value,
+        "headline": summary.headline,
+        "text": " ".join(summary.sentences),
+        "sentences": list(summary.sentences),
+        "intervention_required": summary.intervention_required,
+        "blockers": list(summary.blockers),
+    }
+
+
+def _brain(brain: Brain) -> dict[str, Any]:
+    """One brain card, with every KPI carrying its own explanation."""
+    return {
+        "key": brain.key,
+        "title": brain.title,
+        "level": brain.level.value,
+        "headline": brain.headline,
+        "explanation": brain.explanation,
+        "kpis": [
+            {
+                "key": kpi.key,
+                "label": kpi.label,
+                "value": kpi.value,
+                "meaning": kpi.meaning,
+                "source": kpi.source.value,
+                "level": kpi.level.value,
+                "why": kpi.why,
+                "low_confidence": kpi.low_confidence,
+            }
+            for kpi in brain.kpis
+        ],
     }
 
 

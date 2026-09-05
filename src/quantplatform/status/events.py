@@ -19,7 +19,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-__all__ = ["ActivityCounts", "TimelineEvent", "read_activity", "read_timeline"]
+__all__ = [
+    "ActivityCounts",
+    "TimelineEvent",
+    "read_activity",
+    "read_feed_state",
+    "read_timeline",
+]
 
 _MAX_LINES = 5_000
 """How far back to read in each log. A long-running session's logs outgrow a timeline that
@@ -281,4 +287,22 @@ def _bar_detail(extra: dict[str, object]) -> str | None:
     close_time = extra.get("close_time")
     if isinstance(symbol, str) and isinstance(close_time, str):
         return f"{symbol} candle closing {close_time}"
+    return None
+
+
+def read_feed_state(log_directory: Path) -> str | None:
+    """Return the feed's last recorded state, or ``None`` when it has never said.
+
+    Log-derived, and unavoidably so: the feed's connection state lives in the running
+    process and is never persisted, so the only trace of it outside that process is the
+    transition it logged. That makes this a report of the last thing the feed *said*, not
+    of what the socket is doing now — a process killed uncleanly leaves its last transition
+    behind looking healthy. Callers pair it with whether the session is actually running.
+    """
+    for record in reversed(_tail(log_directory / "marketdata.log")):
+        if record.get("message") != "feed state transition":
+            continue
+        to = _extra(record).get("to")
+        if isinstance(to, str):
+            return to
     return None

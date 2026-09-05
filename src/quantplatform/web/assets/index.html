@@ -12,103 +12,56 @@
     />
   </head>
   <body>
-    <!-- Rendered before any data arrives, so the first paint is the page rather than a
-         blank screen that could be mistaken for a dead service. -->
     <div id="app" class="app" aria-busy="true">
       <header class="masthead">
-        <div class="masthead__identity">
+        <div>
           <h1>Quant&nbsp;Platform</h1>
           <p class="masthead__subtitle" id="subtitle">Paper Trading · Risk V2 · BTC/USDT</p>
         </div>
         <div class="masthead__state">
-          <span class="health health--unknown" id="health">CONNECTING</span>
+          <span class="health health--info" id="health">CONNECTING</span>
           <span class="updated" id="updated">contacting the service…</span>
         </div>
       </header>
 
       <div class="badges" id="badges"></div>
 
-      <div class="banner banner--hidden" id="banner" role="status"></div>
+      <!-- The one paragraph somebody reads before deciding whether to read anything else.
+           Assembled server-side from the panels below, so it cannot contradict them. -->
+      <section class="summary summary--info" id="summary" aria-live="polite">
+        <div class="summary__head">
+          <span class="summary__eyebrow">Quant AI Summary</span>
+          <span class="summary__verdict" id="summary-verdict">—</span>
+        </div>
+        <p class="summary__text" id="summary-text">Waiting for the first reading…</p>
+        <ul class="summary__blockers" id="summary-blockers" hidden></ul>
+      </section>
 
-      <main class="grid" id="grid">
-        <section class="card card--wide" id="card-smoke" hidden>
-          <h2 class="card__title">72&nbsp;Hour Paper Smoke Test</h2>
-          <div class="progress"><div class="progress__fill" id="smoke-fill"></div></div>
-          <p class="progress__label" id="smoke-pct">—</p>
-          <dl class="pairs" id="smoke-pairs"></dl>
-        </section>
-
-        <section class="card" id="card-portfolio" hidden>
-          <h2 class="card__title">Portfolio</h2>
-          <div class="figure">
-            <span class="figure__label">Equity</span>
-            <span class="figure__value" id="equity">—</span>
-            <span class="figure__delta" id="equity-delta"></span>
-          </div>
-          <dl class="pairs" id="portfolio-pairs"></dl>
-        </section>
-
-        <section class="card" id="card-position" hidden>
-          <h2 class="card__title">Position</h2>
-          <div id="position-body"></div>
-        </section>
-
-        <section class="card" id="card-market" hidden>
-          <h2 class="card__title">Market</h2>
-          <div class="figure">
-            <span class="figure__label" id="market-symbol">—</span>
-            <span class="figure__value" id="last-close">—</span>
-          </div>
-          <div class="warmup">
-            <div class="warmup__head">
-              <span id="warmup-label">Warm-up</span><span id="warmup-count">—</span>
-            </div>
-            <div class="progress progress--slim">
-              <div class="progress__fill" id="warmup-fill"></div>
-            </div>
-            <p class="hint" id="warmup-hint"></p>
-          </div>
-          <dl class="pairs" id="market-pairs"></dl>
-        </section>
-
-        <section class="card" id="card-risk" hidden>
-          <h2 class="card__title">Risk</h2>
-          <dl class="pairs" id="risk-pairs"></dl>
-          <ul class="breakers" id="breakers"></ul>
-        </section>
-
-        <section class="card" id="card-activity" hidden>
-          <h2 class="card__title">
-            Activity <span class="tag tag--log" title="Read from the session's structured logs, not from its persisted state">log-derived</span>
-          </h2>
-          <div class="stats" id="activity-stats"></div>
-          <p class="hint" id="activity-hint"></p>
-        </section>
-
-        <section class="card" id="card-infra" hidden>
-          <h2 class="card__title">Infrastructure</h2>
-          <dl class="pairs" id="infra-pairs"></dl>
-        </section>
-
-        <section class="card card--wide" id="card-timeline" hidden>
-          <h2 class="card__title">
-            Timeline <span class="tag tag--log" title="Read from the session's structured logs, not from its persisted state">log-derived</span>
-          </h2>
-          <ol class="timeline" id="timeline"></ol>
-        </section>
-      </main>
-
-      <details class="details" id="details-block" hidden>
-        <summary>System details</summary>
-        <dl class="pairs pairs--dense" id="details-pairs"></dl>
-        <h3 class="details__heading">Where each number comes from</h3>
-        <dl class="pairs pairs--dense" id="sources-pairs"></dl>
-      </details>
+      <main class="brains" id="brains"></main>
 
       <footer class="footer">
         <span>Read-only observer · no control actions available</span>
         <span id="schema"></span>
       </footer>
+    </div>
+
+    <!-- WHY panel. Opens over the page when any KPI is clicked. -->
+    <div class="why" id="why" hidden role="dialog" aria-modal="true" aria-labelledby="why-title">
+      <div class="why__backdrop" data-close></div>
+      <div class="why__sheet">
+        <button class="why__close" type="button" data-close aria-label="Close">×</button>
+        <span class="why__eyebrow">Why?</span>
+        <h2 class="why__title" id="why-title">—</h2>
+        <p class="why__value" id="why-value">—</p>
+        <dl class="why__list">
+          <dt>What it means</dt>
+          <dd id="why-meaning">—</dd>
+          <dt>Where it comes from</dt>
+          <dd id="why-source">—</dd>
+          <dt>Why this reading</dt>
+          <dd id="why-reason">—</dd>
+        </dl>
+      </div>
     </div>
 
     <script src="/static/app.js"></script>

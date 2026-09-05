@@ -610,3 +610,99 @@ def test_every_metric_group_declares_where_it_came_from(tree: dict[str, Path]) -
     assert "structured" in sources["portfolio"]
     assert "log-derived" in sources["activity"]
     assert "log-derived" in sources["timeline"]
+
+
+# --- brains and the WHY contract -----------------------------------------------------
+
+
+def test_the_payload_carries_all_seven_brains_in_reading_order(tree: dict[str, Path]) -> None:
+    _persist(tree, _state())
+
+    brains = _client(tree).get("/api/status").json()["brains"]
+
+    assert [b["key"] for b in brains] == [
+        "market",
+        "strategy",
+        "risk",
+        "execution",
+        "portfolio",
+        "infra",
+        "smoke",
+    ]
+    for brain in brains:
+        assert brain["headline"], brain["key"]
+        assert brain["explanation"], brain["key"]
+        assert brain["level"] in {"good", "attention", "danger", "info"}
+
+
+def test_every_kpi_ships_what_the_why_panel_needs(tree: dict[str, Path]) -> None:
+    # The WHY panel renders only what the API sends. A KPI missing any of these would open
+    # a panel with a blank field, which is worse than not offering the panel at all.
+    _persist(tree, _state())
+
+    for brain in _client(tree).get("/api/status").json()["brains"]:
+        for kpi in brain["kpis"]:
+            assert kpi["label"], f"{brain['key']}.{kpi['key']}"
+            assert kpi["meaning"], f"{brain['key']}.{kpi['key']}"
+            assert kpi["why"], f"{brain['key']}.{kpi['key']}"
+            assert kpi["source"] in {"structured", "log-derived", "unavailable"}
+            assert kpi["level"] in {"good", "attention", "danger", "info"}
+            if kpi["value"] is None:
+                assert kpi["source"] == "unavailable", f"{brain['key']}.{kpi['key']}"
+
+
+def test_the_summary_is_present_and_declares_whether_to_intervene(
+    tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A genuinely all-green scenario: warmed up, risk budget configured, feed connected.
+    # Leaving any of those out produces DEGRADED, which is the brains being honest rather
+    # than a fault — so the healthy path has to be set up properly to be tested.
+    monkeypatch.setenv("QP_RISK__RISK_PER_TRADE_PCT", "0.01")
+    monkeypatch.setenv("QP_RISK__MAX_POSITION_EXPOSURE_PCT", "0.5")
+    monkeypatch.setenv("QP_RISK__MIN_STOP_DISTANCE_BPS", "50")
+    monkeypatch.setenv("QP_RISK__MAX_STOP_DISTANCE_BPS", "1000")
+    monkeypatch.setenv("QP_RISK__INITIAL_STOP_DISTANCE_BPS", "300")
+    lock = SessionLock(directory=tree["state"], session_id=SESSION)
+    lock.acquire(now=datetime.now(UTC))
+    try:
+        _persist(tree, _state(bars_processed=21))
+        _log(
+            tree,
+            "marketdata.log",
+            [
+                {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "message": "feed state transition",
+                    "extra": {"from": "connecting", "to": "streaming"},
+                }
+            ],
+        )
+
+        summary = _client(tree).get("/api/status").json()["summary"]
+
+        assert summary["headline"] == "HEALTHY"
+        assert summary["intervention_required"] is False
+        assert summary["text"]
+        assert summary["blockers"] == []
+    finally:
+        lock.release()
+
+
+def test_a_tripped_breaker_reaches_the_summary_as_a_blocker(tree: dict[str, Path]) -> None:
+    lock = SessionLock(directory=tree["state"], session_id=SESSION)
+    lock.acquire(now=datetime.now(UTC))
+    try:
+        breaker = CircuitBreakerState(
+            tripped_at=datetime.now(UTC),
+            reason=CircuitBreakerReason.DAILY_LOSS_LIMIT,
+            consecutive_losses=0,
+            daily_loss=Decimal("310"),
+        )
+        _persist(tree, _state(breakers=(breaker,)))
+
+        summary = _client(tree).get("/api/status").json()["summary"]
+
+        assert summary["intervention_required"] is True
+        assert summary["blockers"]
+    finally:
+        lock.release()

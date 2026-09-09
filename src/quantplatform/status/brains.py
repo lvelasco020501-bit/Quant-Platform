@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from typing import Final
 
 from quantplatform.status.events import ActivityCounts
 from quantplatform.status.model import Health, SessionStatus
@@ -1187,12 +1188,95 @@ def _portfolio_brain(status: SessionStatus) -> Brain:
 # --- infrastructure ------------------------------------------------------------------------
 
 
+_SECONDS_PER_MINUTE: Final[int] = 60
+_SECONDS_PER_HOUR: Final[int] = 60 * 60
+
+
+def _age_kpi(age: timedelta | None) -> Kpi:
+    """Return how stale the session's own snapshot is."""
+    return Kpi(
+        key="snapshot_age",
+        label="Snapshot age",
+        value=None if age is None else _freshness(age),
+        meaning="How long ago this session last wrote its state to disk.",
+        source=Source.STRUCTURED if age is not None else Source.UNAVAILABLE,
+        level=Level.INFO,
+        why=(
+            f"The session persists a snapshot after each bar, so this should stay under one "
+            f"bar's length. Last written {_freshness(age)} ago."
+            if age is not None
+            else "This session has written no snapshot yet, which is expected before its "
+            "first bar closes. No figure is borrowed from another session to fill the gap."
+        ),
+    )
+
+
+def _bar_age_kpi(status: SessionStatus) -> Kpi:
+    """Return how stale the market picture is."""
+    age = status.last_bar_age
+    return Kpi(
+        key="last_bar_age",
+        label="Last bar age",
+        value=None if age is None else _freshness(age),
+        meaning="How long ago the most recent bar this session processed closed.",
+        source=Source.STRUCTURED if age is not None else Source.UNAVAILABLE,
+        level=Level.INFO,
+        why=(
+            f"Measured from the bar's close, not from when it was filed: what matters is how "
+            f"stale the market picture is. Closed {_freshness(age)} ago."
+            if age is not None
+            else "This session has processed no bar yet, so it has no market picture. "
+            "Nothing is shown rather than another session's last candle."
+        ),
+    )
+
+
+def _freshness(value: timedelta) -> str:
+    """Return a compact reading of how long ago something happened.
+
+    Distinct from :func:`_duration`, which renders uptime in whole hours and minutes. Staleness
+    is judged at a finer grain: "0h 00m" and "0h 03m" are the difference between a snapshot
+    written seconds ago and one three bars late, and both round to nothing in hours.
+    """
+    seconds = int(value.total_seconds())
+    if seconds < _SECONDS_PER_MINUTE:
+        return f"{seconds}s"
+    if seconds < _SECONDS_PER_HOUR:
+        return f"{seconds // _SECONDS_PER_MINUTE}m {seconds % _SECONDS_PER_MINUTE:02d}s"
+    hours, rest = divmod(seconds, _SECONDS_PER_HOUR)
+    return f"{hours}h {rest // _SECONDS_PER_MINUTE:02d}m"
+
+
 def _infra_brain(status: SessionStatus) -> Brain:
     """Whether the machinery under all of this is holding up."""
     report = status.report
     lock = status.lock
     kpis: list[Kpi] = []
     levels: list[Level] = []
+
+    kpis.append(
+        Kpi(
+            key="active_session",
+            label="Active session",
+            value=status.session_id,
+            meaning="Which session every figure on this page describes.",
+            source=Source.STRUCTURED if status.session_id else Source.UNAVAILABLE,
+            level=Level.DANGER if status.mixed_session_data else Level.INFO,
+            why=(
+                "This reading was asked for one session while a different one holds the live "
+                "lock, so what is shown is not the running session. Every panel below is "
+                "scoped to the session named here."
+                if status.mixed_session_data
+                else "Chosen from the lock a live process holds, so every panel below "
+                "describes the same session."
+            ),
+        )
+    )
+    if status.mixed_session_data:
+        levels.append(Level.DANGER)
+
+    kpis.append(_age_kpi(status.snapshot_age))
+    kpis.append(_bar_age_kpi(status))
 
     running_level = Level.GOOD if status.running else Level.ATTENTION
     kpis.append(
@@ -1701,6 +1785,11 @@ def _summary_blockers(
 ) -> list[str]:
     """Collect everything standing between the run and a clean bill of health."""
     blockers: list[str] = []
+    if status.mixed_session_data:
+        blockers.append(
+            "Mixed/stale session data detected: this reading describes "
+            f"{status.session_id!r}, which is not the session currently holding the lock."
+        )
     if not status.running:
         blockers.append("The session process is not running.")
     if by_key["market"].level is not Level.GOOD:

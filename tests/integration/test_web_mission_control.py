@@ -714,10 +714,14 @@ def test_history_survives_the_midnight_log_rotation(tree: dict[str, Path]) -> No
     # ever connected and report the session's fifth candle as its first, one minute past
     # midnight, while the session was perfectly healthy.
     _persist(tree, _state())
+    # Written into the *rotated* sibling, which is what this test is about — but timed after
+    # the session started, because a feed cannot transition before the session that opened it.
+    # Feed state is now scoped to the session's own lifetime, so a transition older than the
+    # session belongs to a previous run and is deliberately not this one's.
     (tree["logs"] / "marketdata.log.2026-09-04").write_text(
         json.dumps(
             {
-                "timestamp": "2026-09-04T20:35:56+00:00",
+                "timestamp": (datetime.now(UTC) - timedelta(hours=5)).isoformat(),
                 "message": "feed state transition",
                 "extra": {"from": "connecting", "to": "streaming"},
             }

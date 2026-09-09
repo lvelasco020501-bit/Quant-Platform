@@ -524,3 +524,41 @@ body {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* --- session identity and freshness ------------------------------------------------- */
+/* Present on every reading, because a panel whose session is unknown is a panel that can
+   quietly describe a run that stopped hours ago. */
+.identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 0.8rem;
+}
+.identity--alert {
+  border-color: var(--danger);
+  background: var(--danger-soft, var(--panel));
+}
+.identity__label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+.identity__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  word-break: break-all;
+}
+.identity__age {
+  color: var(--muted);
+}
+.identity__warn {
+  color: var(--danger);
+  font-weight: 600;
+}

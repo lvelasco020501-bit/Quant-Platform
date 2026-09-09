@@ -71,6 +71,8 @@
       `${sys.risk_label === "RISK V2" ? "Risk V2" : "Risk V1"} · ` +
       `${sys.symbols.join(", ") || "—"}`;
 
+    renderIdentity(sys);
+
     $("badges").innerHTML = [
       [sys.mode, "badge--accent"],
       [sys.risk_label, sys.risk_label === "RISK V2" ? "badge--good" : ""],
@@ -82,6 +84,28 @@
       .join("");
 
     $("schema").textContent = `schema ${data.schema_version}`;
+  }
+
+  /* The line that would have prevented this page ever showing a finished run's numbers
+     under a live run's banner: name the session, and say how old the reading is. */
+  function renderIdentity(sys) {
+    const node = $("identity");
+    const age = (seconds) => {
+      if (seconds === null || seconds === undefined) return "N/A";
+      const s = Math.round(seconds);
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s / 60)}m`;
+      return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+    };
+    node.className = `identity${sys.mixed_session_data ? " identity--alert" : ""}`;
+    node.innerHTML =
+      `<span class="identity__label">Active session</span>` +
+      `<code class="identity__id">${escape(sys.session_id || "none")}</code>` +
+      `<span class="identity__age">snapshot ${escape(age(sys.snapshot_age_seconds))}</span>` +
+      `<span class="identity__age">last bar ${escape(age(sys.last_bar_age_seconds))}</span>` +
+      (sys.mixed_session_data
+        ? `<span class="identity__warn">mixed/stale session data detected</span>`
+        : "");
   }
 
   function renderSummary(data) {

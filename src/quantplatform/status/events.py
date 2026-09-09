@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 __all__ = [
@@ -311,7 +311,7 @@ def _bar_detail(extra: dict[str, object]) -> str | None:
     return None
 
 
-def read_feed_state(log_directory: Path) -> str | None:
+def read_feed_state(log_directory: Path, *, since: datetime | None = None) -> str | None:
     """Return the feed's last recorded state, or ``None`` when it has never said.
 
     Log-derived, and unavoidably so: the feed's connection state lives in the running
@@ -319,11 +319,43 @@ def read_feed_state(log_directory: Path) -> str | None:
     transition it logged. That makes this a report of the last thing the feed *said*, not
     of what the socket is doing now — a process killed uncleanly leaves its last transition
     behind looking healthy. Callers pair it with whether the session is actually running.
+
+    Args:
+        log_directory: Where the feed writes.
+        since: Ignore transitions logged before this instant — normally the active session's
+            start. The feed's log lines carry no session id, because a feed does not know
+            which session is consuming it, so time is the only thing that can tell one run's
+            transitions from another's. Without it a dashboard reported a healthy CONNECTED
+            feed beside "no session running": the last transition of a session that had
+            stopped an hour earlier.
+
+    Returns:
+        The state, or ``None`` when nothing was recorded inside the window.
     """
     for record in reversed(_tail(log_directory / "marketdata.log")):
         if record.get("message") != "feed state transition":
+            continue
+        if since is not None and not _at_or_after(record, since):
             continue
         to = _extra(record).get("to")
         if isinstance(to, str):
             return to
     return None
+
+
+def _at_or_after(record: dict[str, object], moment: datetime) -> bool:
+    """Return whether a log record was written at or after a given instant.
+
+    An unparsable or missing timestamp answers ``False``: a line that cannot prove it belongs
+    to this session is not counted for it.
+    """
+    raw = record.get("timestamp")
+    if not isinstance(raw, str):
+        return False
+    try:
+        written = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if written.tzinfo is None:
+        written = written.replace(tzinfo=UTC)
+    return written >= moment

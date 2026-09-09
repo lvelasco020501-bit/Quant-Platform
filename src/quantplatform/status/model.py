@@ -105,6 +105,16 @@ class SessionStatus:
 
     state_present: bool
     lock: SessionLockRecord | None
+
+    mixed_session_data: bool = False
+    """Whether the sources read here did not all belong to one session.
+
+    Set when a reading was asked for one session while a different one holds a live lock.
+    A dashboard whose panels come from two sessions is worse than one showing nothing: it
+    invites acting on a position that no longer exists, so this is surfaced rather than
+    reconciled.
+    """
+
     warm_start: WarmStartRecord | None = None
     """How this session obtained its market context, when it was restored. Audit only:
     a session carrying one is no more resumable than one without."""
@@ -127,6 +137,28 @@ class SessionStatus:
     def marked_at(self) -> Decimal | None:
         """The price open positions are marked at: the last closed bar, or nothing."""
         return None if self.last_bar is None else self.last_bar.close
+
+    @property
+    def snapshot_age(self) -> timedelta | None:
+        """How long ago this session last persisted itself, or ``None`` if it never has.
+
+        ``None`` is the honest answer before the first bar closes. Rendering it as zero would
+        make a session that has written nothing look freshly saved.
+        """
+        if self.saved_at is None:
+            return None
+        return _now() - self.saved_at
+
+    @property
+    def last_bar_age(self) -> timedelta | None:
+        """How long ago the last bar this session processed closed, or ``None`` if none has.
+
+        Measured from the bar's close rather than from when it was handled: what an operator
+        needs to know is how stale the market picture is, not how quickly it was filed.
+        """
+        if self.last_bar is None:
+            return None
+        return _now() - self.last_bar.close_time
 
 
 def _now() -> datetime:
@@ -169,11 +201,13 @@ def gather_status(
     problems: list[str] = []
 
     lock = _read_lock(state_directory, notes, problems)
-    resolved_id = _resolve_session_id(session_id, lock, paper.session_id, notes)
+    problems_before = len(problems)
+    resolved_id = _resolve_session_id(session_id, lock, paper.session_id, notes, problems)
+    mixed = len(problems) > problems_before
     running = lock is not None and lock.is_alive and lock.session_id == resolved_id
 
     state = _load_state(state_directory, resolved_id, notes, problems)
-    report = _load_report(settings, notes, problems)
+    report = _load_report(settings, resolved_id, notes, problems)
 
     strategy_id = state.strategy_id if state is not None else paper.strategy_id
     required_history = _required_history(registry, strategy_id, notes)
@@ -222,6 +256,7 @@ def gather_status(
         report=report,
         notes=tuple(notes),
         state_present=state is not None,
+        mixed_session_data=mixed,
         lock=lock,
         warm_start=state.warm_start if state else None,
     )
@@ -260,22 +295,37 @@ def _resolve_session_id(
     lock: SessionLockRecord | None,
     configured: str,
     notes: list[str],
+    problems: list[str],
 ) -> str:
-    """Decide which session is being asked about.
+    """Decide which session is being asked about, and say when the answer is contested.
 
-    An explicit request wins. Otherwise a live lock wins over configuration, because an
-    operator asking about "the session" means the one that is running, and reporting the
-    configured name while a differently-named session holds the lock is how a status display
-    comes to describe something that is not there.
+    **A lock held by a live process is the source of truth.** An operator asking "how is it
+    going" means the session that is running, and configuration is a statement of intent that
+    may be hours out of date. Preferring the configured name is how a dashboard came to show a
+    finished run's warm-up, signals, profit and open position under a live session's banner.
+
+    An explicit request is still honoured — inspecting a session that has already stopped is a
+    legitimate thing to want — but it can no longer be honoured *silently* while a different
+    session is running. That disagreement is recorded as a problem, so the reading is DEGRADED
+    and says which session it is actually describing.
     """
+    live = lock if lock is not None and lock.is_alive else None
     if requested is not None:
+        if live is not None and live.session_id != requested:
+            _both(
+                notes,
+                problems,
+                f"asked for session {requested!r} while {live.session_id!r} is the one running: "
+                "describing the one that was asked for, which is not the live session",
+            )
         return requested
-    if lock is not None and lock.session_id != configured:
-        notes.append(
-            f"the running session is {lock.session_id!r}, which is not the configured "
-            f"{configured!r}; reporting on the running one"
-        )
-        return lock.session_id
+    if live is not None:
+        if live.session_id != configured:
+            notes.append(
+                f"the running session is {live.session_id!r}, which is not the configured "
+                f"{configured!r}; reporting on the running one"
+            )
+        return live.session_id
     return configured
 
 
@@ -303,8 +353,17 @@ def _load_state(
     return state
 
 
-def _load_report(settings: Settings, notes: list[str], problems: list[str]) -> DailyReport | None:
-    """Return today's report, or the most recent one, or nothing."""
+def _load_report(
+    settings: Settings, session_id: str, notes: list[str], problems: list[str]
+) -> DailyReport | None:
+    """Return this session's most recent report, or nothing.
+
+    A reports directory outlives the session that filled it, so a report has to prove whose
+    it is before any of its figures may be shown. One belonging to a finished run is dropped
+    rather than displayed: the signal counts, exposure and trade tallies a dashboard drew from
+    it were the strongest-looking numbers on the page and every one of them was another
+    session's.
+    """
     try:
         writer = DailyReportWriter(
             config=ReportingConfiguration(output_directory=settings.paper.reports_directory)
@@ -318,6 +377,12 @@ def _load_report(settings: Settings, notes: list[str], problems: list[str]) -> D
             notes,
             problems,
             f"daily reports could not be read ({type(exc).__name__}); activity counts are unknown",
+        )
+        return None
+    if report is not None and report.session_id != session_id:
+        notes.append(
+            f"the most recent daily report belongs to another session "
+            f"({report.session_id!r}, not {session_id!r}); its figures are not shown"
         )
         return None
     return report

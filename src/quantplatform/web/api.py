@@ -96,7 +96,9 @@ def _payload(settings: WebSettings) -> dict[str, Any]:
     )
     activity = read_activity(settings.log_directory, session_id=gathered.session_id)
     timeline = read_timeline(settings.log_directory, session_id=gathered.session_id)
-    feed_state = read_feed_state(settings.log_directory)
+    # Scoped to this session's own lifetime: the feed log carries no session id, so a
+    # transition written by a run that has already stopped is not this session's news.
+    feed_state = read_feed_state(settings.log_directory, since=gathered.started_at)
     brains = build_brains(
         gathered, activity, feed_state=feed_state, smoke_hours=settings.smoke_hours
     )
@@ -189,7 +191,18 @@ def _system(status: SessionStatus) -> dict[str, Any]:
         "risk_label": "RISK V2" if status.risk_v2_active else "RISK V1",
         "symbols": list(status.symbols),
         "timeframe": status.timeframe,
+        # Identity and freshness travel with the banner, because every other panel is
+        # meaningless without knowing whose session it describes and how old the reading is.
+        "session_id": status.session_id,
+        "mixed_session_data": status.mixed_session_data,
+        "snapshot_age_seconds": _seconds(status.snapshot_age),
+        "last_bar_age_seconds": _seconds(status.last_bar_age),
     }
+
+
+def _seconds(value: timedelta | None) -> float | None:
+    """Return an elapsed time in seconds, keeping unknown as unknown."""
+    return None if value is None else value.total_seconds()
 
 
 def _strategy_label(status: SessionStatus) -> str:

@@ -461,7 +461,10 @@ class PaperTradingSession:
         self._metrics.bars_received += 1
 
         if not self._is_actionable(bar):
+            # Refused for a reason that is the session working, not failing. Counted twice on
+            # purpose: once in the total, once in the subset health is allowed to forgive.
             self._metrics.bars_rejected += 1
+            self._metrics.bars_superseded += 1
             _LOGGER.debug(
                 "bar rejected",
                 extra={
@@ -781,6 +784,7 @@ class _MutableMetrics:
         self.bars_received = 0
         self.bars_processed = 0
         self.bars_rejected = 0
+        self.bars_superseded = 0
         self.signals_generated = 0
         self.intents_created = 0
         self.decisions_made = 0
@@ -799,6 +803,7 @@ class _MutableMetrics:
             bars_received=self.bars_received,
             bars_processed=self.bars_processed,
             bars_rejected=self.bars_rejected,
+            bars_superseded=self.bars_superseded,
             signals_generated=self.signals_generated,
             intents_created=self.intents_created,
             decisions_made=self.decisions_made,

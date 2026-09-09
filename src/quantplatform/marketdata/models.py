@@ -235,4 +235,5 @@ class FeedMetrics:
             candles_accepted=self.bars_emitted,
             candles_rejected=self.total_suppressed,
             duplicate_candles=self.duplicates_suppressed,
+            forming_candles=self.forming_suppressed,
         )

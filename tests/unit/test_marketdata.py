@@ -718,10 +718,27 @@ def test_a_snapshot_of_an_untouched_feed_is_clean_and_undefined() -> None:
     assert snapshot.acceptance_rate is None
 
 
-def test_a_snapshot_reports_the_share_the_feed_delivered() -> None:
+def test_a_snapshot_reports_the_share_of_closed_candles_the_feed_delivered() -> None:
+    # Eight candles parsed, two of them still forming, and every one of the six that closed
+    # was delivered. This once read 0.75, counting the forming pair as failures. They are not:
+    # a kline stream republishes the candle in flight by design, and grading against those
+    # updates measures the venue's cadence, not its reliability — which is how a live feed
+    # that had lost nothing scored 0.06% and put five daily reports in the red.
     snapshot = FeedMetrics(candles_parsed=8, bars_emitted=6, forming_suppressed=2).health_snapshot()
 
-    assert snapshot.acceptance_rate == Decimal("0.75")
+    assert snapshot.closed_candles_received == 6
+    assert snapshot.acceptance_rate == Decimal(1)
+
+
+def test_a_closed_candle_the_feed_refused_still_lowers_the_share() -> None:
+    # The other half of the pair above: a duplicate is a closed candle that did not become a
+    # bar, so it belongs in the denominator and has to move the number.
+    snapshot = FeedMetrics(
+        candles_parsed=8, bars_emitted=5, forming_suppressed=2, duplicates_suppressed=1
+    ).health_snapshot()
+
+    assert snapshot.closed_candles_received == 6
+    assert snapshot.acceptance_rate == Decimal(5) / Decimal(6)
 
 
 def test_a_malformed_frame_makes_a_snapshot_unclean() -> None:

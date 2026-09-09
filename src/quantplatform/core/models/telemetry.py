@@ -51,6 +51,7 @@ ADDITIVE_FEED_COUNTERS: Final[tuple[str, ...]] = (
     "candles_accepted",
     "candles_rejected",
     "duplicate_candles",
+    "forming_candles",
 )
 """Every counter that only climbs, and is therefore safe to subtract across a window.
 
@@ -106,6 +107,20 @@ class FeedMetricsSnapshot(DomainModel):
     reconnect is the venue behaving correctly, while a steady stream of them is not.
     """
 
+    forming_candles: int = Field(default=0, ge=0)
+    """The share of :attr:`candles_rejected` that had simply not closed yet.
+
+    Broken out for the same reason as duplicates, and more urgently. A kline stream
+    republishes the candle in flight about once a second, so this counter outnumbers every
+    other by three orders of magnitude — roughly 42,000 a day against 24 closed bars.
+    Folding it in with real refusals is what made ``candles_accepted / candles_received``
+    read 0.06% on a feed that had not lost a single bar, and put five consecutive daily
+    reports in the red for a non-event.
+
+    Defaults to zero, so a snapshot written before this counter existed grades exactly as it
+    did then: no forming candles known means every parsed candle is treated as a closed one.
+    """
+
     @model_validator(mode="after")
     def _validate(self) -> Self:
         """Check the counters describe a possible history.
@@ -126,6 +141,9 @@ class FeedMetricsSnapshot(DomainModel):
             raise ValueError(msg)
         if self.duplicate_candles > self.candles_rejected:
             msg = "duplicate candles cannot exceed rejected candles"
+            raise ValueError(msg)
+        if self.forming_candles > self.candles_rejected:
+            msg = "forming candles cannot exceed rejected candles"
             raise ValueError(msg)
         return self
 
@@ -174,17 +192,28 @@ class FeedMetricsSnapshot(DomainModel):
         )
 
     @property
+    def closed_candles_received(self) -> int:
+        """Return how many parsed candles were finished ones.
+
+        The denominator any question about delivery has to be asked over. A forming candle
+        was never a bar the feed could have delivered, so counting it as one it failed to
+        deliver measures the venue's streaming cadence rather than its reliability.
+        """
+        return self.candles_received - self.forming_candles
+
+    @property
     def acceptance_rate(self) -> Decimal | None:
-        """Return the share of parsed candles that reached the pipeline.
+        """Return the share of *closed* candles that reached the pipeline.
 
         Returns:
-            The ratio, or ``None`` before any candle was parsed — a rate over zero
-            observations is undefined, and reporting it as zero would read like a total
-            feed failure rather than a quiet start.
+            The ratio, or ``None`` before any candle closed — a rate over zero observations
+            is undefined, and reporting it as zero would read like a total feed failure
+            rather than a quiet start, or a session that connected mid-hour.
         """
-        if self.candles_received == 0:
+        closed = self.closed_candles_received
+        if closed <= 0:
             return None
-        return Decimal(self.candles_accepted) / Decimal(self.candles_received)
+        return Decimal(self.candles_accepted) / Decimal(closed)
 
     @property
     def is_clean(self) -> bool:

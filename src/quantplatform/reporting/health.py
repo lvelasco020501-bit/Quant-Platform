@@ -150,14 +150,22 @@ def _ceiling(
 
 
 def _feed_stability(statistics: DailyStatistics, thresholds: AlertThresholds) -> HealthCheck:
-    """Grade the share of received bars that reached the pipeline."""
+    """Grade the share of *closed* candles that reached the pipeline.
+
+    Closed is the whole point. A kline stream republishes the candle in flight about once a
+    second, and those updates outnumber finished bars three orders of magnitude to one. Judged
+    against every parsed frame, a feed that had not lost a single bar scored 0.06% against a
+    floor of 95% and painted five consecutive daily reports red. A red that is always on is a
+    red nobody reads, so the denominator here counts only candles the venue actually finished
+    — the ones it could have failed to deliver.
+    """
     observed = statistics.observed_acceptance_rate
     minimum = thresholds.min_acceptance_rate
     if observed is None:
         return HealthCheck(
             name=HealthCheckName.FEED_STABILITY,
             level=HealthLevel.GREEN,
-            message="no bars were received, so acceptance has nothing to measure",
+            message="no candle closed today, so acceptance has nothing to measure",
             threshold=minimum,
             skipped=True,
         )
@@ -165,7 +173,7 @@ def _feed_stability(statistics: DailyStatistics, thresholds: AlertThresholds) ->
         return HealthCheck(
             name=HealthCheckName.FEED_STABILITY,
             level=HealthLevel.GREEN,
-            message=f"{_percent(observed)} of received bars reached the pipeline",
+            message=f"{_percent(observed)} of closed candles reached the pipeline",
             observed=observed,
             threshold=minimum,
         )
@@ -177,7 +185,7 @@ def _feed_stability(statistics: DailyStatistics, thresholds: AlertThresholds) ->
         name=HealthCheckName.FEED_STABILITY,
         level=level,
         message=(
-            f"only {_percent(observed)} of received bars reached the pipeline, "
+            f"only {_percent(observed)} of closed candles reached the pipeline, "
             f"against a floor of {_percent(minimum)}"
         ),
         observed=observed,
@@ -194,16 +202,28 @@ def _session_acceptance(statistics: DailyStatistics, thresholds: AlertThresholds
     every one — and because nothing measured the second question, a week of trading nothing
     would have reported green.
 
-    Zero processing while bars arrived is always red, never merely yellow. There is no
-    configuration under which a session that received work and did none of it is healthy.
+    Zero processing while actionable bars arrived is always red, never merely yellow. There is
+    no configuration under which a session that received work and did none of it is healthy.
+
+    **A bar the session was right to refuse is not counted against it.** Forming, not yet
+    final, or already lived through: each of those refusals is the session protecting itself
+    from trading a price that has not settled or a minute it has already traded. Grading them
+    as defects made a startup day — three bars acted on out of four delivered, the fourth
+    caught mid-flight on connect — raise an *error*-severity alert against a healthy session.
+    The exemption is narrow on purpose: it covers only refusals the session classified as
+    superseded, so a bar dropped for any other reason still counts in full.
     """
-    observed = statistics.daily_session_acceptance_rate
+    observed = statistics.observed_session_acceptance_rate
     minimum = thresholds.minimum_session_acceptance_rate
+    actionable = statistics.actionable_session_bars
     if observed is None:
         return HealthCheck(
             name=HealthCheckName.SESSION_BAR_ACCEPTANCE,
             level=HealthLevel.GREEN,
-            message="the session received no bars today, so acceptance has nothing to measure",
+            message=(
+                "the session received no bar it was expected to act on today, so acceptance "
+                "has nothing to measure"
+            ),
             threshold=minimum,
             skipped=True,
         )
@@ -213,7 +233,7 @@ def _session_acceptance(statistics: DailyStatistics, thresholds: AlertThresholds
             level=HealthLevel.GREEN,
             message=(
                 f"the session processed {_percent(observed)} of the "
-                f"{statistics.daily_session_bars_received} bar(s) it received"
+                f"{actionable} actionable bar(s) it received"
             ),
             observed=observed,
             threshold=minimum,
@@ -223,8 +243,7 @@ def _session_acceptance(statistics: DailyStatistics, thresholds: AlertThresholds
             name=HealthCheckName.SESSION_BAR_ACCEPTANCE,
             level=HealthLevel.RED,
             message=(
-                f"the session processed none of the "
-                f"{statistics.daily_session_bars_received} bar(s) it received"
+                f"the session processed none of the {actionable} actionable bar(s) it received"
             ),
             observed=observed,
             threshold=minimum,

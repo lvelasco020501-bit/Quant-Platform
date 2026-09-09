@@ -395,8 +395,12 @@ def _add_session_rejection(
 
     Critical when it processed none of them: a session that received work and did none of
     it is not degraded, it is not running, and the difference matters at 3am.
+
+    Counts only bars the session was expected to act on. A bar still forming, one the clock
+    has not called final, or one already lived through is a refusal the session is supposed
+    to make — waking somebody at 3am for that is how an alert channel stops being read.
     """
-    observed = statistics.daily_session_acceptance_rate
+    observed = statistics.observed_session_acceptance_rate
     minimum = thresholds.minimum_session_acceptance_rate
     if observed is None or observed >= minimum:
         return
@@ -406,7 +410,7 @@ def _add_session_rejection(
             severity=AlertSeverity.CRITICAL if observed <= ZERO else AlertSeverity.ERROR,
             message=(
                 f"the session processed {_percent(observed)} of the "
-                f"{statistics.daily_session_bars_received} bar(s) the feed delivered, "
+                f"{statistics.actionable_session_bars} actionable bar(s) the feed delivered, "
                 f"against a floor of {_percent(minimum)}"
             ),
             observed=observed,
@@ -623,6 +627,7 @@ class DailyReportBuilder:
             performance=performance,
             observations=observations,
             feed_metrics=window,
+            previous=previous,
         )
         health = evaluate_health(statistics=statistics, thresholds=self._config.thresholds)
         alerts = evaluate_alerts(statistics=statistics, thresholds=self._config.thresholds)
@@ -760,6 +765,7 @@ class DailyReportBuilder:
         performance: PerformanceSummary,
         observations: FeedDiagnostics,
         feed_metrics: FeedMetricsSnapshot | None,
+        previous: DailyReport | None = None,
     ) -> DailyStatistics:
         """Fold every source into the day's counted figures."""
         flow = _OrderFlow.of(outcomes)
@@ -768,6 +774,14 @@ class DailyReportBuilder:
         # the session exactly once — so the feed's "delivered" is the session's "received",
         # and one number cannot drift from the other.
         session_received = feed_metrics.candles_accepted if feed_metrics is not None else 0
+        # Bars the session was right to refuse, this day alone. The session's own counter is
+        # cumulative, so it is differenced against the reading the last report carried —
+        # the same reason the feed's counters are differenced rather than read raw. Without
+        # this, one refusal on day one would go on excusing a refusal every day after it.
+        superseded_baseline = previous.statistics.bars_superseded if previous is not None else 0
+        session_superseded = min(
+            max(result.runtime.bars_superseded - superseded_baseline, 0), session_received
+        )
         # Carried through the session untouched, exactly as the feed's counters are. Not a
         # daily delta: these say whether the refresh loop is working *now*, and a difference
         # between two days cannot express that.
@@ -833,6 +847,7 @@ class DailyReportBuilder:
             acceptance_rate=runtime.acceptance_rate,
             bars_processed=len(outcomes),
             bars_rejected=runtime.bars_rejected,
+            bars_superseded=runtime.bars_superseded,
             out_of_order_candles=observations.out_of_order_candles,
             unknown_symbols=observations.unknown_symbols,
             missing_bars=observations.missing_bars,
@@ -849,12 +864,16 @@ class DailyReportBuilder:
             daily_candles_received=observations.candles_received,
             daily_candles_accepted=observations.candles_accepted,
             daily_candles_rejected=observations.candles_rejected,
+            daily_forming_candles=(feed_metrics.forming_candles if feed_metrics is not None else 0),
             daily_feed_acceptance_rate=(
                 feed_metrics.acceptance_rate if feed_metrics is not None else None
             ),
             daily_session_bars_received=session_received,
             daily_session_bars_processed=len(outcomes),
-            daily_session_acceptance_rate=_ratio(len(outcomes), session_received),
+            daily_session_bars_superseded=session_superseded,
+            daily_session_acceptance_rate=_ratio(
+                len(outcomes), session_received - session_superseded
+            ),
             feed_metrics_available=feed_metrics is not None,
             symbol_rules_refresh_attempts=rules.refresh_attempts if rules else 0,
             symbol_rules_refresh_successes=rules.refresh_successes if rules else 0,

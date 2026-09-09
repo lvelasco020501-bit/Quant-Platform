@@ -363,6 +363,14 @@ class DailyStatistics(DomainModel):
     bars_rejected: int = Field(default=0, ge=0)
     """Session-cumulative, for the same reason."""
 
+    bars_superseded: int = Field(default=0, ge=0)
+    """Session-cumulative subset of ``bars_rejected`` the session was right to refuse.
+
+    Carried here so the next day's report can difference against it, exactly as the feed's
+    cumulative counters are differenced. Read
+    :attr:`daily_session_bars_superseded` for the figure that belongs to this day.
+    """
+
     out_of_order_candles: int = Field(default=0, ge=0)
     unknown_symbols: int = Field(default=0, ge=0)
     missing_bars: int = Field(default=0, ge=0)
@@ -386,6 +394,15 @@ class DailyStatistics(DomainModel):
     daily_candles_rejected: int = Field(default=0, ge=0)
     daily_duplicate_candles: int = Field(default=0, ge=0)
 
+    daily_forming_candles: int = Field(default=0, ge=0)
+    """Today's candles refused solely because they had not closed yet.
+
+    A kline stream republishes the candle in flight about once a second, so this dwarfs
+    every other counter here: a normal day is ~42,000 of these against 24 closed bars.
+    Kept separate from :attr:`daily_candles_rejected` because it is the venue working, not
+    the venue failing, and grading delivery against it measures streaming cadence.
+    """
+
     daily_feed_acceptance_rate: Money | None = None
     """Today's accepted candles over today's received candles.
 
@@ -399,6 +416,15 @@ class DailyStatistics(DomainModel):
 
     daily_session_bars_processed: int = Field(default=0, ge=0)
     """Day-scoped: bars that reached the pipeline."""
+
+    daily_session_bars_superseded: int = Field(default=0, ge=0)
+    """Day-scoped: bars the session declined for a structurally correct reason.
+
+    A bar still forming, one the clock has not called final, or one whose close time the
+    account has already lived through. Each refusal is the session protecting itself, and
+    counting them as failures is what made a startup day — three bars acted on out of four
+    delivered, the fourth caught mid-flight on connect — raise an *error*-severity alert.
+    """
 
     daily_session_acceptance_rate: Money | None = None
     """Today's processed bars over today's received bars.
@@ -459,17 +485,48 @@ class DailyStatistics(DomainModel):
     """
 
     @property
+    def daily_closed_candles_received(self) -> int:
+        """Return how many of today's parsed candles were finished ones."""
+        return self.daily_candles_received - self.daily_forming_candles
+
+    @property
     def observed_acceptance_rate(self) -> Decimal | None:
         """Return the acceptance rate feed-stability should be judged on.
 
-        The feed's daily rate when a reading reached this report, and the session's
-        cumulative bar-acceptance rate otherwise. The two count different things — the feed
-        counts candles the venue sent that never became bars, the session counts bars it
-        refused for its own reasons — so the measured one wins whenever it exists.
+        Recomputed from today's counts whenever a closed candle is among them, because that
+        is the only form of the question worth asking: of the candles that actually finished,
+        how many became bars? Falls back to the rate the report recorded when no count is
+        available, and to the session's cumulative rate when no feed reading reached the
+        report at all. The two count different things — the feed counts candles the venue
+        sent that never became bars, the session counts bars it refused for its own reasons.
         """
         if self.feed_metrics_available:
+            closed = self.daily_closed_candles_received
+            if closed > 0:
+                return Decimal(self.daily_candles_accepted) / Decimal(closed)
             return self.daily_feed_acceptance_rate
         return self.acceptance_rate
+
+    @property
+    def actionable_session_bars(self) -> int:
+        """Return the bars the session was genuinely expected to act on today.
+
+        Everything the feed handed over, less the ones it was right to decline.
+        """
+        return self.daily_session_bars_received - self.daily_session_bars_superseded
+
+    @property
+    def observed_session_acceptance_rate(self) -> Decimal | None:
+        """Return the share of actionable bars the session processed.
+
+        ``None`` when nothing today was actionable, which is a real state — a session that
+        connects mid-hour and is stopped before the hour closes refused nothing wrongly, and
+        a rate over zero observations is undefined rather than zero.
+        """
+        actionable = self.actionable_session_bars
+        if actionable <= 0:
+            return None
+        return Decimal(self.daily_session_bars_processed) / Decimal(actionable)
 
     @property
     def is_profitable(self) -> bool:

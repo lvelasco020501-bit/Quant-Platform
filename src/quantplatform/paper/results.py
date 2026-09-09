@@ -56,6 +56,15 @@ class RuntimeMetrics:
     bars_rejected: int = 0
     """Bars refused before reaching the pipeline: still forming, out of order, or unknown."""
 
+    bars_superseded: int = 0
+    """The subset of :attr:`bars_rejected` the session was *right* to refuse.
+
+    A bar still forming, one the clock has not called final, or one whose close time the
+    account has already lived through. Every one of these is the session declining to trade a
+    price that has not settled or a minute it has already traded, and reporting them beside
+    genuine failures made a healthy startup day look like a 25% rejection rate.
+    """
+
     signals_generated: int = 0
     intents_created: int = 0
     decisions_made: int = 0

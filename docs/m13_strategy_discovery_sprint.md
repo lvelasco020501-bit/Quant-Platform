@@ -286,7 +286,18 @@ backtest para poder evaluar la política completa.
   En 11 el mismo experimento de año completo quedó registrado dos veces dentro de la corrida
   (baseline de stress y de sensibilidad) y el ledger lo marca *reproducible*. Los dos
   benchmarks no tienen sensibilidad, así que no tienen esa repetición interna.
-* **Re-ejecución desde el commit limpio:** ver el commit siguiente a este documento.
+* **Re-ejecución desde el commit limpio `571322b`** (árbol sin cambios): `regime_trend` bajo A y
+  bajo B, y `ema_trend` bajo A. Los resultados almacenados son **idénticos en todos los campos
+  salvo `code_revision` y las marcas de tiempo**: los 18 y 11 trades, los 8 760 puntos de la
+  curva de equity, el rendimiento y la definición. Retornos: +0.037157869721627175 y
+  −0.013032966000388245, los mismos que en la corrida del sprint.
+* **Sobre la etiqueta `code_changed` del ledger — no es un veredicto sobre los resultados.** El
+  sprint corrió con el árbol de trabajo (`849d021-dirty`: el código de `src` ya era el final, pero
+  sin commitear) y la re-ejecución con `571322b`. Cuando la revisión cambia, el ledger devuelve
+  `code_changed` *antes* de comparar hashes, y el `result_hash` incluye la propia revisión, así
+  que entre revisiones distintas nunca coinciden por construcción. La prueba de igualdad es por
+  eso la comparación directa de contenidos de arriba, no el hash. Es una limitación de la
+  herramienta, anotada para quien lea este ledger después.
 
 ## 10. Limitaciones
 

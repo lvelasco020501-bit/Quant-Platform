@@ -11,6 +11,7 @@ not yet printed.
 
 from __future__ import annotations
 
+from quantplatform.features.indicators import IndicatorFeatures
 from quantplatform.features.pipeline import (
     CompositeFeaturePipeline,
     DonchianChannelFeatures,
@@ -23,6 +24,7 @@ __all__ = [
     "CompositeFeaturePipeline",
     "DonchianChannelFeatures",
     "ExponentialMovingAverageFeatures",
+    "IndicatorFeatures",
     "MovingAverageFeatures",
     "NullFeaturePipeline",
 ]

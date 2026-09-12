@@ -14,6 +14,7 @@ from quantplatform.features import (
     CompositeFeaturePipeline,
     DonchianChannelFeatures,
     ExponentialMovingAverageFeatures,
+    IndicatorFeatures,
     NullFeaturePipeline,
 )
 
@@ -41,9 +42,12 @@ def features_for(strategy: BaseStrategy) -> FeaturePipeline:
     An ``ema_<n>`` name is answered with an exponential pipeline of period ``n``; a
     ``donchian_high_<n>`` or ``donchian_low_<n>`` name is answered with a Donchian-channel
     pipeline of period ``n`` — one pipeline serves both names, since a channel's high and low
-    are computed together. A strategy needing both kinds gets a
-    :class:`~quantplatform.features.CompositeFeaturePipeline` of the two; one declaring
-    neither gets the null pipeline. Anything else is left to the engine's contract check,
+    are computed together. Any name in the research indicator grammar — ``sma_<n>``,
+    ``roc_<n>``, ``zscore_<n>`` and the rest listed on
+    :mod:`quantplatform.features.indicators` — is answered by one
+    :class:`~quantplatform.features.IndicatorFeatures`. A strategy needing more than one kind
+    gets a :class:`~quantplatform.features.CompositeFeaturePipeline` of them; one declaring
+    none gets the null pipeline. Anything else is left to the engine's contract check,
     which refuses a run whose pipeline cannot produce what the strategy requires rather than
     letting it start and go quiet.
     """
@@ -55,11 +59,15 @@ def features_for(strategy: BaseStrategy) -> FeaturePipeline:
         set(_periods_for("donchian_high_", required)) | set(_periods_for("donchian_low_", required))
     )
 
+    indicator_names = tuple(sorted(name for name in required if IndicatorFeatures.handles(name)))
+
     pipelines: list[object] = []
     if ema_periods:
         pipelines.append(ExponentialMovingAverageFeatures(ema_periods))
     if donchian_periods:
         pipelines.append(DonchianChannelFeatures(donchian_periods))
+    if indicator_names:
+        pipelines.append(IndicatorFeatures(indicator_names))
 
     if not pipelines:
         return NullFeaturePipeline()

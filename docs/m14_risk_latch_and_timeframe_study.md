@@ -360,7 +360,12 @@ deduplica resultados idénticos— y no se cambió después de ver la salida.
 * **REF a través del wrapper = motor sin wrapper** en 18 de 18 jobs; el ledger las marca *reproducible*.
 * **1h REF reproduce M13 dígito a dígito** para las 6 estrategias, copias multi-timeframe incluidas.
 * **`research verify`**: 18 ledgers, 0 fallos de reproducibilidad.
-* **Re-ejecución desde el commit limpio:** ver el commit siguiente a este documento.
+* **Re-ejecución desde el commit limpio `0f6bf44`** (árbol sin cambios) de 4 jobs —
+  `rsi_reversal` y `regime_trend` en 4h y 1d, las cinco políticas más stress, IS/OOS,
+  walk-forward y vecinos: **96 de 96 resultados almacenados idénticos** en todos los campos salvo
+  `code_revision` y las marcas de tiempo. `research verify`: 0 fallos. Como en M13, la etiqueta
+  `code_changed` del ledger solo dice que la revisión cambió; la igualdad se prueba comparando
+  contenidos, porque el `result_hash` incluye la revisión.
 
 ## 12. Limitaciones
 

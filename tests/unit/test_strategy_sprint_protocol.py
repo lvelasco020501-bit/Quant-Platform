@@ -37,7 +37,9 @@ from quantplatform.research.sprint import (
 )
 from quantplatform.strategies.research import build_research_registry
 
-DEPLOYED = Path("var/research/m10c/def_breakout_v2.json")
+# Committed copy of the deployed M11 definition: var/ is git-ignored, so a test reading it
+# would pass here and fail on any fresh clone.
+DEPLOYED = Path(__file__).resolve().parents[1] / "fixtures" / "deployed_risk_v2_definition.json"
 
 
 def test_every_candidate_and_every_neighbour_can_be_built() -> None:

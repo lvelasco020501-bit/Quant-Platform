@@ -15,6 +15,7 @@ from pathlib import Path
 
 from quantplatform.backtesting.engine import BacktestEngine
 from quantplatform.core.enums import ExecutionMode
+from quantplatform.core.errors import ConfigurationError
 from quantplatform.core.interfaces import FeaturePipeline
 from quantplatform.core.models.portfolio import Balance
 from quantplatform.execution.broker import SimulatedBroker
@@ -42,6 +43,7 @@ class ExperimentEngineFactory:
         registry: StrategyRegistry,
         features_for: Callable[[BaseStrategy], FeaturePipeline],
         quote_asset: str,
+        risk_engine_for: Callable[[ExperimentDefinition], StandardRiskEngine] | None = None,
     ) -> None:
         """Wire the registry an experiment's ``strategy_id`` is resolved against.
 
@@ -52,8 +54,13 @@ class ExperimentEngineFactory:
                 the instance here instead would be a second, weaker copy of that check.
             features_for: Builds the pipeline a resolved strategy declares it needs.
             quote_asset: Asset the account is denominated in.
+            risk_engine_for: Builds the risk engine for one definition, when research needs a
+                variant of the standard one — M14's latch policies, say. ``None`` builds the
+                standard engine, exactly as before. Whatever it returns must be configured with
+                the definition's own risk configuration, or the factory refuses it.
         """
         self._registry = registry
+        self._risk_engine_for = risk_engine_for
         self._features_for = features_for
         self._quote_asset = quote_asset
 
@@ -103,11 +110,29 @@ class ExperimentEngineFactory:
             config=definition.backtest,
             strategy=strategy,
             features=self._features_for(strategy),
-            risk_engine=StandardRiskEngine(config=definition.risk),
+            risk_engine=self._risk_engine(definition),
             broker=broker,
             portfolio=portfolio,
             symbols=symbols,
         )
+
+    def _risk_engine(self, definition: ExperimentDefinition) -> StandardRiskEngine:
+        """Return the risk engine for a definition, refusing one configured for another.
+
+        Raises:
+            ConfigurationError: If an injected engine's configuration is not the definition's.
+                A run under different limits than the definition names would file its result
+                under the wrong experiment.
+        """
+        if self._risk_engine_for is None:
+            return StandardRiskEngine(config=definition.risk)
+        engine = self._risk_engine_for(definition)
+        if engine.config != definition.risk:
+            raise ConfigurationError(
+                "the injected risk engine is not configured with the definition's risk limits",
+                experiment_id=definition.experiment_id,
+            )
+        return engine
 
 
 _GIT_TIMEOUT_SECONDS = 10

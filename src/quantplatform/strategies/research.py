@@ -36,12 +36,17 @@ from quantplatform.core.enums import MarketType, PositionState, SignalAction, Ti
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.strategies.base import BaseStrategy
+from quantplatform.strategies.breakout import BreakoutStrategy
+from quantplatform.strategies.ema_trend import EmaTrendStrategy
 from quantplatform.strategies.registry import StrategyRegistry, build_default_registry
 
 __all__ = [
+    "MULTI_TIMEFRAME_BENCHMARKS",
     "RESEARCH_STRATEGIES",
     "BollingerReversionStrategy",
+    "BreakoutMultiTimeframe",
     "EmaSlopeStrategy",
+    "EmaTrendMultiTimeframe",
     "MomentumStrategy",
     "RegimeReversionStrategy",
     "RegimeSwitchStrategy",
@@ -69,6 +74,10 @@ _ONE_BAR_MORE: Final[frozenset[str]] = frozenset(
     {"roc", "zscore_prev", "rvol", "rsi", "er", "donchian_high", "donchian_low"}
 )
 _EMA_SEED_MULTIPLE: Final[int] = 5
+
+_STUDIED_TIMEFRAMES: Final[tuple[Timeframe, ...]] = (Timeframe.H1, Timeframe.H4, Timeframe.D1)
+"""Research strategies may run on the slower timeframes M14 studies. The production
+strategies stay hourly-only; the benchmarks get research copies below instead."""
 
 _FROZEN: Final[ConfigDict] = ConfigDict(frozen=True, extra="forbid", validate_default=True)
 _Window = Annotated[int, Field(ge=2, le=1000)]
@@ -120,7 +129,7 @@ def _metadata(
         description=description,
         required_history=max(warm_up(feature) for feature in features),
         required_features=features,
-        supported_timeframes=(Timeframe.H1,),
+        supported_timeframes=_STUDIED_TIMEFRAMES,
         supported_market_types=(MarketType.SPOT,),
         parameter_schema=schema,
         operates_intrabar=False,
@@ -772,6 +781,45 @@ class VolFilteredMomentumStrategy(ResearchStrategy):
         return ()
 
 
+# --- Benchmarks on slower timeframes -----------------------------------------------------------
+
+
+def _widened(metadata: StrategyMetadata, strategy_id: str) -> StrategyMetadata:
+    """Return a benchmark's contract under a research id, allowed on the studied timeframes."""
+    declared = dict(metadata)
+    declared["strategy_id"] = strategy_id
+    declared["supported_timeframes"] = _STUDIED_TIMEFRAMES
+    declared["description"] = (
+        f"{metadata.description} Research copy of {metadata.strategy_id}, identical rule, "
+        "also allowed on 4h and 1d."
+    )
+    return StrategyMetadata(**declared)
+
+
+class EmaTrendMultiTimeframe(EmaTrendStrategy):
+    """EMA20/50 exactly as the benchmark, allowed on 4h and 1d for the timeframe study.
+
+    A subclass rather than an edit: the production class stays hourly-only and pinned, and
+    this copy carries its own id, so no result from a slower timeframe can ever be filed
+    under the frozen benchmark's name.
+    """
+
+    METADATA: ClassVar[StrategyMetadata] = _widened(EmaTrendStrategy.METADATA, "ema_trend_mtf")
+
+
+class BreakoutMultiTimeframe(BreakoutStrategy):
+    """Donchian 20/10 exactly as the paper strategy, allowed on 4h and 1d. See above."""
+
+    METADATA: ClassVar[StrategyMetadata] = _widened(BreakoutStrategy.METADATA, "breakout_mtf")
+
+
+MULTI_TIMEFRAME_BENCHMARKS: Final[tuple[type[BaseStrategy], ...]] = (
+    EmaTrendMultiTimeframe,
+    BreakoutMultiTimeframe,
+)
+"""Research copies of the benchmarks. Registered for research only, never for paper."""
+
+
 RESEARCH_STRATEGIES: Final[tuple[type[ResearchStrategy], ...]] = (
     MomentumStrategy,
     EmaSlopeStrategy,
@@ -795,6 +843,6 @@ def build_research_registry() -> StrategyRegistry:
     against exactly the classes paper trading runs.
     """
     registry = build_default_registry()
-    for strategy_class in RESEARCH_STRATEGIES:
+    for strategy_class in (*RESEARCH_STRATEGIES, *MULTI_TIMEFRAME_BENCHMARKS):
         registry.register(strategy_class)
     return registry

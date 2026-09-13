@@ -22,7 +22,11 @@ from quantplatform.features import IndicatorFeatures
 from quantplatform.orchestration.features import features_for
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.registry import BUILTIN_STRATEGIES, build_default_registry
-from quantplatform.strategies.research import RESEARCH_STRATEGIES, build_research_registry
+from quantplatform.strategies.research import (
+    MULTI_TIMEFRAME_BENCHMARKS,
+    RESEARCH_STRATEGIES,
+    build_research_registry,
+)
 from tests.factories import make_bar, make_bars, make_context
 
 FLAT = PositionState.FLAT
@@ -57,7 +61,7 @@ def test_no_research_strategy_is_reachable_from_paper_trading() -> None:
     # The paper runner resolves strategies through the default registry. A research rule that
     # leaked into it would be one mistyped flag away from a live session.
     paper = build_default_registry()
-    for strategy_class in RESEARCH_STRATEGIES:
+    for strategy_class in (*RESEARCH_STRATEGIES, *MULTI_TIMEFRAME_BENCHMARKS):
         assert strategy_class not in BUILTIN_STRATEGIES
         assert strategy_class.METADATA.strategy_id not in paper
     assert len(paper) == 2
@@ -67,7 +71,7 @@ def test_the_research_registry_still_carries_the_benchmarks() -> None:
     registry = build_research_registry()
     assert "ema_trend" in registry
     assert "breakout" in registry
-    assert len(registry) == 2 + len(RESEARCH_STRATEGIES)
+    assert len(registry) == 2 + len(RESEARCH_STRATEGIES) + len(MULTI_TIMEFRAME_BENCHMARKS)
 
 
 def test_every_research_strategy_is_long_only_spot() -> None:

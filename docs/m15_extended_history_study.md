@@ -111,7 +111,7 @@ timeframes.
 104 trabajos (el walk-forward, las siete ventanas anuales y la corrida continua de cada
 estrategia × timeframe), **0 fallidos**, 11 h 38 min en 6 procesos. Los 104 ledgers pasan
 `quantplatform research verify` con **0 contradicciones**; cada experimento tiene una sola entrada,
-así que la reproducibilidad la establece la re-ejecución desde árbol limpio (§10), no el verify. El
+así que la reproducibilidad la establece la re-ejecución desde árbol limpio (§11), no el verify. El
 informe completo, con cada combinación bajo cada política, es `var/research/m15/REPORT.md`
 (`scripts/m15_report.py`), y los números de máquina, `verdicts.json`.
 
@@ -225,3 +225,19 @@ Nada va a paper. Para convertir regime_trend 4h en candidato hace falta **muestr
 activos con el mismo protocolo, o más historia. Y para correr 1h de verdad, arreglar el motor
 cuadrático (histórico incremental) en un milestone propio. Adoptar C en Risk V2 productivo sería
 una decisión aparte, con su procedimiento de reset.
+
+## 11. Reproducibilidad desde árbol limpio
+
+Re-ejecución desde el commit `185ca01` (árbol sin cambios; cada entrada nueva lleva la revisión sin
+`-dirty`) de **todo el diario** (4 estrategias, 36 trabajos) y de **regime_trend 4h** (la
+combinación de cabecera, 9 trabajos: las cuatro políticas continuas, los siete años con stress y
+vecinos, y el walk-forward).
+
+* **332 de 332 resultados almacenados idénticos** en todos los campos salvo `code_revision`, marcas
+  de tiempo e identificadores del intento. 0 sin pareja.
+* `research verify` sobre los 104 ledgers: **0 fallos de reproducibilidad**. Como en M13 y M14, la
+  etiqueta `code_changed` solo dice que la revisión cambió (`result_hash` la incluye); la igualdad
+  se prueba comparando contenidos.
+* Las parejas se forman por `experiment_id` (hash de la definición), no por nombre: en los ledgers
+  anuales, stress y vecinos comparten el nombre de su base (167 entradas), y emparejar por nombre
+  cruza REF con sus variantes.

@@ -9,6 +9,13 @@ boundary, so an incomplete bucket at either *edge* is dropped: it is the dataset
 not a hole in the data. A missing bar anywhere else is refused — a 4h bar built from three
 hours would describe a market nobody observed, and silently skipping it would shift every
 indicator that reads a window across it.
+
+**The one exception is named, never inferred.** An exchange occasionally halts trading for a
+few hours; those hours have no kline because nothing traded, and the exchange's own 4h and 1d
+klines are built from the hours that did trade. A caller may pass exactly those hours as
+``allowed_missing``; a bucket missing only named hours is built from the hours present, which is
+the exchange's own bar, and anything else missing is still refused. The M15 dataset proves the
+claim rather than assuming it, by comparing every resampled bar with Binance's official one.
 """
 
 from __future__ import annotations
@@ -25,12 +32,20 @@ from quantplatform.core.timeutils import bar_close_time, floor_to_timeframe
 __all__ = ["resample_bars"]
 
 
-def resample_bars(bars: Sequence[MarketBar], timeframe: Timeframe) -> tuple[MarketBar, ...]:
+def resample_bars(
+    bars: Sequence[MarketBar],
+    timeframe: Timeframe,
+    *,
+    allowed_missing: frozenset[datetime] = frozenset(),
+) -> tuple[MarketBar, ...]:
     """Aggregate ``bars`` into complete bars of a slower ``timeframe``.
 
     Args:
         bars: Closed bars of one symbol and one timeframe, in ascending order.
         timeframe: A slower timeframe the source timeframe divides exactly.
+        allowed_missing: Source open times documented as exchange outages. A bucket missing
+            only these is built from the bars it has; empty by default, so nothing is ever
+            assumed to be an outage.
 
     Returns:
         One bar per complete bucket, in order.
@@ -60,6 +75,10 @@ def resample_bars(bars: Sequence[MarketBar], timeframe: Timeframe) -> tuple[Mark
         if times == expected:
             out.append(_aggregate(start, members, timeframe))
             continue
+        missing_here = set(expected) - set(times)
+        if missing_here <= allowed_missing and times == [t for t in expected if t in set(times)]:
+            out.append(_aggregate(start, members, timeframe))
+            continue
         leading = index == 0 and times == expected[-len(times) :]
         trailing = index == len(groups) - 1 and times == expected[: len(times)]
         if leading or trailing:
@@ -72,10 +91,16 @@ def resample_bars(bars: Sequence[MarketBar], timeframe: Timeframe) -> tuple[Mark
         raise ValueError(msg)
 
     for earlier, later in pairwise(out):
-        if later.open_time != earlier.open_time + timeframe.duration:
-            after = earlier.open_time.isoformat()
-            msg = f"whole {timeframe.value} buckets are missing after {after}"
-            raise ValueError(msg)
+        # A bucket with no bar at all is acceptable only when every one of its source hours
+        # is a documented outage: then the exchange has no bar there either.
+        cursor = earlier.open_time + timeframe.duration
+        while cursor < later.open_time:
+            hours = [cursor + source.duration * i for i in range(per_bucket)]
+            if not all(hour in allowed_missing for hour in hours):
+                after = earlier.open_time.isoformat()
+                msg = f"whole {timeframe.value} buckets are missing after {after}"
+                raise ValueError(msg)
+            cursor += timeframe.duration
     return tuple(out)
 
 

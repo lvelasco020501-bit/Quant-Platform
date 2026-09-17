@@ -212,3 +212,19 @@ Por la regla fijada de antemano (§5):
 * **NO-GO a paper.** Ni PAPER CANDIDATE ni despliegue. Faltan: arreglar el latch permanente
   (§7.3), y muestra por mercado, que solo llega con más activos o más frecuencia — no con más
   ajuste de parámetros.
+
+## 8. Tests, gate y reproducibilidad
+
+* **Tests nuevos: 33.** 18 fijan el protocolo (los seis activos, sus ventanas, y que estrategia,
+  riesgo y costes son **idénticos** en los seis); 15 cubren el lector de Binance Vision (unidades
+  de timestamp, duplicados, conflictos, huecos agrupados, OHLCV, CSV determinista). Suite completa:
+  **2 358 pasan**.
+* **Gate completo, verde:** `ruff format --check`, `ruff check`, `mypy src` limpio, `mypy .` en su
+  línea base de **108 errores / 10 archivos** (sin errores nuevos), `pytest`, `docker compose
+  config`, `git diff --check`.
+* **Ledgers:** 42 verificados, **0 fallos de reproducibilidad**.
+* **Re-ejecución desde árbol limpio** (commit `4cf48d3`, SOL: política C y walk-forward):
+  **13 de 13 resultados idénticos** campo a campo salvo revisión, marcas de tiempo e
+  identificadores del intento. 0 sin pareja. Las parejas se forman por `experiment_id`.
+* **Nada se desplegó.** No se tocó la sesión PAPER en curso, ni Risk V2 productivo, ni execution,
+  ni portfolio, ni las estrategias productivas.

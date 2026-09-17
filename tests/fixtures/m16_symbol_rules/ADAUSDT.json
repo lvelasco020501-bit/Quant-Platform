@@ -1,0 +1,14 @@
+{
+  "base_asset": "ADA",
+  "market_type": "spot",
+  "max_notional": "9000000.00000000",
+  "max_quantity": "900000.00000000",
+  "min_notional": "5.00000000",
+  "min_quantity": "0.10000000",
+  "price_tick": "0.00010000",
+  "quantity_step": "0.10000000",
+  "quote_asset": "USDT",
+  "source": "binance_spot:ADAUSDT",
+  "symbol": "ADA/USDT",
+  "updated_at": "2026-09-16T22:51:28.105915+00:00"
+}

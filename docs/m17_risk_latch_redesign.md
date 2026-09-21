@@ -144,7 +144,9 @@ segura; es la más ciega.
   18 del protocolo (umbral y cooldown idénticos entre políticas, identidad propia por política, la
   rejilla de comisiones, y las cuatro puertas de decisión).
 * **Gate completo verde** y `mypy .` en su línea base.
-* **60 jobs, 0 fallos.** Ledgers verificados.
+* **60 jobs, 0 fallos.** 60 ledgers verificados, **0 fallos de reproducibilidad**.
+* **Re-ejecución desde árbol limpio** (commit `f94441d`, SOL bajo G): **3 de 3 resultados
+  idénticos** campo a campo salvo revisión, marcas de tiempo e identificadores del intento.
 
 ## 10. GO / NO-GO para cambiar Risk V2 productivo
 

@@ -93,7 +93,9 @@ Lo que este milestone sí deja cerrado:
 * **42 tests** entre el motor de recuperación (22) y el protocolo de M18 (20), incluidos los dos
   que pinchan errores propios: que la regla permanente reproduce el wrapper de M14 bit por bit, y
   que un drawdown por encima del umbral **tiene** que registrar un halt.
-* **72 runs, 18 jobs, 0 fallos.**
+* **72 runs, 18 jobs, 0 fallos.** 18 ledgers verificados.
+* **Re-ejecución desde árbol limpio** (commit `af34328`, SOL bajo G): **4 de 4 resultados
+  idénticos** campo a campo salvo revisión, marcas de tiempo e identificadores del intento.
 * Un error propio corregido a mitad: la primera tabla decía que C "nunca paró" mientras la misma
   corrida mostraba 80% del tiempo bloqueado — el wrapper sólo registraba los halts que él mismo
   imponía, y el de C lo impone el engine. Se corrigió, se re-corrió C entero y hay un test que lo

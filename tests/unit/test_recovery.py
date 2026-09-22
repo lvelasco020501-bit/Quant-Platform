@@ -41,6 +41,7 @@ from quantplatform.research.recovery import (
     RecoveryLatchRiskEngine,
     RecoveryPolicy,
     next_period_start,
+    resets_within_year,
     risk_configuration_for_recovery,
 )
 from quantplatform.research.sprint import CANDIDATES, definition_for, narrowed
@@ -370,3 +371,85 @@ def test_the_permanent_latch_records_the_halt_it_never_releases() -> None:
     assert episode["ended"] is None
     assert episode["reference_after"] is None
     assert episode["equity_at_halt"] > 0
+
+
+# --- The global loss budget (M19) -----------------------------------------------------------
+
+BUDGETED = RecoveryPolicy(
+    key="H",
+    label="local reset under a global cap",
+    drawdown_pct=DRAWDOWN,
+    recovery=Recovery.COOLDOWN_AND_RESTART,
+    cooldown=timedelta(days=2),
+    global_drawdown_cap=Decimal("0.20"),
+)
+RATIONED = RecoveryPolicy(
+    key="I",
+    label="local reset, two resets a year",
+    drawdown_pct=DRAWDOWN,
+    recovery=Recovery.COOLDOWN_AND_RESTART,
+    cooldown=timedelta(days=2),
+    max_resets_per_year=2,
+)
+
+
+def test_a_global_cap_stops_a_market_for_good_once_the_budget_is_spent() -> None:
+    # The whole point of M19: a local reset may let the market trade again, but the loss
+    # measured from the *original* high-water mark is a budget that no reset can clear.
+    result, engine = _run(BUDGETED)
+    assert result.performance is not None
+    assert result.performance.max_drawdown <= Decimal("0.25"), "the cap must bound the damage"
+    assert engine.episodes
+    assert engine.episodes[-1]["ended"] is None, "the last halt is the permanent one"
+    assert engine.budget_exhausted
+
+
+def test_a_global_cap_changes_nothing_while_the_budget_is_untouched() -> None:
+    # A cap far beyond anything the series reaches must leave G's behaviour identical.
+    loose = BUDGETED.model_copy(update={"global_drawdown_cap": Decimal("0.90")})
+    with_cap, capped_engine = _run(loose)
+    without, plain_engine = _run(RESTART)
+    assert with_cap.performance == without.performance
+    assert len(capped_engine.episodes) == len(plain_engine.episodes)
+    assert not capped_engine.budget_exhausted
+
+
+def test_a_reset_allowance_runs_out_and_the_next_halt_is_permanent() -> None:
+    _, engine = _run(RATIONED)
+    restarts = [e for e in engine.episodes if e["ended"] is not None]
+    assert len(restarts) <= 2, "no more than the allowance, whatever the series does"
+    assert engine.episodes[-1]["ended"] is None
+    assert engine.budget_exhausted
+
+
+def test_the_allowance_is_a_rolling_year_not_a_lifetime() -> None:
+    year = timedelta(days=365)
+    moment = ANCHOR + year + timedelta(days=10)
+    older = [ANCHOR, ANCHOR + timedelta(days=5)]
+    assert resets_within_year(older, moment) == 0
+    recent = [moment - timedelta(days=100), moment - timedelta(days=200)]
+    assert resets_within_year(recent, moment) == 2
+
+
+def test_a_budget_needs_a_reset_to_govern() -> None:
+    with pytest.raises(ValueError, match="reset"):
+        RecoveryPolicy(
+            key="X",
+            label="bad",
+            drawdown_pct=DRAWDOWN,
+            recovery=Recovery.COOLDOWN,
+            cooldown=timedelta(days=2),
+            global_drawdown_cap=Decimal("0.20"),
+        )
+
+
+def test_a_global_cap_must_be_wider_than_the_local_limit() -> None:
+    with pytest.raises(ValueError, match="wider"):
+        RecoveryPolicy(
+            key="X",
+            label="bad",
+            drawdown_pct=Decimal("0.20"),
+            recovery=Recovery.COOLDOWN_AND_RESTART,
+            cooldown=timedelta(days=2),
+            global_drawdown_cap=Decimal("0.10"),
+        )

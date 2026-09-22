@@ -26,6 +26,7 @@ and a forced exit is never blocked — closing a position is how risk goes down.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -48,6 +49,7 @@ __all__ = [
     "RecoveryLatchRiskEngine",
     "RecoveryPolicy",
     "next_period_start",
+    "resets_within_year",
     "risk_configuration_for_recovery",
 ]
 
@@ -55,6 +57,7 @@ _LATCHED: Final[str] = "circuit breaker is latched"
 _DRAWDOWN: Final[CircuitBreakerReason] = CircuitBreakerReason.EXCESSIVE_DRAWDOWN
 _STREAK: Final[CircuitBreakerReason] = CircuitBreakerReason.CONSECUTIVE_LOSSES
 QUARTER_MONTHS: Final[int] = 3
+ROLLING_YEAR: Final[timedelta] = timedelta(days=365)
 
 
 class Recovery(StrEnum):
@@ -75,6 +78,12 @@ def next_period_start(moment: datetime) -> datetime:
     return datetime(year, month, 1, tzinfo=moment.tzinfo)
 
 
+def resets_within_year(resets: Sequence[datetime], moment: datetime) -> int:
+    """Return how many of ``resets`` fall in the twelve months before ``moment``."""
+    horizon = moment - ROLLING_YEAR
+    return sum(1 for reset in resets if reset > horizon)
+
+
 class RecoveryPolicy(DomainModel):
     """A drawdown breaker plus the rule that decides when the market reopens."""
 
@@ -90,6 +99,17 @@ class RecoveryPolicy(DomainModel):
     streak_limit: int | None = Field(default=None, ge=1)
     """Consecutive losing trades that halt new exposure, for reproducing production."""
 
+    global_drawdown_cap: Decimal | None = Field(default=None, gt=0, lt=1)
+    """Loss from the **original** high-water mark that no local reset may ever clear.
+
+    A local reset exists so a market can trade again; this exists so that trading again can
+    never turn into an unbounded loss. M18 showed why both are needed: a reference that
+    restarts freely walked a 10% limit down to a 19.16% drawdown over three halts.
+    """
+
+    max_resets_per_year: int | None = Field(default=None, ge=1)
+    """How many local resets a rolling year may contain before the halt becomes permanent."""
+
     @model_validator(mode="after")
     def _validate(self) -> Self:
         waits = self.recovery in {Recovery.COOLDOWN, Recovery.COOLDOWN_AND_RESTART}
@@ -104,6 +124,17 @@ class RecoveryPolicy(DomainModel):
             raise ValueError(msg)
         if self.recovery is not Recovery.PERMANENT and self.drawdown_pct is None:
             msg = "a recovery rule needs a drawdown breaker to recover from"
+            raise ValueError(msg)
+        budgeted = self.global_drawdown_cap is not None or self.max_resets_per_year is not None
+        if budgeted and self.recovery is not Recovery.COOLDOWN_AND_RESTART:
+            msg = "a loss budget governs a local reset, so it needs a rule that resets"
+            raise ValueError(msg)
+        if (
+            self.global_drawdown_cap is not None
+            and self.drawdown_pct is not None
+            and self.global_drawdown_cap <= self.drawdown_pct
+        ):
+            msg = "the global cap must be wider than the local limit, or it replaces it"
             raise ValueError(msg)
         return self
 
@@ -164,6 +195,17 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         self._restarted_at_peak: Decimal | None = None
         """The engine's peak when the reference was last restarted; ``None`` until then."""
 
+        self._original_peak: Decimal | None = None
+        """The highest equity the account ever reached. Never reset, by design."""
+
+        self._resets: list[datetime] = []
+        self._exhausted = False
+
+    @property
+    def budget_exhausted(self) -> bool:
+        """Return whether a global budget has been spent, making the halt permanent."""
+        return self._exhausted
+
     @property
     def episodes(self) -> list[dict[str, Any]]:
         """Return each halt with the equity and reference it began and ended on.
@@ -203,7 +245,11 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
                 ),
             )
         update: dict[str, object] = {"breakers": breakers}
-        if self._policy.governs_drawdown and self._peak is not None:
+        if self._exhausted and self._original_peak is not None:
+            # Nothing may reopen now, so the limit check is shown the original peak: the
+            # local reference must not be able to soften a budget that is already spent.
+            update["peak_equity"] = self._original_peak
+        elif self._policy.governs_drawdown and self._peak is not None:
             # The limit check measures against ``context.peak_equity``; a policy that
             # restarts the reference has to be measured against its own, or "reopened"
             # would mean nothing.
@@ -224,7 +270,13 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
             self._record_engine_latch(context)
             return
         now, equity = context.as_of, context.snapshot.equity
+        self._original_peak = (
+            context.peak_equity
+            if self._original_peak is None
+            else max(self._original_peak, context.peak_equity)
+        )
         self._track_reference(context.peak_equity, equity)
+        self._spend_budget(now, equity)
         if self._policy.recovery is Recovery.PERIOD:
             self._roll_period(now, equity)
         self._reopen_if_due(now, equity)
@@ -293,12 +345,50 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         self._end_halt(now, equity)
         self._restart_reference(equity)
 
+    def _spend_budget(self, now: datetime, equity: Decimal) -> None:
+        """Halt for good when the loss from the original peak reaches the global cap.
+
+        This is checked before anything else a reopening rule might do, and it is measured
+        from the peak the account actually reached rather than from whatever the local
+        reference has become — that is the whole difference between a budget and a reset.
+        """
+        cap = self._policy.global_drawdown_cap
+        if cap is None or self._exhausted or not self._original_peak:
+            return
+        if (self._original_peak - equity) / self._original_peak < cap:
+            return
+        self._exhausted = True
+        if self._latched_since is None:
+            self._latched_since = now
+            self._latched_until = None
+            self._stats.pauses.append((now, None))
+            self._episodes.append(
+                {
+                    "began": now,
+                    "ended": None,
+                    "equity_at_halt": equity,
+                    "equity_at_release": None,
+                    "reference_before": self._original_peak,
+                    "reference_after": None,
+                    "reason": "global loss budget spent",
+                }
+            )
+        else:
+            self._latched_until = None
+
     def _reopen_if_due(self, now: datetime, equity: Decimal) -> None:
         """End a halt whose wait has run out, moving the reference if the rule says so."""
         if self._latched_since is None or self._latched_until is None or now < self._latched_until:
             return
+        allowance = self._policy.max_resets_per_year
+        if allowance is not None and resets_within_year(self._resets, now) >= allowance:
+            # The allowance is spent: this halt stops being a pause and becomes the latch.
+            self._exhausted = True
+            self._latched_until = None
+            return
         self._end_halt(self._latched_until, equity)
         if self._policy.restarts_high_water_mark:
+            self._resets.append(now)
             self._restart_reference(equity)
 
     def _restart_reference(self, equity: Decimal) -> None:

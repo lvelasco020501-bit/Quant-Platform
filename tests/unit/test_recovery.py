@@ -325,3 +325,48 @@ def test_the_configuration_arms_the_breaker_the_policy_needs() -> None:
     assert risk.max_total_drawdown_pct == DRAWDOWN
     assert risk.max_consecutive_losses is None
     assert risk.execution_policy == deployed.execution_policy, "costs are never touched"
+
+
+# --- What each halt did to the reference ----------------------------------------------------
+
+
+def test_each_halt_records_the_equity_and_reference_it_started_and_ended_on() -> None:
+    # M18 needs this to tell a ratchet from a single fall: a chain of halts whose restart
+    # reference steps down each time is the failure mode a moving high-water mark can have,
+    # and it cannot be seen from halt counts alone.
+    _, engine = _run(RESTART)
+    episodes = engine.episodes
+    assert episodes, "the series must actually reach the drawdown latch"
+    first = episodes[0]
+    assert first["began"] == _latched_at(engine)[0][0]
+    assert first["equity_at_halt"] > 0
+    assert first["reference_before"] >= first["equity_at_halt"]
+
+
+def test_a_restart_lowers_the_reference_to_the_reopening_equity() -> None:
+    _, engine = _run(RESTART)
+    restarted = [e for e in engine.episodes if e["ended"] is not None]
+    assert restarted
+    for episode in restarted:
+        assert episode["reference_after"] == episode["equity_at_release"]
+        assert episode["reference_after"] < episode["reference_before"]
+
+
+def test_carrying_the_reference_leaves_it_where_it_was() -> None:
+    _, engine = _run(COOLDOWN)
+    ended = [e for e in engine.episodes if e["ended"] is not None]
+    assert ended
+    for episode in ended:
+        assert episode["reference_after"] == episode["reference_before"]
+
+
+def test_the_permanent_latch_records_the_halt_it_never_releases() -> None:
+    # It is the engine that latches here, not the wrapper. Recording it anyway is what keeps
+    # a report from claiming the permanent rule "never halted" while the same run shows most
+    # of its history blocked.
+    _, engine = _run(PERMANENT)
+    assert len(engine.episodes) == 1
+    episode = engine.episodes[0]
+    assert episode["ended"] is None
+    assert episode["reference_after"] is None
+    assert episode["equity_at_halt"] > 0

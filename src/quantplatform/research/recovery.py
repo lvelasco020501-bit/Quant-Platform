@@ -29,7 +29,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Any, Final, Self
 
 from pydantic import Field, model_validator
 
@@ -159,9 +159,21 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         self._latched_since: datetime | None = None
         self._latched_until: datetime | None = None
         self._period_start: datetime | None = None
+        self._episodes: list[dict[str, Any]] = []
         self._last_release: datetime | None = None
         self._restarted_at_peak: Decimal | None = None
         """The engine's peak when the reference was last restarted; ``None`` until then."""
+
+    @property
+    def episodes(self) -> list[dict[str, Any]]:
+        """Return each halt with the equity and reference it began and ended on.
+
+        A halt count says how often a policy stopped; this says what it did to the level the
+        next drawdown is measured from. A chain of halts whose ``reference_after`` steps down
+        each time is a ratchet — the failure a moving high-water mark can have, and the one
+        thing a count of halts cannot show.
+        """
+        return list(self._episodes)
 
     @property
     def stats(self) -> LatchStats:
@@ -242,12 +254,28 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         self._peak = equity if self._peak is None else max(self._peak, equity)
 
     def _record_engine_latch(self, context: RiskContext) -> None:
-        """Note the engine's own permanent latch, changing nothing about it."""
+        """Note the engine's own permanent latch, changing nothing about it.
+
+        The permanent rule is enforced by the engine, not by this wrapper, so nothing here
+        decides anything. It is still recorded as an episode: a report that counted only the
+        halts the wrapper imposed would say the permanent latch never halted anything, while
+        the same run shows four fifths of its history blocked.
+        """
         if self._stats.pauses:
             return
         for breaker in context.breakers:
             if breaker.reason is _DRAWDOWN and breaker.tripped_at is not None:
                 self._stats.pauses.append((breaker.tripped_at, None))
+                self._episodes.append(
+                    {
+                        "began": breaker.tripped_at,
+                        "ended": None,
+                        "equity_at_halt": context.snapshot.equity,
+                        "equity_at_release": None,
+                        "reference_before": context.peak_equity,
+                        "reference_after": None,
+                    }
+                )
                 return
 
     def _roll_period(self, now: datetime, equity: Decimal) -> None:
@@ -261,15 +289,15 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
             return
         if now < self._period_start:
             return
-        self._restart_reference(equity)
         self._period_start = next_period_start(now)
-        self._end_halt(now)
+        self._end_halt(now, equity)
+        self._restart_reference(equity)
 
     def _reopen_if_due(self, now: datetime, equity: Decimal) -> None:
         """End a halt whose wait has run out, moving the reference if the rule says so."""
         if self._latched_since is None or self._latched_until is None or now < self._latched_until:
             return
-        self._end_halt(self._latched_until)
+        self._end_halt(self._latched_until, equity)
         if self._policy.restarts_high_water_mark:
             self._restart_reference(equity)
 
@@ -277,10 +305,18 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         """Measure the next drawdown from here, not from a peak the account cannot reach."""
         self._restarted_at_peak = self._peak
         self._peak = equity
+        if self._episodes:
+            self._episodes[-1]["reference_after"] = equity
 
-    def _end_halt(self, at: datetime) -> None:
+    def _end_halt(self, at: datetime, equity: Decimal | None = None) -> None:
         if self._latched_since is None:
             return
+        if self._episodes:
+            self._episodes[-1]["ended"] = at
+            self._episodes[-1]["equity_at_release"] = equity
+            self._episodes[-1].setdefault("reference_after", self._peak)
+            if not self._policy.restarts_high_water_mark:
+                self._episodes[-1]["reference_after"] = self._episodes[-1]["reference_before"]
         self._stats.pauses[-1] = (self._latched_since, at)
         self._latched_since = None
         self._latched_until = None
@@ -320,3 +356,13 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
             else now + (self._policy.cooldown or timedelta(0))
         )
         self._stats.pauses.append((self._latched_since, self._latched_until))
+        self._episodes.append(
+            {
+                "began": self._latched_since,
+                "ended": None,
+                "equity_at_halt": equity,
+                "equity_at_release": None,
+                "reference_before": self._peak,
+                "reference_after": None,
+            }
+        )

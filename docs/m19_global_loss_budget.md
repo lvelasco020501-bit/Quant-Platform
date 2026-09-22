@@ -121,3 +121,17 @@ re-planificó a los 4 mercados que sí pueden activar el breaker.
    móviles**, o 2 reinicios totales antes de revisión manual — no por año.
 3. **Arreglar la detección tras el reinicio dentro del engine**, para que el segundo halt y los
    siguientes se evalúen por barra como el primero. Sin eso, cualquier techo se cruza tarde.
+
+## 8. Tests, gate y reproducibilidad
+
+* **46 tests** entre el motor de recuperación (28) y el protocolo de M19 (18). Los que más
+  importan: que un techo muy por encima de la serie deja el comportamiento de G **idéntico**, que
+  el allowance es de año móvil y no de por vida, que un presupuesto exige una regla que reinicie,
+  que el techo tiene que ser más ancho que el límite local, y el añadido después de los
+  resultados: **un presupuesto que nunca mordió no es evidencia de que funcione**.
+* **Suite completa: 2 446 tests en verde.** `ruff format`, `ruff check`, `mypy src` limpios y
+  `mypy .` en su línea base de 108 errores / 10 archivos.
+* **48 corridas, 12 jobs, 0 fallos.** 16 ledgers verificados, **0 fallos de reproducibilidad**.
+* **Re-ejecución desde árbol limpio** (commit `a40d58c`, ADA bajo H): **4 de 4 resultados
+  idénticos** campo a campo salvo revisión, marcas de tiempo e identificadores del intento.
+* Producción intacta: `git status` sobre `risk`, `execution`, `portfolio` y `paper` está vacío.

@@ -453,3 +453,46 @@ def test_a_global_cap_must_be_wider_than_the_local_limit() -> None:
             cooldown=timedelta(days=2),
             global_drawdown_cap=Decimal("0.10"),
         )
+
+
+# --- Per-bar detection (M20) ----------------------------------------------------------------
+
+
+def test_the_per_bar_trigger_fires_on_the_same_bar_as_the_engines_own_breaker() -> None:
+    # The permanent rule is halted by the engine itself, evaluated on every bar. A governed
+    # rule that watches every bar must reach the same conclusion at the same instant; if it
+    # only looked when the strategy asked to trade, it would find a shallower fall and stop
+    # later. This is the whole fix M20 exists for.
+    _, engine_side = _run(PERMANENT)
+    _, wrapper_side = _run(COOLDOWN)
+    assert engine_side.episodes, "the series must actually reach the drawdown latch"
+    assert wrapper_side.episodes
+    assert wrapper_side.episodes[0]["began"] == engine_side.episodes[0]["began"]
+
+
+def test_no_halt_lets_the_loss_run_far_past_the_limit() -> None:
+    # M19 measured 17.17% against a 10% limit, because after a restart the wrapper could only
+    # look at decision points. Watching every bar, the overshoot may only be one bar's move.
+    for policy in (COOLDOWN, RESTART):
+        _, engine = _run(policy)
+        for episode in engine.episodes:
+            reference = Decimal(str(episode["reference_before"]))
+            fell = (reference - Decimal(str(episode["equity_at_halt"]))) / reference
+            assert fell < DRAWDOWN + Decimal("0.02"), f"{policy.key} let {fell:.2%} run"
+
+
+def test_detection_works_the_same_before_and_after_a_reset() -> None:
+    # Every halt, first or fifth, is found by the same per-bar arithmetic, so the depth at
+    # which they trigger must not drift as the references restart.
+    _, engine = _run(RESTART)
+    depths = []
+    for episode in engine.episodes:
+        reference = Decimal(str(episode["reference_before"]))
+        depths.append((reference - Decimal(str(episode["equity_at_halt"]))) / reference)
+    assert len(depths) >= 2, "the series must restart at least once"
+    assert max(depths) - min(depths) < Decimal("0.02")
+
+
+def test_the_engine_offers_every_bar_not_only_the_ones_with_decisions() -> None:
+    _, engine = _run(RESTART)
+    assert engine.bars_seen > engine.stats.assessed, "bars must outnumber decisions"

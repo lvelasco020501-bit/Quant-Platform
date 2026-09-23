@@ -343,6 +343,7 @@ class BacktestEngine:
         self._record_closed_trades(state)
         self._update_equity_anchors(snapshot, state)
         self._update_breakers(snapshot, state)
+        self._offer_bar(snapshot, state)
 
         # Protection is decided before opinion is asked for, and authorised before it. An exit
         # forced by risk must not lose its place in a queue to the very strategy whose position
@@ -831,6 +832,24 @@ class BacktestEngine:
         if state.peak_equity > ZERO:
             drawdown = (state.peak_equity - equity) / state.peak_equity
         state.curve.append(EquityPoint(at=snapshot.taken_at, equity=equity, drawdown=drawdown))
+
+    def _offer_bar(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
+        """Offer this bar's marked account to a risk engine that asks to see every one.
+
+        The engine already values the account on every bar; a risk engine only ever sees it
+        when an intent is assessed, which is whenever the strategy happens to want something.
+        For the breakers that live here that gap does not matter, because this class
+        evaluates them itself. It matters for a *research* risk engine measuring a drawdown
+        against a reference of its own: sampling the account only at decision points measures
+        a shallower fall than the one that happened, and a breaker fed that way trips late.
+
+        Opt-in and inert by default: an engine that does not define ``observe_bar`` is never
+        called, nothing here reads a result, and no decision of this class depends on it.
+        """
+        observe = getattr(self._risk, "observe_bar", None)
+        if observe is None:
+            return
+        observe(snapshot=snapshot, peak_equity=state.peak_equity)
 
     def _update_breakers(self, snapshot: PortfolioSnapshot, state: RunState) -> None:
         """Latch whatever this bar's arithmetic says has broken, and latch it once.

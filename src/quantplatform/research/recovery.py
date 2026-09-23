@@ -36,6 +36,7 @@ from pydantic import Field, model_validator
 
 from quantplatform.core.enums import CircuitBreakerReason, RiskOutcome
 from quantplatform.core.models.base import DomainModel, Text
+from quantplatform.core.models.portfolio import PortfolioSnapshot
 from quantplatform.core.models.risk import CircuitBreakerState, RiskContext
 from quantplatform.research.latch_policy import LatchStats
 from quantplatform.risk.config import RiskConfiguration
@@ -49,6 +50,7 @@ __all__ = [
     "RecoveryLatchRiskEngine",
     "RecoveryPolicy",
     "next_period_start",
+    "resets_within",
     "resets_within_year",
     "risk_configuration_for_recovery",
 ]
@@ -78,10 +80,17 @@ def next_period_start(moment: datetime) -> datetime:
     return datetime(year, month, 1, tzinfo=moment.tzinfo)
 
 
+def resets_within(
+    resets: Sequence[datetime], moment: datetime, window: timedelta = ROLLING_YEAR
+) -> int:
+    """Return how many of ``resets`` fall inside ``window`` before ``moment``."""
+    horizon = moment - window
+    return sum(1 for reset in resets if reset > horizon)
+
+
 def resets_within_year(resets: Sequence[datetime], moment: datetime) -> int:
     """Return how many of ``resets`` fall in the twelve months before ``moment``."""
-    horizon = moment - ROLLING_YEAR
-    return sum(1 for reset in resets if reset > horizon)
+    return resets_within(resets, moment, ROLLING_YEAR)
 
 
 class RecoveryPolicy(DomainModel):
@@ -108,7 +117,12 @@ class RecoveryPolicy(DomainModel):
     """
 
     max_resets_per_year: int | None = Field(default=None, ge=1)
-    """How many local resets a rolling year may contain before the halt becomes permanent."""
+    """How many local resets the window may contain before the halt becomes permanent."""
+
+    reset_window: timedelta = ROLLING_YEAR
+    """How far back the allowance counts. M19 set this to a year and learned why it matters:
+    the reset chains it was meant to stop ran over three and four years, so an allowance
+    counted per year could never bind."""
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
@@ -126,6 +140,9 @@ class RecoveryPolicy(DomainModel):
             msg = "a recovery rule needs a drawdown breaker to recover from"
             raise ValueError(msg)
         budgeted = self.global_drawdown_cap is not None or self.max_resets_per_year is not None
+        if self.reset_window != ROLLING_YEAR and self.max_resets_per_year is None:
+            msg = "a reset window counts an allowance, so it needs one to count"
+            raise ValueError(msg)
         if budgeted and self.recovery is not Recovery.COOLDOWN_AND_RESTART:
             msg = "a loss budget governs a local reset, so it needs a rule that resets"
             raise ValueError(msg)
@@ -191,6 +208,10 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         self._latched_until: datetime | None = None
         self._period_start: datetime | None = None
         self._episodes: list[dict[str, Any]] = []
+        self._per_bar = False
+        """Set once the backtest engine offers bars, which makes detection exact."""
+
+        self._bars_seen = 0
         self._last_release: datetime | None = None
         self._restarted_at_peak: Decimal | None = None
         """The engine's peak when the reference was last restarted; ``None`` until then."""
@@ -200,6 +221,48 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
 
         self._resets: list[datetime] = []
         self._exhausted = False
+
+    @property
+    def bars_seen(self) -> int:
+        """Return how many bars the engine offered. Zero when it offered none."""
+        return self._bars_seen
+
+    def observe_bar(self, *, snapshot: PortfolioSnapshot, peak_equity: Decimal) -> None:
+        """Evaluate the drawdown on this bar, whether or not anything was decided on it.
+
+        The engine values the account on every bar and evaluates its own breaker there. Until
+        M20 this wrapper could only look when an intent was assessed, so after a reference
+        restart it measured a shallower fall than the one that happened and halted late: M19
+        recorded 17.17% against a 10% limit. Reading the same snapshot the engine's breaker
+        reads, on the same bar, removes that gap — the first halt and the fifth are now found
+        by identical arithmetic.
+        """
+        self._per_bar = True
+        self._bars_seen += 1
+        if not self._policy.governs_drawdown:
+            return
+        now, equity = snapshot.taken_at, snapshot.equity
+        self._original_peak = (
+            peak_equity if self._original_peak is None else max(self._original_peak, peak_equity)
+        )
+        if self._restarted_at_peak is None:
+            self._peak = peak_equity
+        else:
+            self._peak = equity if self._peak is None else max(self._peak, equity)
+        self._spend_budget(now, equity)
+        if self._policy.recovery is Recovery.PERIOD:
+            self._roll_period(now, equity)
+        self._reopen_if_due(now, equity)
+        self._halt_if_breached_exactly(now, equity)
+
+    def _halt_if_breached_exactly(self, now: datetime, equity: Decimal) -> None:
+        """Halt when this bar's drawdown from the current reference reaches the limit."""
+        threshold = self._policy.drawdown_pct
+        if self._latched_since is not None or threshold is None or not self._peak:
+            return
+        if (self._peak - equity) / self._peak < threshold:
+            return
+        self._begin_halt(now, equity)
 
     @property
     def budget_exhausted(self) -> bool:
@@ -268,6 +331,9 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         """Track the reference peak, reopen a halt that is due, and start a new one."""
         if not self._policy.governs_drawdown:
             self._record_engine_latch(context)
+            return
+        if self._per_bar:
+            # Detection happens on every bar now; assess only gates what it already decided.
             return
         now, equity = context.as_of, context.snapshot.equity
         self._original_peak = (
@@ -381,7 +447,10 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         if self._latched_since is None or self._latched_until is None or now < self._latched_until:
             return
         allowance = self._policy.max_resets_per_year
-        if allowance is not None and resets_within_year(self._resets, now) >= allowance:
+        if (
+            allowance is not None
+            and resets_within(self._resets, now, self._policy.reset_window) >= allowance
+        ):
             # The allowance is spent: this halt stops being a pause and becomes the latch.
             self._exhausted = True
             self._latched_until = None
@@ -439,6 +508,10 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
             now = engine_trip if engine_trip is not None else now
         elif not self._peak or (self._peak - equity) / self._peak < threshold:
             return
+        self._begin_halt(now, equity)
+
+    def _begin_halt(self, now: datetime, equity: Decimal) -> None:
+        """Record a halt starting now, and when it is due to end."""
         self._latched_since = now
         self._latched_until = (
             next_period_start(now)

@@ -26,7 +26,8 @@ and a forced exit is never blocked — closing a position is how risk goes down.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -34,10 +35,16 @@ from typing import TYPE_CHECKING, Any, Final, Self
 
 from pydantic import Field, model_validator
 
-from quantplatform.core.enums import CircuitBreakerReason, RiskOutcome
+from quantplatform.core.enums import CircuitBreakerReason, RiskActionKind, RiskOutcome
 from quantplatform.core.models.base import DomainModel, Text
-from quantplatform.core.models.portfolio import PortfolioSnapshot
-from quantplatform.core.models.risk import CircuitBreakerState, RiskContext
+from quantplatform.core.models.market import MarketBar
+from quantplatform.core.models.portfolio import PortfolioSnapshot, Position
+from quantplatform.core.models.risk import (
+    CircuitBreakerState,
+    PositionRiskState,
+    RiskAction,
+    RiskContext,
+)
 from quantplatform.research.latch_policy import LatchStats
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.engine import RiskEvaluationResult, StandardRiskEngine
@@ -46,6 +53,8 @@ if TYPE_CHECKING:
     from quantplatform.core.models.orders import OrderIntent
 
 __all__ = [
+    "GLOBAL_DRAWDOWN_FORCED_EXIT",
+    "AccountStopAction",
     "Recovery",
     "RecoveryLatchRiskEngine",
     "RecoveryPolicy",
@@ -55,11 +64,25 @@ __all__ = [
     "risk_configuration_for_recovery",
 ]
 
+GLOBAL_DRAWDOWN_FORCED_EXIT: Final[str] = "GLOBAL_DRAWDOWN_FORCED_EXIT"
+"""Reason carried by every close the account stop orders, so the audit trail names it."""
+
 _LATCHED: Final[str] = "circuit breaker is latched"
 _DRAWDOWN: Final[CircuitBreakerReason] = CircuitBreakerReason.EXCESSIVE_DRAWDOWN
 _STREAK: Final[CircuitBreakerReason] = CircuitBreakerReason.CONSECUTIVE_LOSSES
 QUARTER_MONTHS: Final[int] = 3
 ROLLING_YEAR: Final[timedelta] = timedelta(days=365)
+
+
+@dataclass(frozen=True)
+class AccountStopAction:
+    """One close the account stop ordered, kept so the run can be audited afterwards."""
+
+    symbol: str
+    at: datetime
+    kind: RiskActionKind
+    reason: str
+    quantity: Decimal
 
 
 class Recovery(StrEnum):
@@ -119,6 +142,14 @@ class RecoveryPolicy(DomainModel):
     max_resets_per_year: int | None = Field(default=None, ge=1)
     """How many local resets the window may contain before the halt becomes permanent."""
 
+    close_positions_on_cap: bool = False
+    """Whether breaking the global cap also closes what is open.
+
+    M20 measured why this exists: a cap that only gates entries was crossed by half a point
+    on every market that reached it, because the position already open went on losing. A cap
+    that closes bounds the loss at the bar it is found on, and nothing else can.
+    """
+
     reset_window: timedelta = ROLLING_YEAR
     """How far back the allowance counts. M19 set this to a year and learned why it matters:
     the reset chains it was meant to stop ran over three and four years, so an allowance
@@ -140,6 +171,9 @@ class RecoveryPolicy(DomainModel):
             msg = "a recovery rule needs a drawdown breaker to recover from"
             raise ValueError(msg)
         budgeted = self.global_drawdown_cap is not None or self.max_resets_per_year is not None
+        if self.close_positions_on_cap and self.global_drawdown_cap is None:
+            msg = "closing on the cap needs a global cap to close on"
+            raise ValueError(msg)
         if self.reset_window != ROLLING_YEAR and self.max_resets_per_year is None:
             msg = "a reset window counts an allowance, so it needs one to count"
             raise ValueError(msg)
@@ -221,6 +255,86 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
 
         self._resets: list[datetime] = []
         self._exhausted = False
+        self._stopped_at: datetime | None = None
+        self._closed: set[str] = set()
+        self._actions: list[AccountStopAction] = []
+        self._last_bar: MarketBar | None = None
+        self._last_positions: tuple[Position, ...] = ()
+
+    @property
+    def stopped_at(self) -> datetime | None:
+        """Return when the account stop fired, or ``None`` if it never did."""
+        return self._stopped_at
+
+    @property
+    def actions_taken(self) -> list[AccountStopAction]:
+        """Return every close the account stop ordered, for the audit trail."""
+        return list(self._actions)
+
+    @property
+    def last_bar(self) -> MarketBar | None:
+        """Return the most recent bar the engine was asked about."""
+        return self._last_bar
+
+    @property
+    def last_positions(self) -> tuple[Position, ...]:
+        """Return the positions seen on that bar."""
+        return self._last_positions
+
+    def evaluate_open_positions(
+        self,
+        *,
+        positions: Sequence[Position],
+        position_risk: Mapping[str, PositionRiskState],
+        bar: MarketBar,
+        require_protection: bool = False,
+    ) -> tuple[RiskAction, ...]:
+        """Return what must happen to open exposure, adding the account stop's closes.
+
+        The engine asks this on every bar and authorises whatever comes back ahead of any
+        strategy intent, with the administrative vetoes withdrawn — so a close ordered here
+        is an instruction, not a proposal, and the strategy has no say in it. Everything the
+        standard engine decided (a stop breached, protection missing) is preserved and comes
+        first; the account stop only adds symbols nobody is already closing.
+
+        Ordering only what is still open is what makes it idempotent: asked twice on the same
+        bar it returns the same instruction, and once a position is gone it returns nothing
+        for it.
+        """
+        self._last_bar = bar
+        self._last_positions = tuple(positions)
+        ordinary = super().evaluate_open_positions(
+            positions=positions,
+            position_risk=position_risk,
+            bar=bar,
+            require_protection=require_protection,
+        )
+        if self._stopped_at is None or not self._policy.close_positions_on_cap:
+            return ordinary
+        already = {action.symbol for action in ordinary if action.symbol is not None}
+        extra: list[RiskAction] = []
+        for position in positions:
+            if not position.is_open or position.symbol in already:
+                continue
+            extra.append(
+                RiskAction(
+                    kind=RiskActionKind.CLOSE,
+                    symbol=position.symbol,
+                    reason=GLOBAL_DRAWDOWN_FORCED_EXIT,
+                )
+            )
+            if position.symbol not in self._closed:
+                self._closed.add(position.symbol)
+                self._actions.append(
+                    AccountStopAction(
+                        symbol=position.symbol,
+                        at=bar.close_time,
+                        kind=RiskActionKind.CLOSE,
+                        reason=GLOBAL_DRAWDOWN_FORCED_EXIT,
+                        quantity=position.quantity,
+                    )
+                )
+        return (*ordinary, *extra)
 
     @property
     def bars_seen(self) -> int:
@@ -424,6 +538,8 @@ class RecoveryLatchRiskEngine(StandardRiskEngine):
         if (self._original_peak - equity) / self._original_peak < cap:
             return
         self._exhausted = True
+        if self._stopped_at is None and self._policy.close_positions_on_cap:
+            self._stopped_at = now
         if self._latched_since is None:
             self._latched_since = now
             self._latched_until = None

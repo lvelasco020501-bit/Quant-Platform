@@ -127,3 +127,23 @@ drawdown** en las dos únicas corridas donde llegó a actuar.
 2. **Stop intra-barra** si se quiere bajar del 0.49 pp: requiere datos de tick y otro régimen de
    ejecución, y es un milestone en sí mismo.
 3. **Reconciliación al arranque** antes de cualquier despliegue, para los tres puntos del §7.
+
+## 9. Tests, gate y reproducibilidad
+
+* **14 tests del account stop**, además de los 36 del motor de recuperación. Los que llevan el
+  peso: el cierre se ordena **en la barra del breach**; una sola vez por símbolo; pedir dos
+  veces la misma barra devuelve la misma instrucción; nada que cerrar cuando la posición ya no
+  está; la estrategia **no puede abrir nada** después del stop (verificado a nivel de decisión);
+  el cierre forzado **paga fees y slippage**; y sin cap el motor se comporta exactamente igual
+  que antes.
+* **Un artefacto propio, corregido:** la métrica `trades_after_stop` contaba con `>=` y marcaba
+  como violación una posición abierta **en** la barra del stop por una orden aprobada antes de
+  que el stop existiera. Con `>` la invariante se cumple en las 8 corridas donde el stop
+  disparó, y hay un test que fija la semántica de la barra del stop.
+* **Suite completa: 2 475 tests.** `ruff format`, `ruff check` y `mypy src` limpios; `mypy .` en
+  su línea base de 108 errores / 10 archivos.
+* **72 corridas, 18 jobs, 0 fallos.** 18 ledgers verificados, **0 fallos de reproducibilidad**.
+* **Re-ejecución desde árbol limpio** (commit `fa9aabd`, ADA bajo S12): **4 de 4 resultados
+  idénticos** campo a campo salvo revisión, marcas de tiempo e identificadores del intento.
+* **Producción intacta:** `git status` sobre `risk`, `execution`, `portfolio`, `paper`,
+  `strategies` **y `backtesting`** está vacío. M21 no necesitó ni el hook aditivo de M20.

@@ -133,3 +133,22 @@ no otro umbral:
 2. **Probar el allowance donde pueda morder** — con un techo lo bastante ancho como para que el
    tercer reset llegue antes que el techo, o sin techo.
 3. Una vez exista el cierre forzado, volver a correr G + techo con esa mecánica.
+
+## 9. Tests, gate y reproducibilidad
+
+* **45 tests** entre el motor de recuperación (36) y el protocolo de M20 (9). Los cuatro nuevos
+  del fix: **misma barra que el breaker del engine**, sin overshoot más allá de un movimiento de
+  barra, misma profundidad de disparo antes y después del reset, y más barras ofrecidas que
+  decisiones asesoradas. Sigue en verde el que prueba que la regla permanente reproduce el
+  wrapper de M14 **bit por bit**, así que M14–M17 no se movieron.
+* **Suite completa: 2 460 tests.** `ruff format`, `ruff check` y `mypy src` limpios; `mypy .` en
+  su línea base de 108 errores / 10 archivos.
+* **64 corridas, 16 jobs, 0 fallos.** 16 ledgers verificados, **0 fallos de reproducibilidad**.
+* **Re-ejecución desde árbol limpio** (commit `773b789`, ADA bajo H15): **4 de 4 resultados
+  idénticos** campo a campo salvo revisión, marcas de tiempo e identificadores del intento.
+* **Producción intacta:** `git status` sobre `risk`, `execution`, `portfolio`, `paper` y
+  `strategies` está vacío. El único cambio fuera de research es el hook aditivo
+  `_offer_bar` en `backtesting/engine.py`, declarado en §1.
+* **Nota de reproducibilidad entre milestones:** el fix cambia cómo detecta el engine de
+  research, así que **M18 y M19 reproducen sólo en sus propios commits**; sus ledgers registran
+  la revisión con la que se corrieron y `verify` etiqueta la diferencia como `code_changed`.

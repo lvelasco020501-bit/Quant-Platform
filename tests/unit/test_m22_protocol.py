@@ -15,6 +15,7 @@ every window and touching no threshold cannot be quietly tuned, because the test
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -39,6 +40,7 @@ from quantplatform.research.m22 import (
     ranking_key,
     shows_signal,
     study_definition,
+    walk_forward_summary,
 )
 from quantplatform.research.sprint import CANDIDATES, Family
 
@@ -328,3 +330,44 @@ def test_the_time_stop_is_the_same_seven_days_on_every_definition() -> None:
     for key in ("T1", "T2", "B1", "B2", "M1", "M2"):
         definition = study_definition("BTCUSDT", _by(key))
         assert definition.risk.max_holding_bars == TIME_STOP_BARS
+
+
+# --- The walk-forward aggregate ---------------------------------------------------------------
+
+
+def test_only_the_test_halves_of_a_walk_forward_count() -> None:
+    # The bug this pins: matching OUT_OF_SAMPLE instead of WALK_FORWARD_TEST counted zero test
+    # windows in all thirty screen runs and reported 0/0, which reads as a measured failure
+    # rather than as a filter that matched nothing.
+    folds = [
+        {"role": "walk_forward_train", "card": {"total_return": "9.99"}},
+        {"role": "walk_forward_test", "card": {"total_return": "0.10"}},
+        {"role": "walk_forward_test", "card": {"total_return": "-0.20"}},
+    ]
+    summary = walk_forward_summary(folds)
+    assert summary["tested"] == 2, "a train half is context, never a window"
+    assert summary["positive"] == 1
+    assert summary["positive_share"] == Decimal("0.5")
+
+
+def test_an_out_of_sample_role_is_not_a_walk_forward_window() -> None:
+    folds = [{"role": "out_of_sample", "card": {"total_return": "0.10"}}]
+    assert walk_forward_summary(folds)["tested"] == 0
+
+
+def test_a_fold_that_produced_no_result_is_not_counted_as_a_loss() -> None:
+    folds: list[dict[str, Any]] = [
+        {"role": "walk_forward_test", "card": None},
+        {"role": "walk_forward_test", "card": {"total_return": "0.10"}},
+    ]
+    summary = walk_forward_summary(folds)
+    assert summary["tested"] == 1
+    assert summary["positive_share"] == Decimal(1)
+
+
+def test_no_test_window_reports_nothing_rather_than_zero() -> None:
+    # None fails the verdict's check; zero would look like a strategy that lost every window.
+    summary = walk_forward_summary([])
+    assert summary["positive_share"] is None
+    assert summary["median_return"] is None
+    assert summary["tested"] == 0

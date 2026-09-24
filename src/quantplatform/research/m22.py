@@ -65,11 +65,13 @@ accident, and is refused by :func:`forwarded`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
-from typing import Final
+from statistics import median
+from typing import Any, Final
 
 from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.base import DomainModel, Text
@@ -111,6 +113,7 @@ __all__ = [
     "reference_definition",
     "shows_signal",
     "study_definition",
+    "walk_forward_summary",
 ]
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[3]
@@ -333,6 +336,37 @@ def ranking_key(
     three would be choosing by return with an extra step in front of it.
     """
     return (positive_years, walk_forward_share, trades)
+
+
+def walk_forward_summary(folds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return the walk-forward aggregate over the **test** halves of ``folds``.
+
+    A plan's folds carry :attr:`ExperimentRole.WALK_FORWARD_TRAIN` and
+    :attr:`ExperimentRole.WALK_FORWARD_TEST`; never :attr:`ExperimentRole.OUT_OF_SAMPLE`,
+    which belongs to a definition narrowed by hand. The first version of this screen matched
+    the latter and so counted **zero** test windows across all thirty runs while reporting
+    ``0/0`` rather than failing — every fold had in fact succeeded and was recorded. The rule
+    lives here, and is tested, because a walk-forward share that silently reads zero is worse
+    than one that is missing: it looks like an answer.
+
+    Returns:
+        ``tested``, ``positive``, ``positive_share`` and ``median_return``. The last two are
+        ``None`` when no test window produced a result — never zero, which would read as a
+        measured failure rather than an absence.
+    """
+    tested = [
+        Decimal(str(fold["card"]["total_return"]))
+        for fold in folds
+        if fold.get("role") == ExperimentRole.WALK_FORWARD_TEST.value
+        and fold.get("card") is not None
+    ]
+    positive = sum(1 for value in tested if value > 0)
+    return {
+        "tested": len(tested),
+        "positive": positive,
+        "positive_share": (Decimal(positive) / Decimal(len(tested))) if tested else None,
+        "median_return": median(tested) if tested else None,
+    }
 
 
 # --- Definitions ---------------------------------------------------------------------------------

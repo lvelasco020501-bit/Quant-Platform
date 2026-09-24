@@ -45,7 +45,7 @@ from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.market import MarketBar
 from quantplatform.orchestration.features import features_for
 from quantplatform.orchestration.research import ExperimentEngineFactory, code_revision
-from quantplatform.research.definition import ExperimentDefinition, ExperimentRole
+from quantplatform.research.definition import ExperimentDefinition
 from quantplatform.research.folds import WalkForwardPlan, WindowSpec
 from quantplatform.research.ledger import ExperimentLedger
 from quantplatform.research.m16 import DATA_END, Asset, walk_forward_folds_for
@@ -59,6 +59,7 @@ from quantplatform.research.m22 import (
     reference_definition,
     shows_signal,
     study_definition,
+    walk_forward_summary,
 )
 from quantplatform.research.plan_runner import WalkForwardRunner
 from quantplatform.research.result import ExperimentResult
@@ -217,34 +218,36 @@ def _walk_forward(
         ledger=ExperimentLedger(home / "wf_ledger.jsonl"),
         code_revision=revision,
     )
-    folds: list[dict[str, Any]] = []
-    tested: list[Decimal] = []
-    for run in outcome.folds:
-        scorecard = card(run.result)
-        role = run.result.definition.role
-        folds.append(
-            {
-                "index": run.entry.fold_index,
-                "role": role.value,
-                "start": run.result.definition.dataset.start,
-                "status": run.result.status.value,
-                "card": scorecard,
-            }
-        )
-        # Only the test halves are evidence; the train halves run the same configuration and
-        # are kept for context, never counted as out-of-sample windows.
-        if role is ExperimentRole.OUT_OF_SAMPLE and scorecard is not None:
-            tested.append(Decimal(str(scorecard["total_return"])))
-    positive = sum(1 for value in tested if value > 0)
+    folds: list[dict[str, Any]] = [
+        {
+            "index": run.entry.fold_index,
+            "role": run.result.definition.role.value,
+            "start": run.result.definition.dataset.start,
+            "status": run.result.status.value,
+            "card": card(run.result),
+        }
+        for run in outcome.folds
+    ]
     return {
         "aborted": outcome.aborted,
         "abort_reason": outcome.abort_reason,
         "folds": folds,
-        "tested": len(tested),
-        "positive": positive,
-        "positive_share": (Decimal(positive) / Decimal(len(tested))) if tested else None,
-        "median_return": median(tested) if tested else None,
+        **walk_forward_summary(folds),
     }
+
+
+def recompute(root: Path) -> int:
+    """Rewrite every evidence file's walk-forward aggregate from the folds it already holds."""
+    touched = 0
+    for path in sorted(root.glob("*/*/evidence.json")):
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        walk = evidence.get("walk_forward")
+        if not walk or not walk.get("folds"):
+            continue
+        walk.update(walk_forward_summary(walk["folds"]))
+        path.write_text(json.dumps(_s(evidence), indent=2), encoding="utf-8")
+        touched += 1
+    return touched
 
 
 def run_one(raw: str, key: str) -> dict[str, Any]:
@@ -327,7 +330,16 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=2, help="Keep this small; see module doc.")
     parser.add_argument("--only", default="", help="Comma-separated markets; default both.")
     parser.add_argument("--keys", default="", help="Comma-separated configurations; default all.")
+    parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="Run nothing; re-derive each evidence file's walk-forward aggregate from its folds.",
+    )
     args = parser.parse_args()
+
+    if args.recompute:
+        _say(f"recomputed walk-forward for {recompute(OUT)} evidence files")
+        return 0
 
     markets = [m for m in SCREEN_ASSETS if not args.only or m in args.only.split(",")]
     keys = [k for k in KEYS if not args.keys or k in args.keys.split(",")]

@@ -12,10 +12,10 @@ machine that has to be stopped has already produced the answer that matters:
 * ``stress``   — the three declared cost scenarios.
 * ``neigh``    — the four computed neighbours over each market's whole history.
 
-**BTC's stress and deployed runs are not repeated.** M22 ran them on the identical rule,
-window and costs, recorded them in its own ledger, and re-running them would buy a different
-experiment id rather than different evidence. The report reads them from
-``var/research/m22/BTCUSDT/B2/`` and says so.
+**Every market is run fresh, BTC included.** M22 already has BTC's stress and deployed runs
+on the identical rule, window and costs, and reusing them would have saved about half an hour.
+They are re-run anyway so that M23's record stands on its own ledger and a reader does not
+have to cross two milestones to check one verdict.
 
 **Compute.** Start at one worker. Raise to two only with swap and load healthy, and stop if
 the machine begins paging — M22 lost two hours to a run that had degraded 2.7x before anyone

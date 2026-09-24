@@ -60,7 +60,7 @@ Cualquier expectativa distinta lleva a leer ruido como señal a los dos meses.
 | **session_id** | `paper-b2-btc-4h-w1` |
 | **state-dir** | `var/state/b2-btc/` — **directorio propio, ver §3** |
 | **Capital inicial** | 10.000 USDT |
-| **Warm-start** | **Requerido: 401 barras** (`sma_400` necesita 400 + la barra actual) = **67 días** de 4H |
+| **Warm-start** | **Requerido: 400 barras** (`sma_400` necesita exactamente su ventana) = **66,7 días** de 4H |
 
 **Reglas de entrada/salida.** Entra cuando el máximo de la barra supera el máximo de las 40
 barras previas **y** el cierre está por encima de la SMA de 400. Sale cuando el mínimo perfora
@@ -156,11 +156,11 @@ decisiones rechazadas, no el contador de trades.
 | **Riesgo medido (RV2)** | DD 2.87%, PF 1.48 | DD 4.19%, PF 1.39 |
 | **Estabilidad ante costes** | retiene 34% en el peor escenario | retiene 43% |
 | **Estabilidad ante parámetros** | PF vecino mín. 1.30 | PF vecino mín. 1.21 |
-| **Warm-start** | **401 barras (67 días)** | **73 barras (12 días)** |
+| **Warm-start** | **400 barras (66,7 días)** | **73 barras (12 días)** |
 | **Observabilidad** | más trades por unidad de tiempo → señal operativa antes | períodos largos sin operar son normales y hay que saber leerlos |
 | **Infraestructura** | idéntica: un feed 4H, un state-dir, un lock, un log, reportes diarios | idéntica |
 
-La diferencia operativa que más pesa es el **warm-start**: B2 necesita 67 días de historia
+La diferencia operativa que más pesa es el **warm-start**: B2 necesita 66,7 días de historia
 continua antes de poder emitir su primera señal; RT, 12. Eso cambia el coste de arrancar y el
 de recuperarse de una parada larga.
 
@@ -206,7 +206,7 @@ historia de una sesión que carga financial state, y su razón es exacta:
 
 Así que **hay libros abiertos que alguien tiene que cerrar**, y hasta entonces esa sesión no
 puede servir de fuente de warm-start. Las dos sesiones nuevas tendrían que arrancar en frío y
-esperar su warm-up completo: 67 días para B2, 12 para RT.
+esperar su warm-up completo: 66,7 días para B2, 12 para RT.
 
 ---
 

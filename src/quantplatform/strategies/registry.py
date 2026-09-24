@@ -21,11 +21,16 @@ from quantplatform.core.errors import (
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.breakout import BreakoutStrategy
+from quantplatform.strategies.breakout_trend import TrendFilteredBreakoutStrategy
 from quantplatform.strategies.ema_trend import EmaTrendStrategy
 
 __all__ = ["BUILTIN_STRATEGIES", "StrategyRegistry", "build_default_registry"]
 
-BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (EmaTrendStrategy, BreakoutStrategy)
+BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (
+    EmaTrendStrategy,
+    BreakoutStrategy,
+    TrendFilteredBreakoutStrategy,
+)
 """Strategies shipped with the platform.
 
 ``ema_trend`` was the only one for a reason that no longer holds: comparing two strategies
@@ -35,6 +40,14 @@ regime segmentation, stress testing and a neutral ``compare()`` that ranks nothi
 second strategy is what it gets used for, not a comparison the platform still has to be
 talked out of making dishonestly. ``ema_trend`` stays frozen as the benchmark regardless of
 how many strategies are added here.
+
+``breakout_trend`` is the third, and it arrived by a route the other two did not need. It
+spent M22, M23 and M24 in the research harness and was admitted here only after M23 returned
+PAPER CANDIDATE on BTC under a declared out-of-sample window and M24 re-ran it against the
+incumbent through one protocol. Membership of this tuple is a statement about *where a
+strategy may run*, never about how good it is, and it is deliberately the only door: the
+paper runner resolves through :func:`build_default_registry`, so a rule that is not listed
+here cannot reach a session however it is configured.
 """
 
 

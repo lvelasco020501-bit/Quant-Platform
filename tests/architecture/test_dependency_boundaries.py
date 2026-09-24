@@ -791,10 +791,16 @@ def test_the_platform_ships_exactly_the_strategies_it_declares() -> None:
     # notice rather than a silent drift. A single strategy was "the one, deliberately" until
     # M9c.3b's research harness (walk-forward, sensitivity, regime, stress, a neutral
     # compare()) made comparing two of them honestly possible; breakout is that second one.
+    # breakout_trend is the third, promoted after M23 returned PAPER CANDIDATE on BTC under a
+    # declared out-of-sample window and M24 re-ran it against the incumbent through one
+    # protocol. Editing this literal is the promotion.
     registry = PACKAGE_ROOT / "strategies" / "registry.py"
     assert (
-        "BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = "
-        "(EmaTrendStrategy, BreakoutStrategy)"
+        "BUILTIN_STRATEGIES: Final[tuple[type[BaseStrategy], ...]] = (\n"
+        "    EmaTrendStrategy,\n"
+        "    BreakoutStrategy,\n"
+        "    TrendFilteredBreakoutStrategy,\n"
+        ")"
     ) in registry.read_text(encoding="utf-8")
 
 

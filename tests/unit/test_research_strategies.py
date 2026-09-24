@@ -59,19 +59,22 @@ def _act(
 
 def test_no_research_strategy_is_reachable_from_paper_trading() -> None:
     # The paper runner resolves strategies through the default registry. A research rule that
-    # leaked into it would be one mistyped flag away from a live session.
+    # leaked into it would be one mistyped flag away from a live session. RESEARCH_STRATEGIES
+    # is what has *not* been promoted, so nothing in it may appear in paper; breakout_trend
+    # left that tuple when it was promoted and is checked by test_promoted_strategies instead.
     paper = build_default_registry()
     for strategy_class in (*RESEARCH_STRATEGIES, *MULTI_TIMEFRAME_BENCHMARKS):
         assert strategy_class not in BUILTIN_STRATEGIES
         assert strategy_class.METADATA.strategy_id not in paper
-    assert len(paper) == 2
+    assert len(paper) == 3
 
 
 def test_the_research_registry_still_carries_the_benchmarks() -> None:
     registry = build_research_registry()
     assert "ema_trend" in registry
     assert "breakout" in registry
-    assert len(registry) == 2 + len(RESEARCH_STRATEGIES) + len(MULTI_TIMEFRAME_BENCHMARKS)
+    assert "breakout_trend" in registry, "the promoted rule must still be measurable"
+    assert len(registry) == 3 + len(RESEARCH_STRATEGIES) + len(MULTI_TIMEFRAME_BENCHMARKS)
 
 
 def test_every_research_strategy_is_long_only_spot() -> None:
@@ -151,7 +154,9 @@ _EVERY_CONFIGURATION: tuple[tuple[str, dict[str, object]], ...] = (
 
 def test_every_research_strategy_is_exercised_by_this_file() -> None:
     covered = {strategy_id for strategy_id, _ in _EVERY_CONFIGURATION}
-    assert covered == {cls.METADATA.strategy_id for cls in RESEARCH_STRATEGIES}
+    # breakout_trend is covered by tests/unit/test_breakout_trend_strategy.py now that it is
+    # a shipped strategy rather than a research one.
+    assert covered - {"breakout_trend"} == {cls.METADATA.strategy_id for cls in RESEARCH_STRATEGIES}
 
 
 # --- Parameters are validated, and have no defaults -----------------------------------------------

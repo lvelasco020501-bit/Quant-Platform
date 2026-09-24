@@ -24,20 +24,26 @@ omits a value its window cannot yet support, and warm-up is not something to tra
 
 from __future__ import annotations
 
-import re
-from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Annotated, ClassVar, Final, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 
-from quantplatform.core.enums import MarketType, PositionState, SignalAction, Timeframe
+from quantplatform.core.enums import PositionState, SignalAction
 from quantplatform.core.models.signals import Signal, StrategyContext
 from quantplatform.core.models.strategy import StrategyMetadata
 from quantplatform.strategies.base import BaseStrategy
 from quantplatform.strategies.breakout import BreakoutStrategy
 from quantplatform.strategies.ema_trend import EmaTrendStrategy
+from quantplatform.strategies.parametric import (
+    FROZEN,
+    STUDIED_TIMEFRAMES,
+    ParametricStrategy,
+    Ratio,
+    Window,
+    metadata_for,
+)
 from quantplatform.strategies.registry import StrategyRegistry, build_default_registry
 
 __all__ = [
@@ -48,161 +54,16 @@ __all__ = [
     "EmaSlopeStrategy",
     "EmaTrendMultiTimeframe",
     "MomentumStrategy",
+    "ParametricStrategy",
     "RegimeReversionStrategy",
     "RegimeSwitchStrategy",
     "RegimeTrendStrategy",
-    "ResearchStrategy",
     "RsiReversalStrategy",
-    "TrendFilteredBreakoutStrategy",
     "VolFilteredMomentumStrategy",
     "VolScaledMomentumStrategy",
     "ZScoreReversionStrategy",
     "build_research_registry",
-    "warm_up",
 ]
-
-_CONFIDENCE: Final[Decimal] = Decimal("0.6")
-"""Fixed, as in every other strategy here: each rule is a binary condition, and a number
-derived from how far past its threshold a value sits would be an invented probability."""
-
-_VERSION: Final[str] = "0.1.0"
-_FEATURE_NAME: Final[re.Pattern[str]] = re.compile(
-    r"^(?P<kind>[a-z_]+?)_(?P<first>[0-9]+)(?:_(?P<second>[0-9]+))?$"
-)
-_SAME_WINDOW: Final[frozenset[str]] = frozenset({"sma", "stdev", "zscore"})
-_ONE_BAR_MORE: Final[frozenset[str]] = frozenset(
-    {"roc", "zscore_prev", "rvol", "rsi", "er", "donchian_high", "donchian_low"}
-)
-_EMA_SEED_MULTIPLE: Final[int] = 5
-
-_STUDIED_TIMEFRAMES: Final[tuple[Timeframe, ...]] = (Timeframe.H1, Timeframe.H4, Timeframe.D1)
-"""Research strategies may run on the slower timeframes M14 studies. The production
-strategies stay hourly-only; the benchmarks get research copies below instead."""
-
-_FROZEN: Final[ConfigDict] = ConfigDict(frozen=True, extra="forbid", validate_default=True)
-_Window = Annotated[int, Field(ge=2, le=1000)]
-_Ratio = Annotated[Decimal, Field(ge=0, le=1)]
-
-
-def warm_up(name: str) -> int:
-    """Return how many bars a feature needs, ending at the bar being decided on.
-
-    This package may not import the features package, so it states warm-up itself. A test
-    holds this answer to the pipeline's own for every configuration the sprint runs.
-
-    Raises:
-        ValueError: If the name is not one any research strategy declares.
-    """
-    match = _FEATURE_NAME.match(name)
-    if match is None:
-        msg = f"no warm-up rule for feature {name!r}"
-        raise ValueError(msg)
-    kind = match.group("kind")
-    first = int(match.group("first"))
-    second = int(match.group("second") or 0)
-    if kind in _SAME_WINDOW:
-        return first
-    if kind in _ONE_BAR_MORE:
-        return first + 1
-    if kind == "emab":
-        return _EMA_SEED_MULTIPLE * first
-    if kind == "emaslope":
-        return _EMA_SEED_MULTIPLE * first + second
-    if kind == "volratio":
-        return second + 1
-    msg = f"no warm-up rule for feature {name!r}"
-    raise ValueError(msg)
-
-
-def _metadata(
-    strategy_id: str,
-    name: str,
-    description: str,
-    schema: type[BaseModel],
-    features: tuple[str, ...],
-) -> StrategyMetadata:
-    """Return class-level metadata describing the canonical configuration."""
-    return StrategyMetadata(
-        strategy_id=strategy_id,
-        version=_VERSION,
-        name=name,
-        description=description,
-        required_history=max(warm_up(feature) for feature in features),
-        required_features=features,
-        supported_timeframes=_STUDIED_TIMEFRAMES,
-        supported_market_types=(MarketType.SPOT,),
-        parameter_schema=schema,
-        operates_intrabar=False,
-        allows_short=False,
-    )
-
-
-class ResearchStrategy(BaseStrategy):
-    """A strategy whose declared contract is derived from its parameters."""
-
-    def __init__(self, parameters: BaseModel) -> None:
-        """Validate the parameters, then declare exactly the features they call for."""
-        super().__init__(parameters)
-        self._names = self.feature_names()
-        declared = dict(type(self).METADATA)
-        declared["required_features"] = self._names
-        declared["required_history"] = max(warm_up(name) for name in self._names)
-        self._metadata = StrategyMetadata(**declared)
-
-    @property
-    def metadata(self) -> StrategyMetadata:
-        """Return this instance's contract, not the class's canonical one."""
-        return self._metadata
-
-    @abstractmethod
-    def feature_names(self) -> tuple[str, ...]:
-        """Return the features this instance's parameters call for."""
-
-    def _typed[P: BaseModel](self, schema: type[P]) -> P:
-        parameters = self.parameters
-        if not isinstance(parameters, schema):  # pragma: no cover - the base class checked
-            msg = f"{type(self).__name__} requires {schema.__name__}"
-            raise TypeError(msg)
-        return parameters
-
-    @staticmethod
-    def _read(context: StrategyContext, *names: str) -> tuple[Decimal, ...] | None:
-        """Return every named feature, or ``None`` if any is missing."""
-        values: list[Decimal] = []
-        for name in names:
-            value = context.features.get(name)
-            if value is None:
-                return None
-            values.append(value)
-        return tuple(values)
-
-    def _signal(
-        self,
-        context: StrategyContext,
-        action: SignalAction,
-        reason: str,
-        features: Mapping[str, Decimal],
-    ) -> tuple[Signal, ...]:
-        return (
-            self.build_signal(
-                context=context,
-                action=action,
-                confidence=_CONFIDENCE,
-                reason=reason,
-                features=features,
-            ),
-        )
-
-    def _enter(
-        self, context: StrategyContext, reason: str, features: Mapping[str, Decimal]
-    ) -> tuple[Signal, ...]:
-        return self._signal(context, SignalAction.ENTER_LONG, reason, features)
-
-    def _exit(
-        self, context: StrategyContext, reason: str, features: Mapping[str, Decimal]
-    ) -> tuple[Signal, ...]:
-        return self._signal(context, SignalAction.EXIT_LONG, reason, features)
-
 
 # --- Trend / momentum -------------------------------------------------------------------------
 
@@ -210,14 +71,14 @@ class ResearchStrategy(BaseStrategy):
 class MomentumParameters(BaseModel):
     """Parameters for :class:`MomentumStrategy`."""
 
-    model_config = _FROZEN
-    lookback: _Window
+    model_config = FROZEN
+    lookback: Window
 
 
-class MomentumStrategy(ResearchStrategy):
+class MomentumStrategy(ParametricStrategy):
     """Long while the close is above its value N bars ago; flat while below."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "momentum_roc",
         "N-bar momentum",
         "Long-only time-series momentum: hold while the N-bar return is positive.",
@@ -246,15 +107,15 @@ class MomentumStrategy(ResearchStrategy):
 class EmaSlopeParameters(BaseModel):
     """Parameters for :class:`EmaSlopeStrategy`."""
 
-    model_config = _FROZEN
+    model_config = FROZEN
     period: Annotated[int, Field(ge=2, le=200)]
     slope_bars: Annotated[int, Field(ge=1, le=100)]
 
 
-class EmaSlopeStrategy(ResearchStrategy):
+class EmaSlopeStrategy(ParametricStrategy):
     """Long while an EMA is rising and price is above it."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "ema_slope",
         "EMA slope",
         "Long-only trend filter: enter when the EMA is rising and price sits above it, exit "
@@ -284,75 +145,19 @@ class EmaSlopeStrategy(ResearchStrategy):
         return ()
 
 
-class TrendFilteredBreakoutParameters(BaseModel):
-    """Parameters for :class:`TrendFilteredBreakoutStrategy`."""
-
-    model_config = _FROZEN
-    entry_lookback: Annotated[int, Field(ge=2, le=500)]
-    exit_lookback: Annotated[int, Field(ge=2, le=500)]
-    trend_period: _Window
-
-
-class TrendFilteredBreakoutStrategy(ResearchStrategy):
-    """The Donchian breakout, taken only above a long simple average."""
-
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
-        "breakout_trend",
-        "Breakout with trend filter",
-        "Long-only Donchian breakout that only enters while the close is above a long simple "
-        "moving average; the exit is the plain breakdown and ignores the filter.",
-        TrendFilteredBreakoutParameters,
-        ("donchian_high_20", "donchian_low_10", "sma_200"),
-    )
-
-    def feature_names(self) -> tuple[str, ...]:
-        """Return the two channel levels and the trend average."""
-        p = self._typed(TrendFilteredBreakoutParameters)
-        return (
-            f"donchian_high_{p.entry_lookback}",
-            f"donchian_low_{p.exit_lookback}",
-            f"sma_{p.trend_period}",
-        )
-
-    def generate(self, context: StrategyContext) -> Sequence[Signal]:
-        """Enter on a new high above the trend average; exit on a new low regardless."""
-        high_name, low_name, trend_name = self._names
-        bar = context.latest_bar
-        if context.position_state is PositionState.FLAT:
-            values = self._read(context, high_name, trend_name)
-            if values is None:
-                return ()
-            level, trend = values
-            if bar.high > level and bar.close > trend:
-                return self._enter(
-                    context,
-                    f"high {bar.high} broke {level} with close above {trend_name} {trend}",
-                    {high_name: level, trend_name: trend},
-                )
-            return ()
-        if context.position_state is PositionState.LONG:
-            values = self._read(context, low_name)
-            if values is None:
-                return ()
-            (floor,) = values
-            if bar.low < floor:
-                return self._exit(context, f"low {bar.low} broke {floor}", {low_name: floor})
-        return ()
-
-
 class VolScaledMomentumParameters(BaseModel):
     """Parameters for :class:`VolScaledMomentumStrategy`."""
 
-    model_config = _FROZEN
-    lookback: _Window
-    vol_window: _Window
+    model_config = FROZEN
+    lookback: Window
+    vol_window: Window
     threshold: Annotated[Decimal, Field(gt=0, le=10)]
 
 
-class VolScaledMomentumStrategy(ResearchStrategy):
+class VolScaledMomentumStrategy(ParametricStrategy):
     """Momentum that must clear its own noise before it counts."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "vol_momentum",
         "Volatility-scaled momentum",
         "Long-only momentum entered only when the N-bar return exceeds a multiple of the move "
@@ -397,7 +202,7 @@ class VolScaledMomentumStrategy(ResearchStrategy):
 class ZScoreReversionParameters(BaseModel):
     """Parameters for :class:`ZScoreReversionStrategy`."""
 
-    model_config = _FROZEN
+    model_config = FROZEN
     window: Annotated[int, Field(ge=3, le=1000)]
     entry_z: Annotated[Decimal, Field(lt=0)]
     exit_z: Decimal
@@ -410,10 +215,10 @@ class ZScoreReversionParameters(BaseModel):
         return self
 
 
-class ZScoreReversionStrategy(ResearchStrategy):
+class ZScoreReversionStrategy(ParametricStrategy):
     """Buys a close stretched below its mean; sells it back at the mean."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "zscore_revert",
         "Z-score reversion",
         "Long-only mean reversion: enter when the close is more than |entry_z| standard "
@@ -444,15 +249,15 @@ class ZScoreReversionStrategy(ResearchStrategy):
 class BollingerReversionParameters(BaseModel):
     """Parameters for :class:`BollingerReversionStrategy`."""
 
-    model_config = _FROZEN
+    model_config = FROZEN
     window: Annotated[int, Field(ge=3, le=1000)]
     band_z: Annotated[Decimal, Field(gt=0, le=10)]
 
 
-class BollingerReversionStrategy(ResearchStrategy):
+class BollingerReversionStrategy(ParametricStrategy):
     """Buys the close back inside the lower band, not the first touch below it."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "bollinger_revert",
         "Bollinger reversal",
         "Long-only: enter when the previous close was below the lower band and the current "
@@ -486,7 +291,7 @@ class BollingerReversionStrategy(ResearchStrategy):
 class RsiReversalParameters(BaseModel):
     """Parameters for :class:`RsiReversalStrategy`."""
 
-    model_config = _FROZEN
+    model_config = FROZEN
     period: Annotated[int, Field(ge=2, le=500)]
     oversold: Annotated[Decimal, Field(gt=0, lt=100)]
     exit_level: Annotated[Decimal, Field(gt=0, lt=100)]
@@ -499,10 +304,10 @@ class RsiReversalParameters(BaseModel):
         return self
 
 
-class RsiReversalStrategy(ResearchStrategy):
+class RsiReversalStrategy(ParametricStrategy):
     """Buys an oversold RSI, sells it back at the exit level."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "rsi_reversal",
         "RSI reversal",
         "Long-only: enter when the simple-average RSI is below oversold, exit above exit_level.",
@@ -535,16 +340,16 @@ class RsiReversalStrategy(ResearchStrategy):
 class RegimeTrendParameters(BaseModel):
     """Parameters for :class:`RegimeTrendStrategy`."""
 
-    model_config = _FROZEN
-    lookback: _Window
-    er_window: _Window
-    er_min: _Ratio
+    model_config = FROZEN
+    lookback: Window
+    er_window: Window
+    er_min: Ratio
 
 
-class RegimeTrendStrategy(ResearchStrategy):
+class RegimeTrendStrategy(ParametricStrategy):
     """Momentum, entered only while the market is moving efficiently."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "regime_trend",
         "Momentum in a trending regime",
         "Long-only momentum that only enters while the efficiency ratio says the market is "
@@ -584,12 +389,12 @@ class RegimeTrendStrategy(ResearchStrategy):
 class RegimeReversionParameters(BaseModel):
     """Parameters for :class:`RegimeReversionStrategy`."""
 
-    model_config = _FROZEN
+    model_config = FROZEN
     window: Annotated[int, Field(ge=3, le=1000)]
     entry_z: Annotated[Decimal, Field(lt=0)]
     exit_z: Decimal
-    er_window: _Window
-    er_max: _Ratio
+    er_window: Window
+    er_max: Ratio
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
@@ -599,10 +404,10 @@ class RegimeReversionParameters(BaseModel):
         return self
 
 
-class RegimeReversionStrategy(ResearchStrategy):
+class RegimeReversionStrategy(ParametricStrategy):
     """Z-score reversion, entered only while the market is ranging."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "regime_revert",
         "Reversion in a ranging regime",
         "Long-only z-score reversion that only enters while the efficiency ratio says the "
@@ -642,14 +447,14 @@ class RegimeReversionStrategy(ResearchStrategy):
 class RegimeSwitchParameters(BaseModel):
     """Parameters for :class:`RegimeSwitchStrategy`."""
 
-    model_config = _FROZEN
-    lookback: _Window
+    model_config = FROZEN
+    lookback: Window
     window: Annotated[int, Field(ge=3, le=1000)]
     entry_z: Annotated[Decimal, Field(lt=0)]
     exit_z: Decimal
-    er_window: _Window
-    er_trend: _Ratio
-    er_range: _Ratio
+    er_window: Window
+    er_trend: Ratio
+    er_range: Ratio
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
@@ -662,7 +467,7 @@ class RegimeSwitchParameters(BaseModel):
         return self
 
 
-class RegimeSwitchStrategy(ResearchStrategy):
+class RegimeSwitchStrategy(ParametricStrategy):
     """Momentum in a trend, reversion in a range, silence in between.
 
     **Stateless, so the exit follows the current regime rather than the entry's.** A strategy
@@ -671,7 +476,7 @@ class RegimeSwitchStrategy(ResearchStrategy):
     starts trending therefore switches to the momentum exit — stated, not hidden.
     """
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "regime_switch",
         "Regime switch",
         "Long-only: momentum while the efficiency ratio says trending, z-score reversion while "
@@ -725,10 +530,10 @@ class RegimeSwitchStrategy(ResearchStrategy):
 class VolFilteredMomentumParameters(BaseModel):
     """Parameters for :class:`VolFilteredMomentumStrategy`."""
 
-    model_config = _FROZEN
-    lookback: _Window
-    short_vol: _Window
-    long_vol: _Window
+    model_config = FROZEN
+    lookback: Window
+    short_vol: Window
+    long_vol: Window
     max_ratio: Annotated[Decimal, Field(gt=0, le=10)]
 
     @model_validator(mode="after")
@@ -739,10 +544,10 @@ class VolFilteredMomentumParameters(BaseModel):
         return self
 
 
-class VolFilteredMomentumStrategy(ResearchStrategy):
+class VolFilteredMomentumStrategy(ParametricStrategy):
     """Momentum that declines to enter into a volatility spike."""
 
-    METADATA: ClassVar[StrategyMetadata] = _metadata(
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
         "vol_filtered_momentum",
         "Volatility-filtered momentum",
         "Long-only momentum that only enters while short-window realised volatility is at most "
@@ -788,7 +593,7 @@ def _widened(metadata: StrategyMetadata, strategy_id: str) -> StrategyMetadata:
     """Return a benchmark's contract under a research id, allowed on the studied timeframes."""
     declared = dict(metadata)
     declared["strategy_id"] = strategy_id
-    declared["supported_timeframes"] = _STUDIED_TIMEFRAMES
+    declared["supported_timeframes"] = STUDIED_TIMEFRAMES
     declared["description"] = (
         f"{metadata.description} Research copy of {metadata.strategy_id}, identical rule, "
         "also allowed on 4h and 1d."
@@ -820,10 +625,9 @@ MULTI_TIMEFRAME_BENCHMARKS: Final[tuple[type[BaseStrategy], ...]] = (
 """Research copies of the benchmarks. Registered for research only, never for paper."""
 
 
-RESEARCH_STRATEGIES: Final[tuple[type[ResearchStrategy], ...]] = (
+RESEARCH_STRATEGIES: Final[tuple[type[ParametricStrategy], ...]] = (
     MomentumStrategy,
     EmaSlopeStrategy,
-    TrendFilteredBreakoutStrategy,
     VolScaledMomentumStrategy,
     ZScoreReversionStrategy,
     BollingerReversionStrategy,

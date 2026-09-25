@@ -290,7 +290,7 @@ def test_mixed_symbols_are_detected_across_the_dataset() -> None:
     _dataset_validator(recorder).inspect_source_heterogeneity(
         [make_raw_record(symbol=SYMBOL), make_raw_record(symbol="ETH/USDT")]
     )
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert any(finding.code is DataQualityIssue.UNEXPECTED_SYMBOL for finding in findings)
     assert any("mixes 2 distinct symbol" in finding.message for finding in findings)
 
@@ -301,8 +301,7 @@ def test_mixed_timeframes_are_detected_across_the_dataset() -> None:
         [make_raw_record(timeframe="1h"), make_raw_record(timeframe="15m")]
     )
     assert any(
-        finding.code is DataQualityIssue.UNEXPECTED_TIMEFRAME
-        for finding in recorder.findings  # type: ignore[attr-defined]
+        finding.code is DataQualityIssue.UNEXPECTED_TIMEFRAME for finding in recorder.findings
     )
 
 
@@ -311,13 +310,13 @@ def test_homogeneous_dataset_raises_no_heterogeneity_finding() -> None:
     _dataset_validator(recorder).inspect_source_heterogeneity(
         [make_raw_record(), make_raw_record()]
     )
-    assert recorder.findings == ()  # type: ignore[attr-defined]
+    assert recorder.findings == ()
 
 
 def test_out_of_order_input_is_detected_before_sorting() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder).check_ordering([_validated(1, row=1), _validated(0, row=2)])
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert len(findings) == 1
     assert findings[0].code is DataQualityIssue.OUT_OF_ORDER_BAR
     assert findings[0].severity is FindingSeverity.WARNING
@@ -326,14 +325,14 @@ def test_out_of_order_input_is_detected_before_sorting() -> None:
 def test_ordered_input_raises_no_ordering_finding() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder).check_ordering([_validated(0), _validated(1)])
-    assert recorder.findings == ()  # type: ignore[attr-defined]
+    assert recorder.findings == ()
 
 
 def test_exact_duplicate_is_informational_and_collapsed() -> None:
     recorder = make_recorder()
     kept = _dataset_validator(recorder).deduplicate([_validated(0, row=1), _validated(0, row=2)])
     assert len(kept) == 1
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert findings[0].severity is FindingSeverity.INFO
     assert findings[0].code is DataQualityIssue.DUPLICATE_BAR
 
@@ -345,7 +344,7 @@ def test_conflicting_duplicate_keeps_the_first_and_reports_an_error() -> None:
     )
     assert len(kept) == 1
     assert kept[0].close == Decimal("50100")
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert findings[0].severity is FindingSeverity.ERROR
     assert findings[0].context["first_seen_row"] == "1"
 
@@ -355,7 +354,7 @@ def test_missing_interval_is_reported_at_the_configured_severity() -> None:
     _dataset_validator(recorder, gap_severity=FindingSeverity.ERROR).check_gaps(
         [_validated(0), _validated(2)]
     )
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert findings[0].code is DataQualityIssue.MISSING_BAR
     assert findings[0].severity is FindingSeverity.ERROR
     assert findings[0].context["count"] == "1"
@@ -364,17 +363,14 @@ def test_missing_interval_is_reported_at_the_configured_severity() -> None:
 def test_gaps_beyond_the_threshold_escalate_to_fatal() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder, max_allowed_gap_bars=1).check_gaps([_validated(0), _validated(5)])
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert any(finding.severity is FindingSeverity.FATAL for finding in findings)
 
 
 def test_gaps_within_the_threshold_do_not_escalate() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder, max_allowed_gap_bars=10).check_gaps([_validated(0), _validated(5)])
-    assert not any(
-        finding.severity is FindingSeverity.FATAL
-        for finding in recorder.findings  # type: ignore[attr-defined]
-    )
+    assert not any(finding.severity is FindingSeverity.FATAL for finding in recorder.findings)
 
 
 def test_stale_dataset_is_reported() -> None:
@@ -384,10 +380,7 @@ def test_stale_dataset_is_reported() -> None:
         staleness_budget=timedelta(hours=1),
         reference_time=datetime(2026, 1, 1, 12, tzinfo=UTC),
     ).check_staleness([_validated(0)])
-    assert any(
-        finding.code is DataQualityIssue.STALE_DATA
-        for finding in recorder.findings  # type: ignore[attr-defined]
-    )
+    assert any(finding.code is DataQualityIssue.STALE_DATA for finding in recorder.findings)
 
 
 def test_historical_dataset_judged_against_its_own_end_is_not_stale() -> None:
@@ -399,13 +392,13 @@ def test_historical_dataset_judged_against_its_own_end_is_not_stale() -> None:
         staleness_budget=timedelta(hours=2),
         reference_time=datetime(2026, 1, 1, 1, tzinfo=UTC),
     ).check_staleness([_validated(0)])
-    assert recorder.findings == ()  # type: ignore[attr-defined]
+    assert recorder.findings == ()
 
 
 def test_empty_dataset_after_validation_is_fatal() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder).check_non_empty([], source_rows=5)
-    findings = recorder.findings  # type: ignore[attr-defined]
+    findings = recorder.findings
     assert findings[0].code is DataQualityIssue.EMPTY_DATASET
     assert findings[0].severity is FindingSeverity.FATAL
     assert "all 5 source rows were rejected" in findings[0].message
@@ -414,7 +407,7 @@ def test_empty_dataset_after_validation_is_fatal() -> None:
 def test_source_with_no_rows_is_fatal() -> None:
     recorder = make_recorder()
     _dataset_validator(recorder).check_non_empty([], source_rows=0)
-    assert "no data rows" in recorder.findings[0].message  # type: ignore[attr-defined]
+    assert "no data rows" in recorder.findings[0].message
 
 
 # --- Normalisation --------------------------------------------------------------------------
@@ -444,7 +437,7 @@ def test_normalisation_preserves_decimal_values_exactly() -> None:
     bar = normalize_record(record, source="test")
     assert bar.open == Decimal("50000.123456789012345678")
     assert bar.volume == Decimal("12.000000000000000001")
-    assert not isinstance(bar.open, float)
+    assert type(bar.open) is Decimal  # not isinstance: a float must fail, a subclass too
 
 
 def _normalize_fixture(

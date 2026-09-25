@@ -949,8 +949,9 @@ def test_every_numeric_output_is_decimal_never_float() -> None:
 
     fill = result.fills[0]
     for value in (fill.price, fill.quantity, fill.fee, fill.notional):
-        assert isinstance(value, Decimal)
-        assert not isinstance(value, float)
+        # `type(...) is` rather than isinstance: it rejects a float and a Decimal subclass
+        # alike, and unlike `not isinstance(value, float)` it is not statically impossible.
+        assert type(value) is Decimal
 
 
 def test_high_precision_prices_survive_matching_exactly() -> None:
@@ -1107,7 +1108,7 @@ def test_flat_commission_is_charged_once_per_order_across_partial_fills() -> Non
     broker, _ = make_broker(config=config)
     broker.submit(make_approved(tag="1", order_type=OrderType.LIMIT, limit_price=Decimal(48_000)))
 
-    fees = []
+    fees: list[Decimal] = []
     for index in range(20):
         result = broker.process_bar(
             make_bar(index=index, open_price=Decimal(49_000), low=Decimal(47_000))
@@ -1168,19 +1169,21 @@ def test_basis_point_commission_never_exceeds_its_reservation_across_partial_fil
     assert notional + sum(fees, start=Decimal(0)) <= submission.reservation_delta
 
 
-@pytest.mark.parametrize("field", ["basis_points"])
-def test_commission_rates_are_bounded_and_reject_floats(field: str) -> None:
+def test_commission_rates_are_bounded_and_reject_floats() -> None:
     with pytest.raises(ValueError, match="less than or equal to 10000"):
-        FeePolicy(model=CommissionModel.BASIS_POINTS, **{field: Decimal(10_001)})
+        FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=Decimal(10_001))
     with pytest.raises(ValueError, match="binary floating point"):
-        FeePolicy(model=CommissionModel.BASIS_POINTS, **{field: 10.0})
+        # A float is passed deliberately: the assertion IS that the model refuses one, so the
+        # static type has to be wrong here or there would be nothing to test.
+        FeePolicy(model=CommissionModel.BASIS_POINTS, basis_points=10.0)  # type: ignore[arg-type]
 
 
 def test_slippage_rate_is_bounded_and_rejects_floats() -> None:
     with pytest.raises(ValueError, match="less than or equal to 10000"):
         SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=Decimal(10_001))
     with pytest.raises(ValueError, match="binary floating point"):
-        SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=10.0)
+        # Deliberately a float, for the same reason as above.
+        SlippagePolicy(model=SlippageModel.FIXED_BPS, basis_points=10.0)  # type: ignore[arg-type]
 
 
 # --- Mid-bar failure and deterministic resume (audit) ---------------------------------------

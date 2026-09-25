@@ -129,6 +129,7 @@ def test_fees_shrink_the_position_because_a_stop_out_also_pays_them() -> None:
     without = RiskBasedSizer().size(_request(policy=_costless()))
 
     assert with_fees.quantity < without.quantity
+    assert with_fees.risk_amount is not None
     assert with_fees.risk_amount <= Decimal("1000")
 
 

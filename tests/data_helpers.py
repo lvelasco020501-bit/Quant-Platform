@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
+from typing import TypedDict
 from uuid import UUID, uuid4
 
 from quantplatform.config.settings import DataSettings
@@ -27,6 +29,22 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "csv"
 SYMBOL = "BTC/USDT"
 MARKET_TYPE = MarketType.SPOT
 TIMEFRAME = Timeframe.H1
+
+
+class BarLookup(TypedDict):
+    """The three fields that name a bar series.
+
+    A plain dict literal of these three infers ``dict[str, str]``, because ``MarketType`` and
+    ``Timeframe`` are string enums and mypy joins them with ``SYMBOL`` down to their common
+    base. Splatting that into a repository then loses both enums. Naming the shape keeps them.
+    """
+
+    symbol: str
+    market_type: MarketType
+    timeframe: Timeframe
+
+
+LOOKUP: BarLookup = {"symbol": SYMBOL, "market_type": MARKET_TYPE, "timeframe": TIMEFRAME}
 
 # Every fixture's data sits on 2026-01-01 and closes by 05:00. This instant is late enough
 # that all of it has closed, but close enough that the default freshness budget (twice the
@@ -128,11 +146,11 @@ def make_bar(
         timeframe=TIMEFRAME,
         open_time=open_time,
         close_time=open_time + TIMEFRAME.duration,
-        open="50000",
-        high="60000",
-        low="40000",
-        close=close,
-        volume="12.5",
+        open=Decimal("50000"),
+        high=Decimal("60000"),
+        low=Decimal("40000"),
+        close=Decimal(close),
+        volume=Decimal("12.5"),
         quote_volume=None,
         trade_count=100,
         source=source,

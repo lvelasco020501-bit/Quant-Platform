@@ -32,6 +32,7 @@ from quantplatform.storage.repository import (
 from quantplatform.storage.unit_of_work import SqlAlchemyDataUnitOfWork
 from tests.data_helpers import (
     AFTER_ALL_FIXTURES,
+    LOOKUP,
     MARKET_TYPE,
     SYMBOL,
     TIMEFRAME,
@@ -41,8 +42,6 @@ from tests.data_helpers import (
     data_settings,
     fixture,
 )
-
-_LOOKUP = {"symbol": SYMBOL, "market_type": MARKET_TYPE, "timeframe": TIMEFRAME}
 
 
 class _Harness:
@@ -64,7 +63,7 @@ class _Harness:
     def _make_unit(self) -> DataUnitOfWork:
         unit = InMemoryDataUnitOfWork(self.bars, self.runs)
         self.units.append(unit)
-        return unit  # type: ignore[return-value]
+        return unit
 
     async def ingest(self, name: str, **kwargs: object) -> IngestionResult:
         """Ingest a named fixture."""
@@ -264,7 +263,7 @@ async def test_out_of_order_input_is_reported_yet_stored_in_order() -> None:
 
     assert DataQualityIssue.OUT_OF_ORDER_BAR in _codes(result)
     stored = await harness.bars.get_bars(
-        **_LOOKUP, start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2026, 1, 2, tzinfo=UTC)
+        **LOOKUP, start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2026, 1, 2, tzinfo=UTC)
     )
     assert [bar.open_time.hour for bar in stored] == [0, 1]
 
@@ -401,7 +400,7 @@ async def test_ingestion_persists_through_a_real_database(
     assert result.succeeded
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP,
+            **LOOKUP,
             start=datetime(2026, 1, 1, tzinfo=UTC),
             end=datetime(2026, 1, 2, tzinfo=UTC),
         )
@@ -419,7 +418,7 @@ async def test_re_ingestion_through_a_real_database_is_idempotent(
         )
 
     async with session_factory() as session:
-        assert await SqlAlchemyMarketBarRepository(session).count_bars(**_LOOKUP) == 4
+        assert await SqlAlchemyMarketBarRepository(session).count_bars(**LOOKUP) == 4
 
 
 async def test_fatal_run_leaves_a_real_database_untouched(
@@ -441,7 +440,7 @@ async def test_fatal_run_leaves_a_real_database_untouched(
 
     assert not result.succeeded
     async with session_factory() as session:
-        assert await SqlAlchemyMarketBarRepository(session).count_bars(**_LOOKUP) == 0
+        assert await SqlAlchemyMarketBarRepository(session).count_bars(**LOOKUP) == 0
 
 
 async def test_findings_are_linked_to_their_run_in_a_real_database(

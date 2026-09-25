@@ -23,9 +23,8 @@ from quantplatform.storage.repository import (
     SqlAlchemyIngestionRunRepository,
     SqlAlchemyMarketBarRepository,
 )
-from tests.data_helpers import MARKET_TYPE, SYMBOL, TIMEFRAME, make_bar
+from tests.data_helpers import LOOKUP, MARKET_TYPE, SYMBOL, TIMEFRAME, make_bar
 
-_LOOKUP = {"symbol": SYMBOL, "market_type": MARKET_TYPE, "timeframe": TIMEFRAME}
 _DAY_START = datetime(2026, 1, 1, tzinfo=UTC)
 _DAY_END = datetime(2026, 1, 2, tzinfo=UTC)
 
@@ -68,7 +67,7 @@ async def test_bars_round_trip_as_domain_models(
 
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP, start=_DAY_START, end=_DAY_END
+            **LOOKUP, start=_DAY_START, end=_DAY_END
         )
 
     assert len(stored) == 1
@@ -92,7 +91,7 @@ async def test_decimal_precision_survives_the_database(
 
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP, start=_DAY_START, end=_DAY_END
+            **LOOKUP, start=_DAY_START, end=_DAY_END
         )
 
     assert stored[0].open == Decimal("50000.123456789012345678")
@@ -109,7 +108,7 @@ async def test_stored_timestamps_come_back_timezone_aware(
 
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP, start=_DAY_START, end=_DAY_END
+            **LOOKUP, start=_DAY_START, end=_DAY_END
         )
 
     assert stored[0].open_time.tzinfo is not None
@@ -129,7 +128,7 @@ async def test_re_adding_an_identical_bar_is_idempotent(
         results = await repository.add_bars([bar])
         await session.commit()
         assert results[0].outcome is BarWriteOutcome.EXACT_DUPLICATE
-        assert await repository.count_bars(**_LOOKUP) == 1
+        assert await repository.count_bars(**LOOKUP) == 1
 
 
 async def test_conflicting_bar_is_reported_and_never_overwrites(
@@ -151,7 +150,7 @@ async def test_conflicting_bar_is_reported_and_never_overwrites(
 
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP, start=_DAY_START, end=_DAY_END
+            **LOOKUP, start=_DAY_START, end=_DAY_END
         )
     assert stored[0].close == Decimal("50100")
 
@@ -198,7 +197,7 @@ async def test_time_range_query_is_half_open_and_ordered(
 
     async with session_factory() as session:
         selected = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP,
+            **LOOKUP,
             start=datetime(2026, 1, 1, 1, tzinfo=UTC),
             end=datetime(2026, 1, 1, 3, tzinfo=UTC),
         )
@@ -217,8 +216,8 @@ async def test_latest_bar_is_deterministic(
 
     async with session_factory() as session:
         repository = SqlAlchemyMarketBarRepository(session)
-        first = await repository.get_latest_bar(**_LOOKUP)
-        second = await repository.get_latest_bar(**_LOOKUP)
+        first = await repository.get_latest_bar(**LOOKUP)
+        second = await repository.get_latest_bar(**LOOKUP)
 
     assert first is not None
     assert first.open_time.hour == 3
@@ -229,7 +228,7 @@ async def test_latest_bar_is_none_when_nothing_is_stored(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session:
-        assert await SqlAlchemyMarketBarRepository(session).get_latest_bar(**_LOOKUP) is None
+        assert await SqlAlchemyMarketBarRepository(session).get_latest_bar(**LOOKUP) is None
 
 
 async def test_exists_and_count_reflect_the_natural_key(
@@ -240,9 +239,9 @@ async def test_exists_and_count_reflect_the_natural_key(
         await repository.add_bars([make_bar(hour=0)])
         await session.commit()
 
-        assert await repository.exists(**_LOOKUP, open_time=_DAY_START)
-        assert not await repository.exists(**_LOOKUP, open_time=datetime(2026, 1, 1, 5, tzinfo=UTC))
-        assert await repository.count_bars(**_LOOKUP) == 1
+        assert await repository.exists(**LOOKUP, open_time=_DAY_START)
+        assert not await repository.exists(**LOOKUP, open_time=datetime(2026, 1, 1, 5, tzinfo=UTC))
+        assert await repository.count_bars(**LOOKUP) == 1
         assert (
             await repository.count_bars(
                 symbol="ETH/USDT", market_type=MARKET_TYPE, timeframe=TIMEFRAME
@@ -262,7 +261,7 @@ async def test_bars_for_other_instruments_are_not_returned(
 
     async with session_factory() as session:
         stored = await SqlAlchemyMarketBarRepository(session).get_bars(
-            **_LOOKUP, start=_DAY_START, end=_DAY_END
+            **LOOKUP, start=_DAY_START, end=_DAY_END
         )
 
     assert len(stored) == 1
@@ -277,7 +276,7 @@ async def test_repository_does_not_commit_on_its_own(
         # Deliberately no commit: the caller owns the transaction boundary.
 
     async with session_factory() as session:
-        assert await SqlAlchemyMarketBarRepository(session).count_bars(**_LOOKUP) == 0
+        assert await SqlAlchemyMarketBarRepository(session).count_bars(**LOOKUP) == 0
 
 
 async def test_runs_and_findings_round_trip_and_stay_linked(

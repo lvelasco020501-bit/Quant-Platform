@@ -291,7 +291,9 @@ def test_log_extra_preserves_every_field_to_dict_carries() -> None:
     exc = ConfigurationError("bad config", setting="risk.max_open_orders", value=-1)
 
     assert exc.log_extra() == {"error": exc.to_dict()}
-    assert exc.log_extra()["error"]["details"] == {
+    reported = exc.log_extra()["error"]
+    assert isinstance(reported, dict)
+    assert reported["details"] == {
         "setting": "risk.max_open_orders",
         "value": -1,
     }
@@ -306,9 +308,9 @@ def test_log_extra_key_is_never_a_reserved_record_attribute() -> None:
     assert "error" not in logging.makeLogRecord({}).__dict__
 
 
-def _all_error_subclasses(base: type[Exception]) -> list[type[Exception]]:
+def _all_error_subclasses(base: type[QuantPlatformError]) -> list[type[QuantPlatformError]]:
     """Return every QuantPlatformError subclass currently registered, recursively."""
-    found: list[type[Exception]] = []
+    found: list[type[QuantPlatformError]] = []
     for subclass in base.__subclasses__():
         found.append(subclass)
         found.extend(_all_error_subclasses(subclass))

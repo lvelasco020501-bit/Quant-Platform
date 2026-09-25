@@ -38,6 +38,7 @@ from quantplatform.paper import (
     PaperTradingRunner,
     PaperTradingSession,
 )
+from quantplatform.portfolio.engine import SpotPortfolioEngine
 from quantplatform.storage.paper_state import _COMPUTED_FIELD_EXCLUSIONS
 from tests.factories import ANCHOR, SYMBOL, make_backtest, make_bar, make_bars
 from tests.integration.test_backtest_engine import (
@@ -81,7 +82,7 @@ def _session(
     clock: SimulatedClock | None = None,
     repository: InMemoryPaperStateRepository | None = None,
     **backtest_kwargs: object,
-) -> tuple[PaperTradingSession, SimulatedClock, InMemoryPaperStateRepository, object]:
+) -> tuple[PaperTradingSession, SimulatedClock, InMemoryPaperStateRepository, SpotPortfolioEngine]:
     """Wire a session over the real pipeline."""
     resolved_clock = clock if clock is not None else SimulatedClock(ANCHOR)
     resolved_repository = repository if repository is not None else InMemoryPaperStateRepository()

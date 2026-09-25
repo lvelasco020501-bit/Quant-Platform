@@ -25,6 +25,7 @@ from quantplatform.core.enums import (
     RiskOutcome,
 )
 from quantplatform.core.models.execution_policy import ExecutionPolicy
+from quantplatform.core.models.market import SymbolRules
 from quantplatform.core.models.orders import ApprovedOrder
 from quantplatform.core.models.risk import RiskDecision
 from quantplatform.execution.broker import SimulatedBroker
@@ -57,7 +58,7 @@ class _Wiring:
         *,
         policy: ExecutionPolicy,
         cash: Decimal,
-        rules: object | None = None,
+        rules: SymbolRules | None = None,
         **risk_overrides: object,
     ) -> None:
         self.policy = policy
@@ -67,7 +68,7 @@ class _Wiring:
             symbols=self.symbols, initial_balances=(make_balance(free=cash),)
         )
         self.broker = SimulatedBroker(
-            symbols=self.symbols,  # type: ignore[arg-type]
+            symbols=self.symbols,
             portfolio=self.portfolio,
             execution_mode=ExecutionMode.PAPER,
             started_at=ANCHOR,
@@ -81,7 +82,7 @@ class _Wiring:
     def decide(self, **intent_kwargs: object) -> RiskDecision:
         context = make_risk_context(
             snapshot=make_snapshot(cash=self.cash),
-            symbol_rules=self.rules,  # type: ignore[arg-type]
+            symbol_rules=self.rules,
         )
         return self.engine.evaluate(make_intent(**intent_kwargs), context)  # type: ignore[arg-type]
 
@@ -286,7 +287,7 @@ def test_a_sell_approved_by_risk_is_submittable_and_settles() -> None:
         make_intent(
             side=OrderSide.SELL, quantity=Decimal("0.1"), signal_time=ANCHOR.replace(hour=2)
         ),
-        make_risk_context(snapshot=snapshot, symbol_rules=wiring.rules),  # type: ignore[arg-type]
+        make_risk_context(snapshot=snapshot, symbol_rules=wiring.rules),
     )
     order = sell_decision.approved_order
     assert order is not None

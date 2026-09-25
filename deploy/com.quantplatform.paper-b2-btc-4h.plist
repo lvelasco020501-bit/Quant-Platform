@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the B2/BTC/4h paper session.
+
+  NOT INSTALLED. This file lives in the repository as a prepared artifact; installing it is a
+  separate, deliberate act described in docs/m27_sleep_investigation.md.
+
+  Three choices here are policy, not convenience:
+
+  * KeepAlive        false  — Restart=no. launchd will not revive a session that stopped, for
+                              any reason. A paper session that died did so because something
+                              was wrong, and a restart would hide it. This is also what stops
+                              launchd from turning a data gap into an endless respawn loop.
+  * RunAtLoad        false  — nothing starts by itself, not even at login. The session begins
+                              only when a person runs `launchctl start`. Combined with the
+                              --fresh in the launcher, there is no path by which a session
+                              starts or resumes without someone deciding it should.
+  * caffeinate -is          — holds a power assertion for exactly as long as the session runs,
+                              and releases it when the session ends. Scoped to the process,
+                              so it leaves no permanent change to the machine's power
+                              behaviour. -i prevents idle sleep; -s prevents system sleep
+                              while on AC power. It does NOT prevent clamshell sleep: closing
+                              the lid still sleeps the machine, which is what killed the first
+                              session.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quantplatform.paper-b2-btc-4h</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-is</string>
+        <string>/Users/luisve/quant-platform/deploy/paper-b2-btc-4h.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/luisve/quant-platform</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/luisve/quant-platform/var/sessions/paper-b2-btc-4h-w1/logs/launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/luisve/quant-platform/var/sessions/paper-b2-btc-4h-w1/logs/launchd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,42 @@
+[Unit]
+Description=Quant Platform - Mission Control B2 (read-only web observer, port 8801)
+Documentation=https://github.com/lvelasco020501-bit/Quant-Platform
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+# /var, not /opt: the working directory deliberately contains no .env, so this process never
+# loads the trading configuration and never holds the database DSN. Same reasoning as
+# quant-web.service, which runs from a separate checkout for the same purpose.
+WorkingDirectory=/var/quant-platform-b2
+EnvironmentFile=/opt/quant-platform-b2/mission-control-b2.env
+# The venv binary directly rather than through uv: uv wants a writable cache in $HOME, and
+# weakening ProtectHome to give it one would trade real isolation for a convenience this
+# service does not need.
+Environment=MPLCONFIGDIR=/tmp/matplotlib
+ExecStart=/opt/quant-platform-b2/.venv/bin/quantplatform-web
+
+# Safe to restart automatically, unlike the trading session: this process observes and holds
+# no financial state, and a dashboard that stays down after a blip is one nobody trusts.
+Restart=on-failure
+RestartSec=5
+
+# It only ever reads. Both trading trees are read-only to it, so a defect here cannot write
+# a snapshot, clear a lock or touch evidence — in either session.
+ReadOnlyPaths=/var/quant-platform-b2
+ReadOnlyPaths=/var/quant-platform
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=append:/var/log/quant-web-b2.log
+StandardError=append:/var/log/quant-web-b2.log
+
+[Install]
+WantedBy=multi-user.target

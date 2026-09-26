@@ -1,0 +1,46 @@
+[Unit]
+Description=Quant Platform - Paper Session B2 (breakout_trend 40/20/400, BTC/USDT 4h, Risk V2 converted)
+Documentation=https://github.com/lvelasco020501-bit/Quant-Platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+# A checkout of its own, pinned to fb0dec8. The productive 1h session runs from
+# /opt/quant-platform and must not have its code changed underneath it, so this session
+# shares no source tree, no venv and no state directory with it.
+WorkingDirectory=/opt/quant-platform-b2
+EnvironmentFile=/opt/quant-platform-b2/.env
+
+# --fresh is the default and is written out anyway, so that a reader of this file or of a
+# process listing can see that this session never resumes. Every path is absolute and
+# repeats what the environment file already says: a process listing should be enough to
+# tell which session this is without reading any configuration.
+ExecStart=/opt/quant-platform-b2/.venv/bin/quantplatform paper run \
+  --fresh \
+  --strategy breakout_trend \
+  --param entry_lookback=40 \
+  --param exit_lookback=20 \
+  --param trend_period=400 \
+  --symbol BTC/USDT \
+  --timeframe 4h \
+  --state-dir /var/quant-platform-b2/state \
+  --log-dir /var/quant-platform-b2/logs \
+  --reports-dir /var/quant-platform-b2/reports \
+  --session-id vps-b2-btc-4h-20260926T1911Z
+
+# Restart=no is policy, not an omission. A session that stopped did so for a reason, and a
+# restart would both hide it and — because the run is --fresh — silently throw away the
+# warm-up and begin again from zero. systemd must never make that decision.
+Restart=no
+
+# No caffeinate, no power assertion, nothing holding the machine awake: this is a Linux
+# server that does not sleep. That was the entire point of moving off the laptop.
+
+StandardOutput=append:/var/quant-platform-b2/logs/systemd.out.log
+StandardError=append:/var/quant-platform-b2/logs/systemd.err.log
+
+# Deliberately no [Install] section: this unit is never enabled, so an unattended reboot
+# leaves the session stopped rather than restarting a --fresh run that discards 66 days of
+# warm-up without anyone noticing. Starting it is always a decision a person makes.

@@ -15,6 +15,7 @@ because a status display that invents a figure is worse than one that admits a g
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -185,9 +186,13 @@ def gather_status(
 
     Args:
         settings: Effective configuration, for the directories and the declared strategy.
-        registry: Registry the configured strategy identifier is described from. Metadata
-            only; no strategy is constructed, so a status read works even for a deployment
-            whose parameters are currently unconfigurable.
+        registry: Registry the configured strategy identifier is described from. A strategy
+            *is* constructed here, from the configured parameters, because for a parametric
+            strategy the class metadata describes a configuration nobody is running — see
+            :func:`_required_history`. Construction is validation and arithmetic only: it
+            opens nothing, writes nothing and is never asked to generate a signal. A
+            deployment whose parameters will not build still reads, falling back to the
+            class figure and saying so.
         session_id: Which session to describe. Defaults to the configured one, unless a
             different session holds the lock — a running session is what an operator asking
             "how is it going" means, even if configuration has since moved on.
@@ -210,7 +215,32 @@ def gather_status(
     report = _load_report(settings, resolved_id, notes, problems)
 
     strategy_id = state.strategy_id if state is not None else paper.strategy_id
-    required_history = _required_history(registry, strategy_id, notes)
+    # The configured parameters describe the configured strategy. When the session on disk
+    # is running a different one, they cannot be used to build it, and the reading falls
+    # back to that strategy's class figure rather than to a number built from the wrong
+    # parameters.
+    configured: dict[str, object] | None
+    if strategy_id is None:
+        # Nothing is running and nothing is configured. There is no warm-up to describe and
+        # nothing worth saying about it.
+        configured = None
+    elif paper.strategy_id is None:
+        configured = None
+        notes.append(
+            f"configuration names no strategy, so the parameters {strategy_id!r} is running "
+            "here are unknown: the warm-up requirement below is that strategy's class "
+            "default, which may not be this session's"
+        )
+    elif strategy_id == paper.strategy_id:
+        configured = dict(paper.strategy_params)
+    else:
+        configured = None
+        notes.append(
+            f"the session is running {strategy_id!r} while {paper.strategy_id!r} is "
+            "configured, so the configured parameters cannot describe it: the warm-up "
+            "requirement below is the class default, which may not be this session's"
+        )
+    required_history = _required_history(registry, strategy_id, configured, notes)
 
     starting_capital = settings.backtest.initial_capital
     cash = _cash(state)
@@ -389,19 +419,58 @@ def _load_report(
 
 
 def _required_history(
-    registry: StrategyRegistry, strategy_id: str | None, notes: list[str]
+    registry: StrategyRegistry,
+    strategy_id: str | None,
+    parameters: Mapping[str, object] | None,
+    notes: list[str],
 ) -> int | None:
-    """Return how many bars the strategy needs before it may have an opinion."""
+    """Return how many bars *this session's* strategy needs before it may have an opinion.
+
+    Built from the configured parameters rather than read off the class, because for a
+    parametric strategy those are two different numbers. ``breakout_trend`` declares the
+    canonical 20/10/200 on its class and the B2 session runs 40/20/400; the class says 200,
+    the instance says 400, and the engine has always enforced 400 —
+    :meth:`BaseStrategy.validate_context` reads ``self.metadata``, which
+    :class:`ParametricStrategy` overrides per instance. Reading the class here made the panel
+    announce COMPLETE with half the history in hand, about a month early.
+
+    This is the observation layer, so a strategy that will not build is not allowed to break
+    the reading. The class figure is shown instead, with a note saying it may not be this
+    session's — a warm-up number that might be wrong, clearly labelled, beats a blank panel.
+
+    Args:
+        registry: Registry to resolve the identifier through.
+        strategy_id: The strategy this session is running.
+        parameters: The configured parameters, or ``None`` when they belong to a different
+            strategy and therefore cannot describe this one.
+        notes: Collected diagnostics, appended to when the answer is weaker than it looks.
+
+    Returns:
+        The warm-up requirement in bars, or ``None`` if the strategy is unknown here.
+    """
     if strategy_id is None:
         return None
     try:
-        return registry.metadata_for(strategy_id).required_history
+        declared = registry.metadata_for(strategy_id).required_history
     except Exception:
         notes.append(
             f"strategy {strategy_id!r} is not registered here, so its warm-up "
             "requirement is unknown"
         )
         return None
+    if parameters is None:
+        return declared
+    try:
+        # Validation and arithmetic. Constructing a strategy opens nothing and writes
+        # nothing, and this one is never asked for a signal — it is built to be measured.
+        return registry.create(strategy_id, parameters).metadata.required_history
+    except Exception as exc:
+        notes.append(
+            f"strategy {strategy_id!r} could not be built from the configured parameters "
+            f"({type(exc).__name__}), so the warm-up requirement shown is its class default "
+            f"of {declared} bars, which may not be this session's"
+        )
+        return declared
 
 
 def _cash(state: PaperSessionState | None) -> Decimal | None:

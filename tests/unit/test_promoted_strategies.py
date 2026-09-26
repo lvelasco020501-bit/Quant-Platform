@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from quantplatform.core.enums import Timeframe
 from quantplatform.strategies.breakout_trend import TrendFilteredBreakoutStrategy
+from quantplatform.strategies.parametric import ParametricStrategy
 from quantplatform.strategies.registry import BUILTIN_STRATEGIES, build_default_registry
 from quantplatform.strategies.research import (
     MULTI_TIMEFRAME_BENCHMARKS,
@@ -102,3 +103,28 @@ def test_the_promoted_rule_is_long_only_spot() -> None:
     metadata = TrendFilteredBreakoutStrategy.METADATA
     assert metadata.allows_short is False
     assert metadata.operates_intrabar is False
+
+
+# --- Whose contract is a property of the instance -------------------------------------------------
+
+PARAMETRIC: frozenset[str] = frozenset({"breakout_trend"})
+"""Promoted strategies whose declared contract is derived from their parameters.
+
+For these, class metadata describes a configuration nobody runs, and anything reading it as
+if it were the session's contract is wrong. Mission Control did exactly that: it showed
+``Warm-up 0 / 200`` for a session needing 400, and would have called the warm-up COMPLETE a
+month early. The regression lives in ``tests/integration/test_status_command.py``.
+"""
+
+
+def test_the_parametric_members_of_the_registry_are_the_declared_ones() -> None:
+    # Promoting a second parametric strategy has to fail here, so that whoever does it is
+    # sent to extend the status regression rather than discovering the same defect again
+    # through a panel that reads COMPLETE too early.
+    parametric = {
+        strategy.METADATA.strategy_id
+        for strategy in BUILTIN_STRATEGIES
+        if issubclass(strategy, ParametricStrategy)
+    }
+    assert parametric == PARAMETRIC
+    assert set(PROMOTED) >= PARAMETRIC

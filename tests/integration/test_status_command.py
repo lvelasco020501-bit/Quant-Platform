@@ -169,6 +169,121 @@ def test_warmup_is_complete_once_enough_bars_have_been_seen(
     assert "COMPLETE" in render_status(status, colour=False)
 
 
+# --- warm-up of a strategy whose contract comes from its parameters ------------------------
+
+# ``breakout_trend`` is the first promoted strategy whose warm-up is a property of the
+# instance rather than of the class: its METADATA describes the canonical 20/10/200
+# configuration, and the session configured below runs 40/20/400. The engine has always
+# validated against the instance — ``BaseStrategy.validate_context`` reads ``self.metadata``,
+# which ``ParametricStrategy`` overrides — so a panel reading the class was quietly
+# describing a different strategy from the one trading.
+
+
+def _parametric(directories: dict[str, Path], **paper: object) -> SessionStatus:
+    """Gather status for a session running ``breakout_trend`` at M23's 40/20/400."""
+    _persist(directories, _state(strategy_id="breakout_trend", bars_processed=5))
+    return _gather(
+        directories,
+        strategy_id="breakout_trend",
+        strategy_params={"entry_lookback": "40", "exit_lookback": "20", "trend_period": "400"},
+        **paper,
+    )
+
+
+def test_warmup_is_measured_against_the_configured_instance_not_the_class(
+    directories: dict[str, Path],
+) -> None:
+    status = _parametric(directories)
+
+    # 400, from sma_400, and not the 200 the class declares for its canonical sma_200.
+    assert build_default_registry().metadata_for("breakout_trend").required_history == 200
+    assert status.required_history == 400
+    assert status.warmup_complete is False
+    assert "5 / 400" in render_status(status, colour=False)
+
+
+def test_the_panel_does_not_call_a_parametric_warmup_complete_early(
+    directories: dict[str, Path],
+) -> None:
+    # The bug's visible consequence: at 200 bars the class figure says COMPLETE while the
+    # engine is still refusing to let the strategy have an opinion, roughly a month early.
+    _persist(directories, _state(strategy_id="breakout_trend", bars_processed=200))
+
+    status = _gather(
+        directories,
+        strategy_id="breakout_trend",
+        strategy_params={"entry_lookback": "40", "exit_lookback": "20", "trend_period": "400"},
+    )
+
+    assert status.warmup_complete is False
+    assert "COMPLETE" not in render_status(status, colour=False)
+
+
+def test_a_strategy_that_declares_on_the_class_is_unchanged(
+    directories: dict[str, Path],
+) -> None:
+    # ``breakout`` derives nothing from its parameters, so instance and class agree and this
+    # fix must not move its number.
+    _persist(directories, _state(bars_processed=5))
+
+    status = _gather(directories)
+
+    declared = build_default_registry().metadata_for("breakout").required_history
+    assert status.required_history == declared
+    assert status.required_history == 21
+
+
+def test_parameters_the_strategy_refuses_fall_back_to_the_class_and_say_so(
+    directories: dict[str, Path],
+) -> None:
+    # A misconfigured session still gets a reading. The number shown is the class default,
+    # which may not be this session's, so the reading says that rather than implying it.
+    _persist(directories, _state(strategy_id="breakout_trend", bars_processed=5))
+
+    status = _gather(
+        directories,
+        strategy_id="breakout_trend",
+        strategy_params={"entry_lookback": "40"},
+    )
+
+    assert status.required_history == 200
+    assert any("configured parameters" in note for note in status.notes)
+
+
+def test_parameters_belonging_to_another_strategy_are_not_applied(
+    directories: dict[str, Path],
+) -> None:
+    # The session is running one strategy and configuration has moved on to another. The
+    # configured parameters describe the configured strategy, not the running one, so they
+    # may not be used to build it.
+    _persist(directories, _state(strategy_id="breakout_trend", bars_processed=5))
+
+    status = _gather(
+        directories,
+        strategy_id="breakout",
+        strategy_params={"entry_lookback": "20", "exit_lookback": "10"},
+    )
+
+    assert status.strategy_id == "breakout_trend"
+    assert status.required_history == 200
+    assert any("cannot describe it" in note for note in status.notes)
+
+
+def test_a_reader_configured_with_no_strategy_at_all_says_what_it_is_showing(
+    directories: dict[str, Path],
+) -> None:
+    # Mission Control is pointed at a session's directories and may be started without the
+    # session's own environment. It then knows which strategy is running, from the state
+    # file, but not the numbers it is running — so it shows the class figure and labels it
+    # rather than presenting 200 as if it were this session's requirement.
+    _persist(directories, _state(strategy_id="breakout_trend", bars_processed=5))
+
+    status = _gather(directories, strategy_id=None, strategy_params={})
+
+    assert status.required_history == 200
+    assert any("may not be this session's" in note for note in status.notes)
+
+
 # --- positions -----------------------------------------------------------------------------
 
 

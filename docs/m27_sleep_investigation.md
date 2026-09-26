@@ -215,7 +215,9 @@ interrumpirse. Las dos salidas honestas:
 | Tras arrancar: `live_trading_armed` | `false` |
 | A las 4 h: primera barra | `bars_processed` ≥ 1 y sin `data_gap_error` |
 
-**Nota de observabilidad que sigue pendiente de M26:** Mission Control mostrará
-`Warm-up 0 / 200` cuando la estrategia necesita 400, porque lee la metadata de clase y no la
-de instancia. No afecta a la operativa — el motor valida contra 400 — pero el panel dirá
-"COMPLETE" un mes antes de que lo esté. Sigue sin corregir, a la espera de tu decisión.
+**Nota de observabilidad de M26 — CORREGIDA el 2026-09-25 en `b4eefa9`.** Mission Control
+mostraba `Warm-up 0 / 200` cuando la estrategia necesita 400, porque leía la metadata de
+clase y no la de instancia. Nunca afectó a la operativa — el motor siempre validó contra 400
+— pero el panel habría dicho "COMPLETE" un mes antes de tiempo. `status/model.py` construye
+ahora la estrategia con los parámetros configurados y lee su metadata; comprobado contra el
+estado real de esta sesión, que reporta `Warm-up 1 / 400`.

@@ -49,9 +49,15 @@ from quantplatform.research.sprint import Scorecard
 from quantplatform.strategies.research import build_research_registry
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
-DATA: Final[Path] = ROOT / "data/raw/m29/out"
 HOME: Final[Path] = ROOT / "var/research/m29"
-TIMEFRAME: Final[Timeframe] = Timeframe.D1
+
+DATA_FOR: Final[dict[Timeframe, Path]] = {
+    Timeframe.D1: ROOT / "data/raw/m29/out",
+    Timeframe.H4: ROOT / "data/raw/m16/out",
+    Timeframe.H1: ROOT / "data/raw/m16/out",
+}
+"""Where each timeframe's canonical series lives. 4h and 1h are M16's own outputs, used
+unchanged; 1d is the series ``m29_dataset.py`` derived from those same 1h bars."""
 MIN_OOS_BARS: Final[int] = 30
 """Below this the out-of-sample window is too short for any figure from it to mean much."""
 
@@ -60,9 +66,9 @@ OOS_START: Final[datetime] = datetime(2024, 1, 1, tzinfo=UTC)
 make every prior verdict incomparable and hand this one a window chosen after the fact."""
 
 
-def load(raw: str) -> tuple[MarketBar, ...]:
-    """Read one market's derived daily series, re-validating every row through the model."""
-    path = next(DATA.glob(f"{raw}_1d_*.csv"))
+def load(raw: str, timeframe: Timeframe) -> tuple[MarketBar, ...]:
+    """Read one market's canonical series, re-validating every row through the model."""
+    path = next(DATA_FOR[timeframe].glob(f"{raw}_{timeframe.value}_*.csv"))
     bars: list[MarketBar] = []
     with path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -80,7 +86,7 @@ def load(raw: str) -> tuple[MarketBar, ...]:
                     volume=Decimal(row["volume"]),
                     quote_volume=Decimal(row["quote_volume"]) if row.get("quote_volume") else None,
                     trade_count=int(row["trade_count"]) if row.get("trade_count") else None,
-                    source="m29_daily",
+                    source=row.get("source") or "m29_screen",
                     is_closed=True,
                 )
             )
@@ -121,14 +127,14 @@ def at_cost(definition: ExperimentDefinition, multiplier: int) -> ExperimentDefi
     return definition.model_copy(update={"risk": risk, "backtest": backtest})
 
 
-def card(result: ExperimentResult | None) -> dict[str, Any] | None:
+def card(result: ExperimentResult | None, timeframe: Timeframe) -> dict[str, Any] | None:
     """Return one run's scorecard, plus the annualised figures the gates read."""
     if result is None or result.performance is None:
         return None
     out: dict[str, Any] = Scorecard.from_performance(result.performance).model_dump()
     bars = result.performance.bars_processed if hasattr(result.performance, "bars_processed") else 0
     out["bars"] = bars or len(result.equity_curve)
-    annual = cagr(Decimal(str(out["total_return"])), bars=out["bars"], timeframe=TIMEFRAME)
+    annual = cagr(Decimal(str(out["total_return"])), bars=out["bars"], timeframe=timeframe)
     out["cagr"] = annual
     out["calmar"] = calmar(annual, Decimal(str(out["max_drawdown"])))
     out["exposure"] = out.get("time_in_market")
@@ -158,14 +164,16 @@ def per_year(result: ExperimentResult | None) -> list[dict[str, Any]]:
 def run(definition: ExperimentDefinition, bars: tuple[MarketBar, ...]) -> ExperimentResult | None:
     """Execute one experiment, returning the result or ``None`` if it failed."""
     result = ExperimentRunner().run(
-        definition, bars=bars, factory=_factory(), code_revision="m29-screen-1d"
+        definition, bars=bars, factory=_factory(), code_revision="m29-screen"
     )
     return result if result.status.value == "succeeded" else None
 
 
-def cell(raw: str, probe: Probe, bars: tuple[MarketBar, ...]) -> dict[str, Any]:
+def cell(
+    raw: str, probe: Probe, bars: tuple[MarketBar, ...], timeframe: Timeframe
+) -> dict[str, Any]:
     """Run every declared pass for one configuration on one market."""
-    base_def = definition_for(raw, probe, TIMEFRAME, latching=False)
+    base_def = definition_for(raw, probe, timeframe, latching=False)
     entry: dict[str, Any] = {
         "asset": raw,
         "key": probe.key,
@@ -177,16 +185,17 @@ def cell(raw: str, probe: Probe, bars: tuple[MarketBar, ...]) -> dict[str, Any]:
     }
 
     result = run(base_def, bars)
-    entry["base"] = card(result)
+    entry["base"] = card(result, timeframe)
     entry["per_year"] = per_year(result)
 
     for multiplier in COST_STRESS_MULTIPLIERS:
-        entry[f"cost_x{multiplier}"] = card(run(at_cost(base_def, multiplier), bars))
+        entry[f"cost_x{multiplier}"] = card(run(at_cost(base_def, multiplier), bars), timeframe)
 
     oos = tuple(bar for bar in bars if bar.open_time >= OOS_START)
-    entry["oos"] = card(run(base_def, oos)) if len(oos) > MIN_OOS_BARS else None
+    entry["oos"] = card(run(base_def, oos), timeframe) if len(oos) > MIN_OOS_BARS else None
 
-    entry["deployed"] = card(run(definition_for(raw, probe, TIMEFRAME, latching=True), bars))
+    deployed = definition_for(raw, probe, timeframe, latching=True)
+    entry["deployed"] = card(run(deployed, bars), timeframe)
     return entry
 
 
@@ -194,23 +203,28 @@ def main() -> int:
     """Run the whole 1d screen, one cell at a time, and write one report."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", default="")
+    parser.add_argument("--timeframe", default="1d")
+    parser.add_argument("--keys", default="", help="restrict to these probe keys, e.g. B1,T1")
     args = parser.parse_args()
     wanted = {name for name in args.only.split(",") if name}
     assets = [raw for raw in ASSETS if not wanted or raw in wanted]
+    timeframe = Timeframe(args.timeframe)
+    keys = {name for name in args.keys.split(",") if name}
+    probes = [p for p in CANDIDATES_M29 if not keys or p.key in keys]
 
     HOME.mkdir(parents=True, exist_ok=True)
     started = time.time()
     cells: list[dict[str, Any]] = []
-    total = len(assets) * len(CANDIDATES_M29)
+    total = len(assets) * len(probes)
     done = 0
 
     for raw in assets:
-        bars = load(raw)
-        sys.stdout.write(f"{raw}: {len(bars)} daily bars\n")
+        bars = load(raw, timeframe)
+        sys.stdout.write(f"{raw}: {len(bars)} {timeframe.value} bars\n")
         sys.stdout.flush()
-        for probe in CANDIDATES_M29:
+        for probe in probes:
             at = time.time()
-            entry = cell(raw, probe, bars)
+            entry = cell(raw, probe, bars, timeframe)
             done += 1
             base = entry["base"]
             summary = (
@@ -232,14 +246,17 @@ def main() -> int:
     report = {
         "milestone": "m29",
         "phase": "screen",
-        "timeframe": TIMEFRAME.value,
+        "timeframe": timeframe.value,
         "oos_start": OOS_START.isoformat(),
         "cost_stress_multipliers": list(COST_STRESS_MULTIPLIERS),
         "generated_at": datetime.now(UTC).isoformat(),
         "seconds": round(time.time() - started, 1),
         "cells": cells,
     }
-    out = HOME / "screen_1d.json"
+    # A restricted run writes to its own file. A smoke test on one cell once overwrote a
+    # finished screen's evidence, which is a cheap mistake to make and a slow one to undo.
+    narrowed = "" if not keys and not wanted else "-partial"
+    out = HOME / f"screen_{timeframe.value}{narrowed}.json"
     out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
     sys.stdout.write(f"\n{len(cells)} cells in {report['seconds']}s -> {out.relative_to(ROOT)}\n")
     return 0

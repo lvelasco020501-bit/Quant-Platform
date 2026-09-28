@@ -27,6 +27,8 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Final
 
+from quantplatform.core.enums import Timeframe
+from quantplatform.core.timeutils import floor_to_timeframe
 from quantplatform.status.events import ActivityCounts
 from quantplatform.status.model import Health, SessionStatus
 
@@ -163,21 +165,48 @@ def _elapsed_hours(status: SessionStatus) -> float | None:
     return None if elapsed is None else elapsed.total_seconds() / 3600
 
 
-def _bars_expected(status: SessionStatus) -> int | None:
-    """Return how many hourly candles should have closed since the session started.
+def _bar_interval(status: SessionStatus) -> Timeframe | None:
+    """Return the interval this session's candles actually run on.
 
-    Counts hour boundaries crossed, not elapsed hours divided: a session that starts at
-    20:35 sees its first close at 21:00, twenty-five minutes in, and dividing would call
-    that zero and report a healthy feed as behind.
+    The last processed bar is preferred over the configured timeframe because
+    :attr:`SessionStatus.bars_processed` comes from the persisted state, and a count is only
+    meaningful against the grid the counted bars were on. Configuration can have moved on
+    since the session started; the bar it last handled cannot.
+    """
+    if status.last_bar is not None:
+        return status.last_bar.timeframe
+    try:
+        return Timeframe(status.timeframe)
+    except ValueError:
+        return None
+
+
+def _bars_expected(status: SessionStatus) -> int | None:
+    """Return how many candles should have closed since the session started.
+
+    Counts boundaries crossed on the session's *own* grid, not elapsed time divided: a
+    session that starts at 20:35 on hourly bars sees its first close at 21:00, twenty-five
+    minutes in, and dividing would call that zero and report a healthy feed as behind.
+
+    The grid is the session's, which is the whole point. This counted hour boundaries on
+    every session whatever its bars were, so the first 4h session on the platform was told
+    it had missed twenty candles of the twenty-seven "expected" while it had in fact
+    processed all seven that closed — enough to turn the page amber for a day. Alignment
+    comes from :func:`floor_to_timeframe`, the same grid arithmetic the feed validates
+    incoming candles against, so a weekly bar anchors to Monday here too.
     """
     if status.started_at is None:
         return None
-    start = status.started_at
+    interval = _bar_interval(status)
+    if interval is None:
+        return None
     now = datetime.now(UTC)
-    first_close = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    # The first close strictly after the start: a session beginning exactly on a boundary
+    # does not get that candle, it gets the next one.
+    first_close = floor_to_timeframe(status.started_at, interval) + interval.duration
     if now < first_close:
         return 0
-    return int((now - first_close).total_seconds() // 3600) + 1
+    return int((now - first_close).total_seconds() // interval.seconds) + 1
 
 
 # --- market --------------------------------------------------------------------------------
@@ -188,6 +217,8 @@ def _market_brain(status: SessionStatus, feed_state: str | None) -> Brain:
     report = status.report
     kpis: list[Kpi] = []
     levels: list[Level] = []
+    interval = _bar_interval(status)
+    interval_name = interval.value if interval is not None else "interval"
 
     connected = feed_state in {"connected", "streaming"}
     feed_level = Level.GOOD if (connected and status.running) else Level.ATTENTION
@@ -234,7 +265,7 @@ def _market_brain(status: SessionStatus, feed_state: str | None) -> Brain:
                 if status.last_bar
                 else None
             ),
-            meaning="When that candle closed. On H1 a new one should arrive every hour.",
+            meaning=f"When that candle closed. A new one should arrive every {interval_name}.",
             source=Source.STRUCTURED if status.last_bar else Source.UNAVAILABLE,
             level=Level.INFO,
             why=(
@@ -247,13 +278,13 @@ def _market_brain(status: SessionStatus, feed_state: str | None) -> Brain:
 
     expected = _bars_expected(status)
     received = status.bars_processed
-    if expected is None or received is None:
+    if expected is None or received is None or interval is None:
         kpis.append(
             _unavailable(
                 "bar_coverage",
                 "Candles received",
                 "How many candles arrived against how many should have.",
-                "The session has not recorded a start time or a candle count yet.",
+                "The session has not recorded a start time, a candle count and a bar interval yet.",
             )
         )
     else:
@@ -265,8 +296,8 @@ def _market_brain(status: SessionStatus, feed_state: str | None) -> Brain:
                 label="Candles received",
                 value=f"{received} / {expected} expected",
                 meaning=(
-                    "Candles the session processed against how many hourly closes have "
-                    "happened since it started. A shortfall means data was missed."
+                    f"Candles the session processed against how many {interval.value} closes "
+                    "have happened since it started. A shortfall means data was missed."
                 ),
                 source=Source.STRUCTURED,
                 level=coverage_level,
@@ -274,7 +305,8 @@ def _market_brain(status: SessionStatus, feed_state: str | None) -> Brain:
                     "Every candle that should have closed has been processed."
                     if coverage_level is Level.GOOD
                     else f"{behind} expected candles have not been processed. One candle of "
-                    "lag is normal around the hour boundary; more suggests the feed missed data."
+                    f"lag is normal around a {interval.value} boundary; more suggests the "
+                    "feed missed data."
                 ),
             )
         )
@@ -1636,13 +1668,14 @@ def _smoke_brain(status: SessionStatus, smoke_hours: float | None) -> Brain:
 
     expected = _bars_expected(status)
     received = status.bars_processed
-    if expected is None or received is None:
+    interval = _bar_interval(status)
+    if expected is None or received is None or interval is None:
         kpis.append(
             _unavailable(
                 "bars",
                 "Candles expected vs received",
-                "Whether every hourly candle that should have arrived did.",
-                "Needs a start time and a candle count.",
+                "Whether every candle that should have arrived did.",
+                "Needs a start time, a candle count and a bar interval.",
             )
         )
     else:
@@ -1653,7 +1686,7 @@ def _smoke_brain(status: SessionStatus, smoke_hours: float | None) -> Brain:
                 key="bars",
                 label="Candles expected vs received",
                 value=f"{received} received / {expected} expected",
-                meaning="Whether every hourly candle that should have arrived did.",
+                meaning=(f"Whether every {interval.value} candle that should have arrived did."),
                 source=Source.STRUCTURED,
                 level=level,
                 why=(

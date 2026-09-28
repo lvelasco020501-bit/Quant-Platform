@@ -11,10 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from quantplatform.core.enums import CircuitBreakerReason, StopKind
+from quantplatform.core.enums import CircuitBreakerReason, StopKind, Timeframe
 from quantplatform.core.models.portfolio import Position
 from quantplatform.core.models.risk import CircuitBreakerState, PositionRiskState
 from quantplatform.core.models.stops import StopSpecification
+from quantplatform.core.timeutils import floor_to_timeframe
 from quantplatform.reporting.models import (
     DailyAlerts,
     DailyHealth,
@@ -362,6 +363,137 @@ def test_a_session_keeping_up_with_the_feed_is_not_flagged() -> None:
 
     coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
 
+    assert coverage.level is Level.GOOD
+
+
+def _started_for(closes: int, interval: Timeframe) -> datetime:
+    """Return a start time after which exactly ``closes`` candles of ``interval`` have closed.
+
+    Derived from now rather than written as a date, so these tests assert the arithmetic
+    instead of quietly becoming wrong tomorrow. One minute before a boundary puts the start
+    inside the preceding bar, which is the interesting case: that bar's close does not count.
+    """
+    grid = floor_to_timeframe(datetime.now(UTC), interval)
+    return grid - interval.duration * (closes - 1) - timedelta(minutes=1)
+
+
+def test_the_expected_count_follows_the_session_timeframe_not_the_clock_hour() -> None:
+    # The B2 session, exactly: a bit over a day in on 4h bars, with every 4h close since
+    # processed. Seven candles closed in that window, not the twenty-seven hour boundaries a
+    # clock-hour count saw, which called a perfectly healthy feed twenty short.
+    status = _status(
+        timeframe="4h",
+        started_at=_started_for(7, Timeframe.H4),
+        last_bar=make_bar(timeframe=Timeframe.H4, close=Decimal("84016")),
+        bars_processed=7,
+    )
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert coverage.value == "7 / 7 expected"
+    assert coverage.level is Level.GOOD
+
+
+def test_a_four_hour_session_keeping_up_does_not_drag_the_summary_to_degraded() -> None:
+    # The visible symptom: one wrong KPI turned the whole page amber while the session was
+    # processing every candle on time.
+    status = _status(
+        timeframe="4h",
+        started_at=_started_for(7, Timeframe.H4),
+        last_bar=make_bar(timeframe=Timeframe.H4, close=Decimal("84016")),
+        bars_processed=7,
+        required_history=400,
+    )
+    brains = _brains(status, feed_state="streaming")
+
+    assert _brain(brains, "market").level is not Level.ATTENTION
+    assert summarise(status, brains).headline != Health.DEGRADED
+
+
+def test_a_four_hour_session_that_really_missed_candles_is_still_flagged() -> None:
+    # The fix must not buy quiet by making the check toothless.
+    status = _status(
+        timeframe="4h",
+        started_at=_started_for(7, Timeframe.H4),
+        last_bar=make_bar(timeframe=Timeframe.H4, close=Decimal("84016")),
+        bars_processed=2,
+    )
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert coverage.level is Level.ATTENTION
+    assert "have not been processed" in coverage.why
+
+
+def test_a_daily_session_counts_daily_closes() -> None:
+    # Started before yesterday's midnight: one daily close has happened, so one candle is
+    # owed — not the twenty-something hour boundaries that have gone by since.
+    status = _status(
+        timeframe="1d",
+        started_at=_started_for(1, Timeframe.D1),
+        last_bar=make_bar(timeframe=Timeframe.D1, close=Decimal("84016")),
+        bars_processed=1,
+    )
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert coverage.value == "1 / 1 expected"
+    assert coverage.level is Level.GOOD
+
+
+def test_the_hourly_count_is_exactly_what_it_was() -> None:
+    # The regression guard for the two tests above this section: six hours in on 1h bars,
+    # six closes owed. This number must not move.
+    status = _status(bars_processed=6)
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert coverage.value == "6 / 6 expected"
+    assert coverage.level is Level.GOOD
+
+
+def test_the_wording_no_longer_promises_hourly_candles() -> None:
+    # The old text said "how many hourly closes have happened" on every session, whatever
+    # its bars were. A panel that names the wrong interval teaches an operator to distrust it.
+    status = _status(timeframe="4h", last_bar=make_bar(timeframe=Timeframe.H4))
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert "hourly" not in coverage.meaning.lower()
+    assert "4h" in coverage.meaning
+
+
+def test_the_smoke_panel_counts_by_timeframe_too() -> None:
+    # _bars_expected has a second caller, in the smoke brain. It was wrong in the same way
+    # and for the same reason.
+    status = _status(
+        timeframe="4h",
+        started_at=_started_for(7, Timeframe.H4),
+        last_bar=make_bar(timeframe=Timeframe.H4, close=Decimal("84016")),
+        bars_processed=7,
+    )
+
+    bars = _kpi(_brain(_brains(status, smoke_hours=72), "smoke"), "bars")
+
+    assert bars.value == "7 received / 7 expected"
+    assert bars.level is Level.GOOD
+
+
+def test_the_bar_count_follows_the_bars_the_session_actually_processed() -> None:
+    # bars_processed comes from the persisted state; the timeframe it is compared against
+    # should come from the same place. Configuration can drift — a dashboard pointed at a
+    # session whose configured timeframe has moved on must count the candles the session
+    # really handled, which is what its last bar records.
+    status = _status(
+        timeframe="1h",  # configuration says hourly...
+        started_at=_started_for(7, Timeframe.H4),
+        last_bar=make_bar(timeframe=Timeframe.H4),  # ...the session is processing 4h bars
+        bars_processed=7,
+    )
+
+    coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
+
+    assert coverage.value == "7 / 7 expected"
     assert coverage.level is Level.GOOD
 
 

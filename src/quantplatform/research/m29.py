@@ -31,10 +31,21 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Final
 
-from quantplatform.core.enums import Timeframe
+from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.base import DomainModel, Text
-from quantplatform.research.m22 import Horizon, doubled
+from quantplatform.research.definition import (
+    ExperimentDefinition,
+    ExperimentRole,
+    StrategySpec,
+    canonical_json,
+)
+from quantplatform.research.latch_policy import risk_configuration_for
+from quantplatform.research.m14 import REFERENCE
+from quantplatform.research.m15 import risk_for_timeframe
+from quantplatform.research.m16 import DATA_END, symbol_rules_for
+from quantplatform.research.m22 import Horizon, _base, asset_for, doubled
 from quantplatform.research.sprint import CANDIDATES, SprintCandidate
+from quantplatform.strategies.research import build_research_registry
 
 __all__ = [
     "ASSETS",
@@ -56,6 +67,7 @@ __all__ = [
     "Stage",
     "cagr",
     "calmar",
+    "definition_for",
     "profit_rank",
     "survives",
 ]
@@ -351,3 +363,66 @@ def profit_rank(*, calmar_ratio: Decimal | None, annual: Decimal | None) -> tupl
         calmar_ratio if calmar_ratio is not None else Decimal(-1),
         annual if annual is not None else Decimal(-1),
     )
+
+
+# --- Building one run ----------------------------------------------------------------------------
+
+
+def definition_for(
+    raw: str, probe: Probe, timeframe: Timeframe, *, latching: bool
+) -> ExperimentDefinition:
+    """Return the experiment definition for one probe, on one market, at one timeframe.
+
+    Plumbing, not policy: it moves no threshold declared above and chooses no number. The only
+    thing it adds over M22's builder is that the timeframe is an argument rather than a
+    constant, which is what lets the same fourteen rules be asked the same question at 1d, 4h
+    and 1h.
+
+    Risk is :func:`~quantplatform.research.m15.risk_for_timeframe` applied to the deployed Risk
+    V2 configuration — the conversion M15 declared and every run from M15 onward has used, so a
+    daily run is risked on a daily bar's terms rather than an hour's.
+
+    Args:
+        raw: Market symbol as the dataset names it, e.g. ``"BTCUSDT"``.
+        probe: Which of the fourteen configurations to run.
+        timeframe: The bar interval, which also selects the risk conversion.
+        latching: ``False`` for the screen's research variant, which releases the latching
+            breakers so a rule is measured rather than the breakers; ``True`` for deployed
+            Risk V2, which any PAPER CANDIDATE has to survive.
+
+    Returns:
+        A definition, round-tripped through canonical JSON so it carries no computed field.
+    """
+    asset, base = asset_for(raw), _base()
+    version = build_research_registry().metadata_for(probe.candidate.strategy_id).version
+    at_timeframe = risk_for_timeframe(base.risk, timeframe)
+    risk = at_timeframe if latching else risk_configuration_for(REFERENCE, at_timeframe)
+    dataset = base.dataset.model_copy(
+        update={
+            "symbol": asset.symbol,
+            "symbol_rules": symbol_rules_for(asset),
+            "market_type": MarketType.SPOT,
+            "timeframe": timeframe,
+            "start": asset.start,
+            "end": DATA_END,
+            "source": "binance_vision_m16" if timeframe is not Timeframe.D1 else "m29_daily",
+        }
+    )
+    suffix = "deployed" if latching else "ref"
+    copy = base.model_copy(
+        update={
+            "name": (
+                f"m29-{raw}-{timeframe.value}-{probe.key}-{probe.candidate.strategy_id}-{suffix}"
+            ),
+            "strategy": StrategySpec(
+                strategy_id=probe.candidate.strategy_id,
+                strategy_version=version,
+                params=probe.candidate.params,
+            ),
+            "dataset": dataset,
+            "backtest": base.backtest.model_copy(update={"timeframe": timeframe}),
+            "risk": risk,
+            "role": ExperimentRole.IN_SAMPLE,
+        }
+    )
+    return ExperimentDefinition.model_validate_json(canonical_json(copy))

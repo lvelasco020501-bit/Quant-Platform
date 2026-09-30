@@ -221,13 +221,18 @@ def _scores(
     vol_name = f"rvol_{vol_window}"
     pipeline = IndicatorFeatures([roc_name, vol_name] if normalised else [roc_name])
     root = Decimal(lookback).sqrt()
+    # compute() reads only the last `required_history` bars of whatever it is handed, so it is
+    # handed exactly those. Slicing from the start of the series instead would copy a list that
+    # grows with the run, making score computation quadratic in history length -- 6x the bars
+    # would cost 36x the time, which is the difference between a 4h screen and no 4h screen.
+    depth = pipeline.required_history
     out: dict[str, tuple[Decimal | None, ...]] = {}
     for asset, bars in series.items():
         out[asset] = tuple(
             None
             if slot is None
             else _one_score(
-                pipeline.compute(bars[: slot + 1]),
+                pipeline.compute(bars[max(0, slot + 1 - depth) : slot + 1]),
                 roc_name=roc_name,
                 vol_name=vol_name,
                 normalised=normalised,

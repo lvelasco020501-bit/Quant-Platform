@@ -25,6 +25,7 @@ import csv
 import json
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -57,15 +58,19 @@ from quantplatform.research.rotation import (
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 HOME: Final[Path] = ROOT / "var/research/m31"
-DATA: Final[Path] = ROOT / "data/raw/m30/out"
+DATA_FOR: Final[dict[Timeframe, Path]] = {
+    Timeframe.D1: ROOT / "data/raw/m30/out",
+    Timeframe.H4: ROOT / "data/raw/m16/out",
+}
+"""Where each timeframe's canonical series lives. 1d is the series ``m30_dataset.py`` derived
+and verified; 4h is M16's own output, used unchanged and never re-derived."""
 M30_SCREEN: Final[Path] = ROOT / "var/research/m30/screen_1d.json"
-TIMEFRAME: Final[Timeframe] = Timeframe.D1
 TOLERANCE: Final[Decimal] = Decimal("0.000001")
 
 
-def load(raw: str) -> tuple[MarketBar, ...]:
-    """Read one market's canonical daily series, re-validating every row through the model."""
-    path = next(DATA.glob(f"{raw}_1d_*.csv"))
+def load(raw: str, timeframe: Timeframe) -> tuple[MarketBar, ...]:
+    """Read one market's canonical series, re-validating every row through the model."""
+    path = next(DATA_FOR[timeframe].glob(f"{raw}_{timeframe.value}_*.csv"))
     bars: list[MarketBar] = []
     with path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -117,11 +122,11 @@ def _single_year_share(run: RotationRun) -> Decimal | None:
     return max(deltas) / total if total > 0 and deltas else None
 
 
-def card(run: RotationRun) -> dict[str, Any]:
+def card(run: RotationRun, timeframe: Timeframe) -> dict[str, Any]:
     """Return every figure one run offers, with no judgement applied to any of it."""
     total = run.total_return
     drawdown = max_drawdown(run.equity_curve)
-    annual = cagr(total, bars=run.bars, timeframe=TIMEFRAME)
+    annual = cagr(total, bars=run.bars, timeframe=timeframe)
     years = yearly_returns(run.equity_curve, run.initial_equity)
     contributions = {c.asset: c.net_profit for c in run.contributions}
     net_total = sum(contributions.values(), start=Decimal(0))
@@ -151,9 +156,23 @@ def card(run: RotationRun) -> dict[str, Any]:
     }
 
 
-def cell(rule: RotationRule, label: str, policy: ExposurePolicy, series: Series) -> dict[str, Any]:
-    """Run the four declared passes for one signal under one exposure policy."""
+def cell(
+    rule: RotationRule,
+    label: str,
+    policy: ExposurePolicy,
+    series: Series,
+    timeframe: Timeframe,
+    *,
+    lookback: int | None = None,
+) -> dict[str, Any]:
+    """Run the four declared passes for one signal under one exposure policy.
+
+    ``lookback`` overrides the frozen signal's own only for a sensitivity probe, which is a
+    measurement of fragility and never a candidate. The frozen rule is untouched either way.
+    """
     spec = spec_of(rule, policy)
+    if lookback is not None:
+        spec = replace(spec, lookback=lookback)
     cost = ONE_WAY_COST_BASIS_POINTS
     entry: dict[str, Any] = {
         "key": f"{rule.key}-{label.replace(' ', '')}",
@@ -164,13 +183,14 @@ def cell(rule: RotationRule, label: str, policy: ExposurePolicy, series: Series)
             "volatility_window": policy.volatility_window,
             "drawdown_power": policy.drawdown_power,
         },
-        "base": card(simulate(series, spec, cost_basis_points=cost)),
+        "lookback": spec.lookback,
+        "base": card(simulate(series, spec, cost_basis_points=cost), timeframe),
     }
     for multiplier in COST_STRESS_MULTIPLIERS:
         entry[f"cost_x{multiplier}"] = card(
-            simulate(series, spec, cost_basis_points=cost * multiplier)
+            simulate(series, spec, cost_basis_points=cost * multiplier), timeframe
         )
-    entry["oos"] = card(simulate(series, spec, cost_basis_points=cost, start=OOS_START))
+    entry["oos"] = card(simulate(series, spec, cost_basis_points=cost, start=OOS_START), timeframe)
 
     measured = Controlled(
         max_drawdown=entry["base"]["max_drawdown"],
@@ -211,17 +231,73 @@ def _check_against_m30(cells: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
+def _probe(
+    cells: list[dict[str, Any]], series: Series, timeframe: Timeframe
+) -> list[dict[str, Any]]:
+    """Return neighbour runs for every cell that passed, or missed by a single condition.
+
+    Which cells get probed is decided mechanically -- cleared the gate, or failed exactly one
+    of it -- rather than chosen after reading the table, so the selection carries no judgement.
+
+    Two neighbourhoods are walked. The **exposure** neighbours ask whether the level that
+    passed is a knife-edge. The **lookback** neighbours are M30's own declared sensitivity
+    probes, half and double. Neither is a candidate: a neighbour that scores better is recorded
+    and not adopted, because changing a parameter because a result pointed at it is what a
+    pre-declaration exists to prevent.
+    """
+    interesting = [c for c in cells if c["passes"] or len(c["failed"]) == 1]
+    out: list[dict[str, Any]] = []
+    for c in interesting:
+        rule = next(r for r in FROZEN if r.key == c["signal"])
+        fixed = c["policy"]["fixed"]
+        neighbours: list[tuple[str, ExposurePolicy, int | None]] = []
+        if fixed is not None:
+            level = Decimal(str(fixed))
+            for step in (Decimal("-0.05"), Decimal("0.05")):
+                nearby = level + step
+                if Decimal(0) < nearby <= Decimal(1):
+                    neighbours.append((f"fixed {nearby:.0%}", ExposurePolicy(fixed=nearby), None))
+        policy = ExposurePolicy(
+            fixed=None if fixed is None else Decimal(str(fixed)),
+            volatility_window=c["policy"]["volatility_window"],
+            drawdown_power=c["policy"]["drawdown_power"],
+        )
+        neighbours.extend(
+            (f"lookback {look}", policy, look) for look in (rule.lookback // 2, rule.lookback * 2)
+        )
+        for label, nearby_policy, look in neighbours:
+            probe = cell(rule, label, nearby_policy, series, timeframe, lookback=look)
+            probe["probes"] = c["key"]
+            out.append(probe)
+            sys.stdout.write(
+                f"    probe {c['key']:22} {label:14} "
+                f"cagr {float(Decimal(str(probe['base']['cagr'] or 0))):+7.2%} "
+                f"dd {float(Decimal(str(probe['base']['max_drawdown']))):6.2%} "
+                f"calmar {float(Decimal(str(probe['base']['calmar'] or 0))):5.2f} "
+                f"{'PASS' if probe['passes'] else ','.join(probe['failed'])}\n"
+            )
+            sys.stdout.flush()
+    return out
+
+
 def main() -> int:
     """Run the declared matrix and write one report."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--keys", default="", help="restrict to these signals, e.g. CS2")
+    parser.add_argument("--timeframe", default="1d")
+    parser.add_argument(
+        "--sensitivity",
+        action="store_true",
+        help="probe the neighbours of whatever cleared the gate, or missed it by one condition",
+    )
     args = parser.parse_args()
     keys = {name for name in args.keys.split(",") if name}
     rules = [rule for rule in FROZEN if not keys or rule.key in keys]
+    timeframe = Timeframe(args.timeframe)
 
-    series: Series = {raw: load(raw) for raw in ASSETS_M30}
+    series: Series = {raw: load(raw, timeframe) for raw in ASSETS_M30}
     sys.stdout.write(
-        f"{len(series)} markets, {sum(len(b) for b in series.values())} daily bars, "
+        f"{len(series)} markets, {sum(len(b) for b in series.values())} {timeframe.value} bars, "
         f"{ONE_WAY_COST_BASIS_POINTS} bps a side\n\n"
     )
     sys.stdout.flush()
@@ -232,7 +308,7 @@ def main() -> int:
     for rule in rules:
         for label, _, policy in POLICIES:
             at = time.time()
-            entry = cell(rule, label, policy, series)
+            entry = cell(rule, label, policy, series, timeframe)
             cells.append(entry)
             b = entry["base"]
             sys.stdout.write(
@@ -243,11 +319,15 @@ def main() -> int:
             )
             sys.stdout.flush()
 
-    problems = _check_against_m30(cells)
+    probes: list[dict[str, Any]] = []
+    if args.sensitivity:
+        probes = _probe(cells, series, timeframe)
+
+    problems = _check_against_m30(cells) if timeframe is Timeframe.D1 else []
     report = {
         "milestone": "m31",
         "phase": "exposure_control",
-        "timeframe": TIMEFRAME.value,
+        "timeframe": timeframe.value,
         "assets": list(ASSETS_M30),
         "frozen_signals": [rule.key for rule in FROZEN],
         "one_way_cost_basis_points": ONE_WAY_COST_BASIS_POINTS,
@@ -258,8 +338,10 @@ def main() -> int:
         "agrees_with_m30": not problems,
         "disagreements": problems,
         "cells": cells,
+        "sensitivity": probes,
     }
-    out = HOME / f"screen_1d{'-partial' if keys else ''}.json"
+    narrowed = "-partial" if keys else ""
+    out = HOME / f"screen_{timeframe.value}{narrowed}.json"
     out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
     sys.stdout.write(f"\n{len(cells)} cells in {report['seconds']}s -> {out.relative_to(ROOT)}\n")
     if problems:
@@ -267,7 +349,8 @@ def main() -> int:
         for line in problems:
             sys.stdout.write(f"  {line}\n")
         return 1
-    sys.stdout.write("uncontrolled cells reproduce M30 exactly\n")
+    if timeframe is Timeframe.D1:
+        sys.stdout.write("uncontrolled cells reproduce M30 exactly\n")
     return 0
 
 

@@ -19,6 +19,8 @@ from quantplatform.core.enums import MarketType, Timeframe
 from quantplatform.core.models.market import MarketBar
 from quantplatform.research.portfolio import (
     Allocation,
+    deployed,
+    normalise_to,
     simulate_portfolio,
     targets_for,
 )
@@ -285,3 +287,70 @@ def test_a_run_never_allocates_more_than_the_account(sleeves: int) -> None:
 
     assert run.final_equity > Decimal(0)
     assert run.bars_held <= run.bars
+
+
+# --- The corrected breadth probe ------------------------------------------------------------------
+# M34's probe moved breadth and position size together, so a narrower universe both concentrated
+# the book and changed how much was at work. These pin the correction: aggregate exposure equal
+# bar by bar, breadth the only thing varying.
+
+
+def test_normalising_leaves_the_deployed_total_exactly_where_it_was() -> None:
+    reference = [Decimal("0.5"), Decimal("0.25"), Decimal(0)]
+    targets = [
+        {("B2", "AA"): Decimal("0.1"), ("G1", "BB"): Decimal("0.1")},
+        {("B2", "AA"): Decimal("0.9")},
+        {("B2", "AA"): Decimal("0.4")},
+    ]
+
+    out = normalise_to(targets, reference)
+
+    assert deployed(out) == (Decimal("0.5"), Decimal("0.25"), Decimal(0))
+
+
+def test_normalising_spreads_the_same_money_over_however_many_positions_there_are() -> None:
+    # The whole point: one number at work, divided differently. Two positions get half each,
+    # four get a quarter each, and the account is equally invested either way.
+    reference = [Decimal("0.6")]
+    narrow = [{("B2", "AA"): Decimal(1), ("G1", "AA"): Decimal(1)}]
+    wide = [dict.fromkeys([("B2", "AA"), ("G1", "AA"), ("B2", "BB"), ("G1", "BB")], Decimal(1))]
+
+    thin = normalise_to(narrow, reference)
+    fat = normalise_to(wide, reference)
+
+    assert set(thin[0].values()) == {Decimal("0.3")}
+    assert set(fat[0].values()) == {Decimal("0.15")}
+    assert deployed(thin) == deployed(fat) == (Decimal("0.6"),)
+
+
+def test_a_breadth_with_no_eligible_signal_stays_in_cash() -> None:
+    # Nothing to spread the reference exposure across. Inventing a position to hit a number
+    # would be the opposite of the point, so the slot is cash and gets counted.
+    reference = [Decimal("0.5")]
+
+    assert normalise_to([{}], reference) == ({},)
+
+
+def test_normalising_to_zero_deploys_nothing() -> None:
+    assert normalise_to([{("B2", "AA"): Decimal("0.4")}], [Decimal(0)]) == ({},)
+
+
+def test_the_reference_breadth_normalises_to_itself_unchanged() -> None:
+    # The check the pre-declaration names: at the declared breadth the correction must be a
+    # no-op, because equal weights already deploy exactly the reference total. Equal to within
+    # Decimal rounding rather than bit-identical -- summing twelfths and dividing back rounds
+    # differently from writing a twelfth down, and the difference is in the 28th digit.
+    allocation = Allocation(universe_size=6, sleeves=2)
+    masks = {
+        ("B2", "AA"): [True, True],
+        ("G1", "AA"): [True, False],
+        ("B2", "BB"): [False, True],
+    }
+    targets = targets_for(masks, [frozenset({"AA", "BB"})] * 2, allocation)
+
+    same = normalise_to(targets, deployed(targets))
+
+    assert [sorted(slot) for slot in same] == [sorted(slot) for slot in targets]
+    for mine, theirs in zip(same, targets, strict=True):
+        for holding, weight in theirs.items():
+            assert abs(mine[holding] - weight) < Decimal("1e-20")

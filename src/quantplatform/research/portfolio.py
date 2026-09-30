@@ -52,6 +52,8 @@ __all__ = [
     "Holding",
     "PortfolioRun",
     "SleeveContribution",
+    "deployed",
+    "normalise_to",
     "positions",
     "simulate_portfolio",
     "targets_for",
@@ -136,6 +138,38 @@ def targets_for(
             if total > allocation.per_asset_cap:
                 wanted[holding] *= allocation.per_asset_cap / total
         out.append(wanted)
+    return tuple(out)
+
+
+def deployed(targets: Sequence[Mapping[Holding, Decimal]]) -> tuple[Decimal, ...]:
+    """Return the share of the account at work at each slot."""
+    return tuple(sum(slot.values(), start=ZERO) for slot in targets)
+
+
+def normalise_to(
+    targets: Sequence[Mapping[Holding, Decimal]],
+    reference: Sequence[Decimal],
+) -> tuple[dict[Holding, Decimal], ...]:
+    """Return ``targets`` rescaled so each slot deploys what ``reference`` says it should.
+
+    The corrected breadth probe. Holding aggregate exposure equal bar by bar leaves breadth as
+    the only thing varying between two runs -- without it, a narrower universe both concentrates
+    the book *and* changes how much of the account is at work, and the two effects cannot be told
+    apart afterwards.
+
+    A slot with no active signal stays in cash: there is nothing to spread the reference exposure
+    across, and inventing a position to match a number would be the opposite of the point. Those
+    slots are counted and reported rather than smoothed over.
+    """
+    out: list[dict[Holding, Decimal]] = []
+    for slot, wanted in enumerate(targets):
+        total = sum(wanted.values(), start=ZERO)
+        want = reference[slot] if slot < len(reference) else ZERO
+        if not wanted or total <= ZERO or want <= ZERO:
+            out.append({})
+            continue
+        share = want / Decimal(len(wanted))
+        out.append(dict.fromkeys(wanted, share))
     return tuple(out)
 
 

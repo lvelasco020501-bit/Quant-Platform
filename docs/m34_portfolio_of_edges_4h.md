@@ -126,6 +126,14 @@ descorrelacionados baten a cada uno aislado?— tiene, en riesgo/retorno, un **s
 
 ## 6. Sensibilidad — la única puerta que falla, y por qué
 
+> **CORRECCIÓN (M35).** La explicación de abajo —"libros el doble de grandes"— es demasiado
+> generosa con C. Medido correctamente, el capital **desplegado medio** sube sólo un **8%** de
+> breadth 6 a breadth 3 (21.7% → 23.4%), no el doble; lo que se dobla es el peso *por señal*
+> (1/6 vs 1/12). Con la exposición agregada mantenida constante, breadth 3 **sigue fallando**
+> (DD 42.68% frente a 46.84%): de los ~15 pp de diferencia, sólo ~4 pp eran tamaño y **~11 pp son
+> concentración**. La sonda mezclaba dos variables —eso era cierto— pero el efecto dominante era
+> el que de verdad medía. Ver `docs/m35_portfolio_validation.md` §2.
+
 | cartera | amplitud 3 | amplitud 6 (declarada) | amplitud 12 |
 |---|---|---|---|
 | A | dd **56.68%**, calmar 0.51 ❌ | dd 47.45%, calmar 0.54 | dd **39.37%**, calmar 0.80 ❌ |

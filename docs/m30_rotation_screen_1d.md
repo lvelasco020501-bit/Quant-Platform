@@ -107,13 +107,20 @@ del mejor año sobre el beneficio neto (tope 0.50) · `top activo` = cuota del m
 |---|---|---|---|---|---|
 | buy & hold BTC | +37.21% | 83.19% | 0.45 | 1 | 1.0 |
 | cesta equiponderada | +56.39% | 85.21% | 0.66 | 6 | 3.7 |
-| B1 breakout / BTC 1D (M29) | 1.47% | 2.48% | 0.59 | 91 | — |
-| G1 regime_trend / BTC 1D (M29) | 0.85% | 3.28% | 0.24 | 47 | — |
+| **B2** breakout_trend 40/20/400 / BTC 1D (M29) | 1.04% | 2.03% | 0.51 | 75 | — |
+| B1 breakout_trend 20/10/200 / BTC 1D (M29) | 1.47% | 2.48% | 0.59 | 91 | — |
+| **regime_trend** 72/72/0.30 / BTC 1D (M29) | 1.28% | 3.35% | 0.38 | 58 | — |
 
-Los dos benchmarks de M29 vienen del **motor de producción**, no de este simulador, y operan con
-sizing por stop y Risk V2. Sus cifras no son comparables barra a barra con las de arriba: miden
-una cantidad distinta (una posición dimensionada por riesgo) sobre el mismo activo. Están aquí
-porque son el incumbente, no porque la comparación sea directa.
+**B2 es la sesión en paper**, con sus parámetros exactos (40/20/400): CAGR 1.04%, DD 2.03%,
+Calmar 0.51, PF 1.97, exposición 14.8%, OOS +0.77%, y +1.04%→+0.87%→+0.74% a costes ×1/×2/×3.
+B1 se incluye porque es la variante base de la misma familia y la que M29 midió como candidata.
+
+Los tres vienen del **motor de producción**, no de este simulador, y operan con sizing por stop y
+Risk V2. Sus cifras no son comparables barra a barra con las de arriba: miden una cantidad
+distinta (una posición dimensionada por riesgo, que casi nunca está totalmente invertida) sobre un
+solo activo. Están aquí porque son el incumbente, no porque la comparación sea directa — y la
+diferencia de escala lo dice todo: el incumbente gana 1% al año con 2% de drawdown, y la rotación
+sin control gana 65% con 78%.
 
 ### Por qué falla cada regla
 

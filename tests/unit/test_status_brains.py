@@ -38,6 +38,12 @@ from quantplatform.status.model import Health, SessionStatus
 from tests.factories import SYMBOL, make_bar
 
 STARTED = datetime.now(UTC) - timedelta(hours=6)
+"""Roughly six hours ago, for the tests that only need a session to have been running a while.
+
+Deliberately *not* used by anything that counts closed candles. Read once at import, it drifts
+against the wall clock as a suite runs, so an assertion on an exact candle count built from it
+flips the moment the run crosses an hour boundary. Those tests use :func:`_started_for`, which
+is derived per call and cannot rot."""
 
 
 def _status(**overrides: object) -> SessionStatus:
@@ -444,7 +450,11 @@ def test_a_daily_session_counts_daily_closes() -> None:
 def test_the_hourly_count_is_exactly_what_it_was() -> None:
     # The regression guard for the two tests above this section: six hours in on 1h bars,
     # six closes owed. This number must not move.
-    status = _status(bars_processed=6)
+    #
+    # The start comes from _started_for rather than the module's STARTED, which is read once at
+    # import: six hours before *import* is not six hours before *now*, and this assertion used
+    # to flip to "7 / 7" whenever the suite happened to cross the top of an hour while running.
+    status = _status(started_at=_started_for(6, Timeframe.H1), bars_processed=6)
 
     coverage = _kpi(_brain(_brains(status), "market"), "bar_coverage")
 

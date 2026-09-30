@@ -33,6 +33,8 @@ from quantplatform.research.rotation import (
     align,
     basket_index,
     buy_and_hold,
+    dollar_volume,
+    eligible_universe,
     equal_weight_basket,
     exposure_for,
     max_drawdown,
@@ -639,3 +641,113 @@ def test_holding_less_still_costs_something_to_adjust() -> None:
 
     assert aware.cost_paid > Decimal(0)
     assert aware.turnover > Decimal(1)
+
+
+# --- The point-in-time universe -------------------------------------------------------------------
+# M32 adds a rule deciding which markets were investable on each date. Its whole job is to keep
+# out assets nobody could have identified at the time, so the test that matters is that a
+# high-momentum illiquid market is refused despite winning the ranking.
+
+
+def volumed(
+    symbol: str, closes: list[str], volumes: list[str], *, offset: int = 0
+) -> list[MarketBar]:
+    """Build a series with explicit per-bar volume, for liquidity ranking tests."""
+    bars = series_of(symbol, closes, offset=offset)
+    return [
+        bar.model_copy(update={"volume": Decimal(v)}) for bar, v in zip(bars, volumes, strict=True)
+    ]
+
+
+def test_dollar_volume_is_comparable_between_markets() -> None:
+    # One BTC is not one XRP, so base volume alone cannot rank two markets against each other.
+    cheap = volumed("AA", ["2", "2"], ["1000", "1000"])[0]
+    dear = volumed("BB", ["1000", "1000"], ["5", "5"])[0]
+
+    assert dollar_volume(cheap) == Decimal(2000)
+    assert dollar_volume(dear) == Decimal(5000)
+
+
+def test_a_thin_market_is_refused_however_well_it_ranks_on_momentum() -> None:
+    # The load-bearing test of the survivorship correction. The illiquid asset has by far the
+    # best momentum; a universe rule that could not exclude it would let the study hold things
+    # nobody could have bought.
+    liquid = volumed("AA", ["100", "101", "102", "103"], ["10000"] * 4)
+    thin_rocket = volumed("ZZ", ["100", "200", "400", "800"], ["1"] * 4)
+    data = {"AA": liquid, "ZZ": thin_rocket}
+
+    unrestricted = simulate(data, RotationSpec(lookback=1, hold=1), cost_basis_points=FREE)
+    restricted = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, universe_size=1, liquidity_window=2),
+        cost_basis_points=FREE,
+    )
+
+    assert {e.asset for e in unrestricted.episodes} == {"ZZ"}
+    assert {e.asset for e in restricted.episodes} == {"AA"}
+
+
+def test_the_liquidity_ranking_reads_no_bar_after_the_one_it_ranks_at() -> None:
+    # A market that becomes the most traded later must be absent from the earlier universe.
+    early = volumed("AA", ["100"] * 6, ["500"] * 6)
+    late = volumed("BB", ["100"] * 6, ["1", "1", "1", "9000", "9000", "9000"])
+    grid = align({"AA": early, "BB": late})
+    positions = {
+        "AA": tuple(range(6)),
+        "BB": tuple(range(6)),
+    }
+
+    universe = eligible_universe({"AA": early, "BB": late}, positions, window=2, size=1)
+
+    assert universe[2] == frozenset({"AA"})
+    assert universe[5] == frozenset({"BB"})
+    assert len(universe) == len(grid)
+
+
+def test_a_market_without_enough_history_is_not_yet_rankable() -> None:
+    established = volumed("AA", ["100"] * 4, ["100"] * 4)
+    newcomer = volumed("BB", ["100"] * 2, ["99999"] * 2, offset=2)
+    data = {"AA": established, "BB": newcomer}
+    positions = {"AA": (0, 1, 2, 3), "BB": (None, None, 0, 1)}
+
+    universe = eligible_universe(data, positions, window=3, size=2)
+
+    # BB has the larger volume by far and is still absent until it has three bars of its own.
+    assert "BB" not in universe[2]
+    assert "BB" not in universe[3]
+
+
+def test_one_frantic_bar_does_not_buy_a_place_in_the_universe() -> None:
+    # The ranking reads a median, so a single day of frenzied volume in an otherwise thin
+    # market cannot promote it. A mean would.
+    steady = volumed("AA", ["100"] * 5, ["100"] * 5)
+    spiky = volumed("BB", ["100"] * 5, ["1", "1", "100000", "1", "1"])
+    data = {"AA": steady, "BB": spiky}
+    positions = {"AA": tuple(range(5)), "BB": tuple(range(5))}
+
+    universe = eligible_universe(data, positions, window=5, size=1)
+
+    assert universe[4] == frozenset({"AA"})
+
+
+def test_the_universe_breaks_ties_on_symbol_so_it_is_reproducible() -> None:
+    first = volumed("AA", ["100"] * 3, ["100"] * 3)
+    second = volumed("BB", ["100"] * 3, ["100"] * 3)
+    positions = {"AA": (0, 1, 2), "BB": (0, 1, 2)}
+
+    universe = eligible_universe({"AA": first, "BB": second}, positions, window=2, size=1)
+
+    assert universe[2] == frozenset({"AA"})
+
+
+def test_leaving_the_universe_unset_is_what_m30_and_m31_ran() -> None:
+    # The corrected universe must be an addition, not a silent change to the runs already
+    # published. With universe_size unset every market with enough history stays rankable.
+    data = {
+        "AA": volumed("AA", ["100", "110", "120"], ["1", "1", "1"]),
+        "BB": volumed("BB", ["100", "105", "110"], ["9999", "9999", "9999"]),
+    }
+
+    plain = simulate(data, RotationSpec(lookback=1, hold=1), cost_basis_points=FREE)
+
+    assert {e.asset for e in plain.episodes} == {"AA"}

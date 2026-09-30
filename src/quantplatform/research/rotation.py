@@ -61,6 +61,8 @@ __all__ = [
     "align",
     "basket_index",
     "buy_and_hold",
+    "dollar_volume",
+    "eligible_universe",
     "equal_weight_basket",
     "exposure_for",
     "max_drawdown",
@@ -196,6 +198,63 @@ def _move(bars: Sequence[MarketBar], slots: Sequence[int | None], slot: int) -> 
         return None
     earlier = bars[before].close
     return None if earlier == ZERO else bars[here].close / earlier - ONE
+
+
+# --- The point-in-time universe ------------------------------------------------------------------
+
+
+def dollar_volume(bar: MarketBar) -> Decimal:
+    """Return one bar's traded value in quote currency.
+
+    ``volume * close``, because the canonical CSV this project has written since M10c carries
+    base-asset volume and no quote volume. Base volume alone is not comparable between markets
+    -- one BTC is not one XRP -- and the product is, which is what a cross-market liquidity
+    ranking needs.
+    """
+    return bar.volume * bar.close
+
+
+def eligible_universe(
+    series: Series,
+    positions: Mapping[str, Sequence[int | None]],
+    *,
+    window: int,
+    size: int,
+) -> tuple[frozenset[str], ...]:
+    """Return, per grid slot, which markets were among the ``size`` most traded.
+
+    This is what stops a study from holding assets nobody could have identified as investable
+    at the time. The ranking reads the trailing median of :func:`dollar_volume` over ``window``
+    bars ending at that slot -- median rather than mean so that a single day of frenzied volume
+    in an otherwise thin market does not buy it a place -- and uses no bar after it. A market
+    with fewer than ``window`` bars of its own history is not yet rankable and is absent.
+
+    Ties break on symbol so the universe is reproducible, the same rule the score ranking uses.
+    """
+    assets = list(series)
+    values: dict[str, list[Decimal | None]] = {}
+    for asset in assets:
+        bars = series[asset]
+        column: list[Decimal | None] = []
+        history: list[Decimal] = []
+        for slot in positions[asset]:
+            if slot is not None:
+                history.append(dollar_volume(bars[slot]))
+            column.append(median(history[-window:]) if len(history) >= window else None)
+        values[asset] = column
+    out: list[frozenset[str]] = []
+    for index in range(len(next(iter(positions.values())))):
+        ranked = sorted(
+            (
+                (value, asset)
+                for asset in assets
+                if (value := values[asset][index]) is not None
+                and positions[asset][index] is not None
+            ),
+            key=lambda pair: (-pair[0], pair[1]),
+        )
+        out.append(frozenset(asset for _, asset in ranked[:size]))
+    return tuple(out)
 
 
 # --- Scores, computed by the production pipeline -------------------------------------------------
@@ -492,6 +551,12 @@ class RotationSpec:
     makes a buy-and-hold benchmark buy-and-hold."""
     exposure: ExposurePolicy = field(default_factory=ExposurePolicy)
     """How much of the account to put behind the signals. Never which signals."""
+    universe_size: int | None = None
+    """When set, only the this-many most-traded markets at each bar may be ranked, by trailing
+    median dollar volume. ``None`` leaves every market with enough history rankable, which is
+    what M30 and M31 ran."""
+    liquidity_window: int = 72
+    """Bars the liquidity ranking looks back over."""
 
 
 @dataclass(frozen=True)
@@ -510,6 +575,8 @@ class _Plan:
     start: datetime | None
     rebalance_on_entry_only: bool
     exposure: ExposurePolicy
+    universe: Sequence[frozenset[str]]
+    """Which markets are rankable at each slot, empty when every market always is."""
     volatility: Sequence[Decimal | None]
     """The aggregate's realised volatility at each slot, empty when nothing reads it."""
     median_volatility: Sequence[Decimal | None]
@@ -570,6 +637,16 @@ def simulate(
         needs_levels = spec.regime_filter is not None or window is not None
         levels = basket_index(series, grid) if needs_levels else ()
         vols, medians = _volatility_columns(levels, window) if window is not None else ((), ())
+        universe = (
+            eligible_universe(
+                series,
+                positions,
+                window=spec.liquidity_window,
+                size=spec.universe_size,
+            )
+            if spec.universe_size is not None
+            else ()
+        )
         return _walk(
             _Plan(
                 series=series,
@@ -590,6 +667,7 @@ def simulate(
                 start=start,
                 rebalance_on_entry_only=spec.rebalance_on_entry_only,
                 exposure=spec.exposure,
+                universe=universe,
                 volatility=vols,
                 median_volatility=medians,
             )
@@ -622,8 +700,11 @@ def _target(plan: _Plan, slot: int, actual: Mapping[str, Decimal]) -> dict[str, 
     """Return the weights the rule wants to hold over the bar after ``slot``."""
     if plan.regime_filter is not None and not _above_average(plan.levels, slot, plan.regime_filter):
         return {}
+    investable = plan.universe[slot] if plan.universe else None
     eligible: list[tuple[str, Decimal]] = []
     for asset in plan.series:
+        if investable is not None and asset not in investable:
+            continue
         score = plan.scores[asset][slot]
         tradeable = slot + 1 < len(plan.grid) and plan.positions[asset][slot + 1] is not None
         if score is not None and tradeable:

@@ -35,10 +35,13 @@ spends flat are counted and reported. Sitting out is a decision the gate gets to
 
 from __future__ import annotations
 
+from bisect import insort
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, localcontext
+from itertools import pairwise
+from statistics import median
 from typing import TYPE_CHECKING, Final
 
 from quantplatform.core.models.base import DomainModel, Text, UtcDatetime
@@ -51,6 +54,7 @@ __all__ = [
     "AssetContribution",
     "Episode",
     "EquityPoint",
+    "ExposurePolicy",
     "RotationRun",
     "RotationSpec",
     "Series",
@@ -58,6 +62,7 @@ __all__ = [
     "basket_index",
     "buy_and_hold",
     "equal_weight_basket",
+    "exposure_for",
     "max_drawdown",
     "pairwise_correlation",
     "profit_factor",
@@ -283,6 +288,40 @@ def basket_index(series: Series, grid: Sequence[datetime]) -> tuple[Decimal | No
     return tuple(out)
 
 
+def _volatility_columns(
+    levels: Sequence[Decimal | None], window: int
+) -> tuple[tuple[Decimal | None, ...], tuple[Decimal | None, ...]]:
+    """Return the aggregate's realised volatility per slot, and its causal running median.
+
+    Volatility is the population standard deviation of the index's bar-to-bar moves over
+    ``window`` bars, the same definition ``rvol_<n>`` computes on a price series. The median
+    beside it is taken over observations up to and including that slot and never beyond, so a
+    volatility target built from it knows nothing the tape had not already shown.
+    """
+    moves: list[Decimal | None] = [None]
+    for before, here in pairwise(levels):
+        moves.append(
+            None if before is None or here is None or before == ZERO else here / before - ONE
+        )
+    vols: list[Decimal | None] = []
+    medians: list[Decimal | None] = []
+    seen: list[Decimal] = []
+    for slot in range(len(levels)):
+        recent = moves[slot + 1 - window : slot + 1] if slot + 1 >= window else []
+        if recent and all(move is not None for move in recent):
+            values = [move for move in recent if move is not None]
+            mean = sum(values, start=ZERO) / Decimal(len(values))
+            vol = (
+                sum(((value - mean) ** 2 for value in values), start=ZERO) / Decimal(len(values))
+            ).sqrt()
+            vols.append(vol)
+            insort(seen, vol)
+        else:
+            vols.append(None)
+        medians.append(median(seen) if seen else None)
+    return tuple(vols), tuple(medians)
+
+
 def _above_average(levels: Sequence[Decimal | None], slot: int, window: int) -> bool:
     """Return whether the index sits above the mean of its own last ``window`` levels.
 
@@ -331,6 +370,99 @@ def weights_for(
 
 
 @dataclass(frozen=True)
+class ExposurePolicy:
+    """How much of the account a rule is allowed to have at risk, and never which asset.
+
+    The overlay is deliberately separate from the ranking. A rule's signals decide *what* is
+    held; this decides *how much*, and the two cannot reach into each other -- which is the
+    only way to ask "can this drawdown be controlled without touching the edge?" and get an
+    answer that means anything.
+
+    At most one mechanism may be set. Stacking two would produce a result no single mechanism
+    explains, and there would be no way to say which one earned it.
+    """
+
+    fixed: Decimal | None = None
+    """Constant share of the account at risk, the rest in cash."""
+    volatility_window: int | None = None
+    """Bars the aggregate's realised volatility is measured over. When set, exposure is the
+    trailing median of that volatility divided by its current value, capped at one: full risk
+    in a typically calm tape, less than full when the tape is rougher than it has usually
+    been. The median is taken over observations up to the current bar only, so it uses no
+    information from the future and needs no threshold chosen by anyone."""
+    drawdown_power: int | None = None
+    """Exponent on remaining capital: exposure is ``(1 - drawdown) ** power``. The peak it is
+    measured from is a running maximum that never resets, so recovering re-risks only to the
+    extent the account has actually recovered. Parameter-free apart from the exponent, and
+    no level anywhere for a threshold to be chosen at."""
+
+    def __post_init__(self) -> None:
+        """Reject a policy that sets more than one mechanism, or a nonsensical level.
+
+        Raises:
+            ValueError: If two mechanisms are set at once, or a fixed exposure is outside
+                ``(0, 1]`` -- above one would be leverage, which is excluded by instruction.
+        """
+        chosen = [
+            name
+            for name, value in (
+                ("fixed", self.fixed),
+                ("volatility_window", self.volatility_window),
+                ("drawdown_power", self.drawdown_power),
+            )
+            if value is not None
+        ]
+        if len(chosen) > 1:
+            msg = f"an exposure policy sets one mechanism, not {chosen}"
+            raise ValueError(msg)
+        if self.fixed is not None and not (ZERO < self.fixed <= ONE):
+            msg = "a fixed exposure lies in (0, 1]: above one is leverage"
+            raise ValueError(msg)
+
+    @property
+    def controlled(self) -> bool:
+        """Return whether this policy does anything at all."""
+        return (
+            self.fixed is not None
+            or self.volatility_window is not None
+            or self.drawdown_power is not None
+        )
+
+
+def exposure_for(
+    policy: ExposurePolicy,
+    *,
+    drawdown: Decimal,
+    volatility: Decimal | None,
+    median_volatility: Decimal | None,
+) -> Decimal:
+    """Return the share of the account this policy puts at risk right now, in ``[0, 1]``.
+
+    Args:
+        policy: The declared mechanism.
+        drawdown: Current fall from the running peak, as a positive fraction.
+        volatility: The aggregate's realised volatility at this bar, or ``None`` if its window
+            does not yet fit.
+        median_volatility: Median of every volatility observed up to and including this bar.
+
+    Returns:
+        One for an uncontrolled policy. For volatility targeting, one while the measurement is
+        unavailable -- an unmeasured tape is not evidence of a rough one, and guessing either
+        way would be a decision the data has not supported yet.
+    """
+    if policy.fixed is not None:
+        return policy.fixed
+    if policy.volatility_window is not None:
+        if volatility is None or median_volatility is None or volatility <= ZERO:
+            return ONE
+        return min(ONE, median_volatility / volatility)
+    if policy.drawdown_power is not None:
+        remaining = max(ZERO, ONE - drawdown)
+        return remaining**policy.drawdown_power
+    return ONE
+
+
+@dataclass(frozen=True)
 class RotationSpec:
     """One rotation rule's mechanics, as a record rather than nine call arguments.
 
@@ -353,6 +485,8 @@ class RotationSpec:
     rebalance_on_entry_only: bool = False
     """Equalise weights only when the held set changes, letting them drift otherwise. What
     makes a buy-and-hold benchmark buy-and-hold."""
+    exposure: ExposurePolicy = field(default_factory=ExposurePolicy)
+    """How much of the account to put behind the signals. Never which signals."""
 
 
 @dataclass(frozen=True)
@@ -370,6 +504,11 @@ class _Plan:
     rate: Decimal
     start: datetime | None
     rebalance_on_entry_only: bool
+    exposure: ExposurePolicy
+    volatility: Sequence[Decimal | None]
+    """The aggregate's realised volatility at each slot, empty when nothing reads it."""
+    median_volatility: Sequence[Decimal | None]
+    """The median of every volatility observed up to each slot -- causal by construction."""
     """When set, weights are only equalised as assets join the universe and left to drift
     otherwise -- the buy-and-hold basket, whose whole point is that it does not trade."""
 
@@ -420,8 +559,12 @@ def simulate(
     """
     grid = align(series)
     positions = _positions(series, grid)
+    window = spec.exposure.volatility_window
     with localcontext() as ctx:
         ctx.prec = WORKING_PRECISION
+        needs_levels = spec.regime_filter is not None or window is not None
+        levels = basket_index(series, grid) if needs_levels else ()
+        vols, medians = _volatility_columns(levels, window) if window is not None else ((), ())
         return _walk(
             _Plan(
                 series=series,
@@ -434,15 +577,40 @@ def simulate(
                     vol_window=spec.vol_window,
                     normalised=spec.normalised,
                 ),
-                levels=basket_index(series, grid) if spec.regime_filter is not None else (),
+                levels=levels,
                 hold=spec.hold,
                 threshold=spec.threshold,
                 regime_filter=spec.regime_filter,
                 rate=cost_basis_points / BASIS,
                 start=start,
                 rebalance_on_entry_only=spec.rebalance_on_entry_only,
+                exposure=spec.exposure,
+                volatility=vols,
+                median_volatility=medians,
             )
         )
+
+
+def _scaled(
+    plan: _Plan, slot: int, wanted: dict[str, Decimal], drawdown: Decimal
+) -> dict[str, Decimal]:
+    """Return the signal's weights scaled by the declared exposure, the remainder in cash.
+
+    The scaling happens *after* the ranking has chosen, and it cannot reorder or replace a
+    choice -- which is what lets M31 ask whether the drawdown is controllable without touching
+    the edge, and get an answer about exposure alone.
+    """
+    if not plan.exposure.controlled or not wanted:
+        return wanted
+    share = exposure_for(
+        plan.exposure,
+        drawdown=drawdown,
+        volatility=plan.volatility[slot] if plan.volatility else None,
+        median_volatility=plan.median_volatility[slot] if plan.median_volatility else None,
+    )
+    if share <= ZERO:
+        return {}
+    return {asset: weight * share for asset, weight in wanted.items()}
 
 
 def _target(plan: _Plan, slot: int, actual: Mapping[str, Decimal]) -> dict[str, Decimal]:
@@ -473,10 +641,17 @@ def _walk(plan: _Plan) -> RotationRun:
         bars_of=dict.fromkeys(plan.series, 0),
         counts=dict.fromkeys(plan.series, 0),
     )
+    peak = INITIAL_EQUITY
     for slot in range(len(plan.grid) - 1):
         if plan.start is not None and plan.grid[slot] < plan.start:
             continue
-        _rebalance(plan, book, slot, _target(plan, slot, book.actual))
+        # A running maximum that never resets: recovering re-risks only as far as the account
+        # has actually recovered, which is what "do not reset references" asks for.
+        peak = max(peak, book.equity)
+        drawdown = (peak - book.equity) / peak if peak > ZERO else ZERO
+        _rebalance(
+            plan, book, slot, _scaled(plan, slot, _target(plan, slot, book.actual), drawdown)
+        )
         book.bars += 1
         if book.actual:
             book.bars_held += 1

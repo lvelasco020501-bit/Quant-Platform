@@ -28,11 +28,13 @@ from quantplatform.features.indicators import IndicatorFeatures
 from quantplatform.research.rotation import (
     INITIAL_EQUITY,
     EquityPoint,
+    ExposurePolicy,
     RotationSpec,
     align,
     basket_index,
     buy_and_hold,
     equal_weight_basket,
+    exposure_for,
     max_drawdown,
     pairwise_correlation,
     profit_factor,
@@ -472,3 +474,168 @@ def test_a_run_never_allocates_more_than_the_whole_account(hold: int) -> None:
 
     assert run.final_equity > Decimal(0)
     assert run.bars_held <= run.bars
+
+
+# --- The exposure overlay -------------------------------------------------------------------------
+# M31 adds a layer that decides how much capital stands behind the signals. The property that
+# makes the whole milestone answerable is that it cannot decide *which* signals, so that is the
+# first test here and the one that would invalidate the rest.
+
+
+def _exposure(
+    policy: ExposurePolicy, dd: str = "0", vol: str | None = None, med: str | None = None
+) -> Decimal:
+    return exposure_for(
+        policy,
+        drawdown=Decimal(dd),
+        volatility=None if vol is None else Decimal(vol),
+        median_volatility=None if med is None else Decimal(med),
+    )
+
+
+def test_exposure_cannot_change_which_asset_is_held() -> None:
+    # Three assets with distinct momentum. Whatever the exposure, the sequence of assets the
+    # rule picks must be identical: the overlay scales a decision, it does not make one.
+    data = {
+        "AA": series_of("AA", ["100", "120", "90", "150", "140", "190"]),
+        "BB": series_of("BB", ["100", "95", "160", "120", "180", "130"]),
+        "CC": series_of("CC", ["100", "105", "102", "108", "104", "112"]),
+    }
+    spec = RotationSpec(lookback=1, hold=1)
+    full = simulate(data, spec, cost_basis_points=FREE)
+    quarter = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(fixed=Decimal("0.25"))),
+        cost_basis_points=FREE,
+    )
+    shrinking = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(drawdown_power=2)),
+        cost_basis_points=FREE,
+    )
+
+    picks = [e.asset for e in full.episodes]
+    assert [e.asset for e in quarter.episodes] == picks
+    assert [e.asset for e in shrinking.episodes] == picks
+
+
+def test_an_uncontrolled_policy_changes_nothing() -> None:
+    data = {"AA": series_of("AA", ["100", "120", "90", "150"])}
+    plain = simulate(data, RotationSpec(lookback=1, hold=1), cost_basis_points=COSTLY)
+    explicit = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy()),
+        cost_basis_points=COSTLY,
+    )
+
+    assert plain == explicit
+
+
+def test_a_fixed_exposure_scales_the_path_by_exactly_that_share() -> None:
+    # Two +100% bars at half exposure, re-equalised each bar: 1 -> 1.5 -> 2.25. Not 4x, and not
+    # half of 4x either -- the arithmetic of a partially invested account is its own thing.
+    data = {"AA": series_of("AA", ["100", "100", "200", "400"])}
+
+    run = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(fixed=Decimal("0.5"))),
+        cost_basis_points=FREE,
+    )
+
+    assert run.final_equity == INITIAL_EQUITY * Decimal("2.25")
+
+
+def test_a_drawdown_aware_policy_de_risks_into_a_fall() -> None:
+    # Halving three times. Uncontrolled the account ends at 12.5% of capital; shrinking
+    # exposure as the drawdown deepens must leave materially more of it.
+    data = {"AA": series_of("AA", ["100", "100", "50", "25", "12.5"])}
+    spec = RotationSpec(lookback=1, hold=1)
+
+    plain = simulate(data, spec, cost_basis_points=FREE)
+    aware = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(drawdown_power=1)),
+        cost_basis_points=FREE,
+    )
+
+    assert aware.final_equity > plain.final_equity
+    assert max_drawdown(aware.equity_curve) < max_drawdown(plain.equity_curve)
+
+
+def test_a_steeper_drawdown_response_de_risks_harder() -> None:
+    data = {"AA": series_of("AA", ["100", "100", "50", "25", "12.5"])}
+    linear = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(drawdown_power=1)),
+        cost_basis_points=FREE,
+    )
+    quadratic = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(drawdown_power=2)),
+        cost_basis_points=FREE,
+    )
+
+    assert quadratic.final_equity > linear.final_equity
+
+
+def test_the_drawdown_reference_never_resets() -> None:
+    # A peak reached once governs forever. If the reference crept up to a local high after a
+    # fall, the rule would re-risk into a recovery it had not made, which is the failure mode
+    # "no resetear referencias" names.
+    assert _exposure(ExposurePolicy(drawdown_power=1), dd="0.5") == Decimal("0.5")
+    assert _exposure(ExposurePolicy(drawdown_power=1), dd="0") == Decimal(1)
+    assert _exposure(ExposurePolicy(drawdown_power=2), dd="0.5") == Decimal("0.25")
+    assert _exposure(ExposurePolicy(drawdown_power=1), dd="1") == Decimal(0)
+
+
+def test_volatility_targeting_holds_full_size_in_a_typically_calm_tape() -> None:
+    policy = ExposurePolicy(volatility_window=3)
+
+    assert _exposure(policy, vol="0.02", med="0.04") == Decimal(1)
+    assert _exposure(policy, vol="0.04", med="0.04") == Decimal(1)
+
+
+def test_volatility_targeting_cuts_size_when_the_tape_is_rougher_than_usual() -> None:
+    policy = ExposurePolicy(volatility_window=3)
+
+    assert _exposure(policy, vol="0.08", med="0.04") == Decimal("0.5")
+
+
+def test_volatility_targeting_does_not_guess_before_it_can_measure() -> None:
+    # An unmeasured tape is not evidence of a rough one. Assuming either way would be a
+    # decision the data has not supported yet.
+    policy = ExposurePolicy(volatility_window=3)
+
+    assert _exposure(policy, vol=None, med="0.04") == Decimal(1)
+    assert _exposure(policy, vol="0.04", med=None) == Decimal(1)
+
+
+def test_a_policy_sets_one_mechanism_and_not_two() -> None:
+    # Two at once would produce a result no single mechanism explains, and no way to say which
+    # one earned it.
+    with pytest.raises(ValueError, match="one mechanism"):
+        ExposurePolicy(fixed=Decimal("0.5"), drawdown_power=1)
+    with pytest.raises(ValueError, match="one mechanism"):
+        ExposurePolicy(volatility_window=72, drawdown_power=1)
+
+
+def test_a_fixed_exposure_above_one_is_leverage_and_is_refused() -> None:
+    with pytest.raises(ValueError, match="leverage"):
+        ExposurePolicy(fixed=Decimal("1.5"))
+    with pytest.raises(ValueError, match="leverage"):
+        ExposurePolicy(fixed=Decimal(0))
+
+
+def test_holding_less_still_costs_something_to_adjust() -> None:
+    # De-risking is a trade. A mechanism that reduced exposure for free would flatter every
+    # variant in M31.
+    data = {"AA": series_of("AA", ["100", "100", "50", "25", "12.5"])}
+
+    aware = simulate(
+        data,
+        RotationSpec(lookback=1, hold=1, exposure=ExposurePolicy(drawdown_power=1)),
+        cost_basis_points=COSTLY,
+    )
+
+    assert aware.cost_paid > Decimal(0)
+    assert aware.turnover > Decimal(1)

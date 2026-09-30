@@ -149,6 +149,36 @@ _EVERY_CONFIGURATION: tuple[tuple[str, dict[str, object]], ...] = (
         "vol_filtered_momentum",
         {"lookback": 72, "short_vol": 24, "long_vol": 168, "max_ratio": "1.5"},
     ),
+    (
+        "bb_squeeze",
+        {
+            "short_window": 24,
+            "long_window": 168,
+            "entry_lookback": 20,
+            "exit_lookback": 10,
+            "max_compression": "1",
+        },
+    ),
+    (
+        "vol_compression",
+        {
+            "short_vol": 24,
+            "long_vol": 168,
+            "entry_lookback": 20,
+            "exit_lookback": 10,
+            "max_compression": "1",
+        },
+    ),
+    (
+        "range_compression",
+        {
+            "short_window": 24,
+            "long_window": 168,
+            "entry_lookback": 20,
+            "exit_lookback": 10,
+            "max_compression": "1",
+        },
+    ),
 )
 
 

@@ -50,17 +50,20 @@ __all__ = [
     "MULTI_TIMEFRAME_BENCHMARKS",
     "RESEARCH_STRATEGIES",
     "BollingerReversionStrategy",
+    "BollingerSqueezeBreakoutStrategy",
     "BreakoutMultiTimeframe",
     "EmaSlopeStrategy",
     "EmaTrendMultiTimeframe",
     "MomentumStrategy",
     "ParametricStrategy",
+    "RangeCompressionBreakoutStrategy",
     "RegimeReversionStrategy",
     "RegimeSwitchStrategy",
     "RegimeTrendStrategy",
     "RsiReversalStrategy",
     "VolFilteredMomentumStrategy",
     "VolScaledMomentumStrategy",
+    "VolatilityCompressionBreakoutStrategy",
     "ZScoreReversionStrategy",
     "build_research_registry",
 ]
@@ -625,6 +628,279 @@ MULTI_TIMEFRAME_BENCHMARKS: Final[tuple[type[BaseStrategy], ...]] = (
 """Research copies of the benchmarks. Registered for research only, never for paper."""
 
 
+# --- Volatility compression / expansion -------------------------------------------------------
+#
+# One hypothesis, three ways of measuring it: that the moves worth having begin when a quiet
+# market stops being quiet. Each rule watches a different quantity go still -- the width of a
+# Bollinger band, the volatility of returns, the realised trading range -- and none of them
+# trades the stillness. They trade the breakout that follows it, on the same Donchian leg
+# ``breakout`` has used since M13, so a difference between the three is a difference in what
+# compression *is* and not in how a position is opened.
+#
+# Every statistic is divided by what a random walk would produce for the same pair of windows,
+# so the threshold means the same thing in all three rules: at 1.0 the market is exactly as
+# still as drift-free noise, and below 1.0 it is stiller than that. Price dispersion and
+# realised range both grow with the square root of the window, so their ratio is scaled by
+# ``sqrt(short / long)``; the volatility of one-bar returns does not grow with the window at
+# all -- both windows estimate the same per-bar quantity -- so its ratio needs no scaling. That
+# asymmetry is arithmetic rather than judgement, which is the point of doing it this way.
+
+
+Compression = Annotated[Decimal, Field(gt=0, le=1)]
+"""How still a market must be before a breakout counts, as a multiple of random-walk stillness.
+
+Capped at one because a threshold above it would admit a market noisier than noise, which is
+the filter switched off rather than loosened.
+"""
+
+
+def _random_walk_scale(short: int, long_: int) -> Decimal:
+    """Return the ratio a square-root-of-time statistic has between two window lengths."""
+    return (Decimal(short) / Decimal(long_)).sqrt()
+
+
+class _CompressionParameters(BaseModel):
+    """The shape every compression rule shares: two windows, a breakout leg, a threshold."""
+
+    model_config = FROZEN
+    entry_lookback: Window
+    exit_lookback: Window
+    max_compression: Compression
+
+
+class BollingerSqueezeParameters(_CompressionParameters):
+    """Parameters for :class:`BollingerSqueezeBreakoutStrategy`."""
+
+    short_window: Window
+    long_window: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.short_window >= self.long_window:
+            msg = "short_window must be shorter than long_window"
+            raise ValueError(msg)
+        return self
+
+
+class BollingerSqueezeBreakoutStrategy(ParametricStrategy):
+    """Buys a breakout out of a Bollinger band that had gone unusually narrow."""
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "bb_squeeze",
+        "Bollinger squeeze breakout",
+        "Long-only: enters when the current bar's high breaks the prior N-bar high while "
+        "Bollinger bandwidth over the short window sits at or below max_compression times the "
+        "bandwidth a random walk would give against the long window; exits on a new M-bar low.",
+        BollingerSqueezeParameters,
+        ("stdev_24", "sma_24", "stdev_168", "sma_168", "donchian_high_20", "donchian_low_10"),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return the dispersion, mean and channel features this configuration reads."""
+        p = self._typed(BollingerSqueezeParameters)
+        return (
+            f"stdev_{p.short_window}",
+            f"sma_{p.short_window}",
+            f"stdev_{p.long_window}",
+            f"sma_{p.long_window}",
+            f"donchian_high_{p.entry_lookback}",
+            f"donchian_low_{p.exit_lookback}",
+        )
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter on a breakout out of a squeeze; exit on a new low."""
+        p = self._typed(BollingerSqueezeParameters)
+        if context.position_state is PositionState.FLAT:
+            names = (
+                f"stdev_{p.short_window}",
+                f"sma_{p.short_window}",
+                f"stdev_{p.long_window}",
+                f"sma_{p.long_window}",
+                f"donchian_high_{p.entry_lookback}",
+            )
+            values = self._read(context, *names)
+            if values is None:
+                return ()
+            short_dev, short_mean, long_dev, long_mean, level = values
+            # The band multiplier cancels in a ratio of two bandwidths, which is why this rule
+            # needs no band_z at all: a squeeze is a statement about width, not about sigmas.
+            if short_mean <= 0 or long_mean <= 0 or long_dev <= 0:
+                return ()
+            bandwidth = (short_dev / short_mean) / (long_dev / long_mean)
+            squeeze = bandwidth / _random_walk_scale(p.short_window, p.long_window)
+            if squeeze <= p.max_compression and context.latest_bar.high > level:
+                return self._enter(
+                    context,
+                    f"high {context.latest_bar.high} broke {level} out of a "
+                    f"{squeeze} bandwidth squeeze",
+                    dict(zip(names, values, strict=True)),
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            name = f"donchian_low_{p.exit_lookback}"
+            values = self._read(context, name)
+            if values is not None and context.latest_bar.low < values[0]:
+                return self._exit(
+                    context, f"low {context.latest_bar.low} broke {values[0]}", {name: values[0]}
+                )
+        return ()
+
+
+class VolatilityCompressionParameters(_CompressionParameters):
+    """Parameters for :class:`VolatilityCompressionBreakoutStrategy`."""
+
+    short_vol: Window
+    long_vol: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.short_vol >= self.long_vol:
+            msg = "short_vol must be shorter than long_vol"
+            raise ValueError(msg)
+        return self
+
+
+class VolatilityCompressionBreakoutStrategy(ParametricStrategy):
+    """Buys a breakout out of a lull in realised volatility."""
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "vol_compression",
+        "Volatility compression breakout",
+        "Long-only: enters when the current bar's high breaks the prior N-bar high while "
+        "short-window realised volatility sits at or below max_compression times the "
+        "long-window one; exits on a new M-bar low.",
+        VolatilityCompressionParameters,
+        ("volratio_24_168", "donchian_high_20", "donchian_low_10"),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return the volatility-ratio and channel features this configuration reads."""
+        p = self._typed(VolatilityCompressionParameters)
+        return (
+            f"volratio_{p.short_vol}_{p.long_vol}",
+            f"donchian_high_{p.entry_lookback}",
+            f"donchian_low_{p.exit_lookback}",
+        )
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter on a breakout out of a volatility lull; exit on a new low."""
+        p = self._typed(VolatilityCompressionParameters)
+        if context.position_state is PositionState.FLAT:
+            ratio_name = f"volratio_{p.short_vol}_{p.long_vol}"
+            entry_name = f"donchian_high_{p.entry_lookback}"
+            values = self._read(context, ratio_name, entry_name)
+            if values is None:
+                return ()
+            ratio, level = values
+            # No scaling: both windows estimate the same per-bar volatility, so their ratio is
+            # already one when the market is behaving like drift-free noise.
+            if ratio <= p.max_compression and context.latest_bar.high > level:
+                return self._enter(
+                    context,
+                    f"high {context.latest_bar.high} broke {level} out of a "
+                    f"{ratio} volatility compression",
+                    {ratio_name: ratio, entry_name: level},
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            name = f"donchian_low_{p.exit_lookback}"
+            values = self._read(context, name)
+            if values is not None and context.latest_bar.low < values[0]:
+                return self._exit(
+                    context, f"low {context.latest_bar.low} broke {values[0]}", {name: values[0]}
+                )
+        return ()
+
+
+class RangeCompressionParameters(_CompressionParameters):
+    """Parameters for :class:`RangeCompressionBreakoutStrategy`."""
+
+    short_window: Window
+    long_window: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.short_window >= self.long_window:
+            msg = "short_window must be shorter than long_window"
+            raise ValueError(msg)
+        return self
+
+
+class RangeCompressionBreakoutStrategy(ParametricStrategy):
+    """Buys a breakout out of a trading range that had gone unusually tight."""
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "range_compression",
+        "Range compression breakout",
+        "Long-only: enters when the current bar's high breaks the prior N-bar high while the "
+        "short-window high-low range sits at or below max_compression times the range a random "
+        "walk would give against the long window; exits on a new M-bar low.",
+        RangeCompressionParameters,
+        (
+            "donchian_high_24",
+            "donchian_low_24",
+            "donchian_high_168",
+            "donchian_low_168",
+            "donchian_high_20",
+            "donchian_low_10",
+        ),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return the two measured channels plus the breakout leg's own."""
+        p = self._typed(RangeCompressionParameters)
+        names = (
+            f"donchian_high_{p.short_window}",
+            f"donchian_low_{p.short_window}",
+            f"donchian_high_{p.long_window}",
+            f"donchian_low_{p.long_window}",
+            f"donchian_high_{p.entry_lookback}",
+            f"donchian_low_{p.exit_lookback}",
+        )
+        # A configuration whose windows coincide with its breakout leg would name the same
+        # feature twice; the contract is a set of names, so it is deduplicated here rather
+        # than left to surprise the engine's check.
+        return tuple(dict.fromkeys(names))
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter on a breakout out of a tight range; exit on a new low."""
+        p = self._typed(RangeCompressionParameters)
+        if context.position_state is PositionState.FLAT:
+            names = (
+                f"donchian_high_{p.short_window}",
+                f"donchian_low_{p.short_window}",
+                f"donchian_high_{p.long_window}",
+                f"donchian_low_{p.long_window}",
+                f"donchian_high_{p.entry_lookback}",
+            )
+            values = self._read(context, *names)
+            if values is None:
+                return ()
+            short_high, short_low, long_high, long_low, level = values
+            wide = long_high - long_low
+            if wide <= 0:
+                return ()
+            tightness = ((short_high - short_low) / wide) / _random_walk_scale(
+                p.short_window, p.long_window
+            )
+            if tightness <= p.max_compression and context.latest_bar.high > level:
+                return self._enter(
+                    context,
+                    f"high {context.latest_bar.high} broke {level} out of a "
+                    f"{tightness} range compression",
+                    dict(zip(names, values, strict=True)),
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            name = f"donchian_low_{p.exit_lookback}"
+            values = self._read(context, name)
+            if values is not None and context.latest_bar.low < values[0]:
+                return self._exit(
+                    context, f"low {context.latest_bar.low} broke {values[0]}", {name: values[0]}
+                )
+        return ()
+
+
 RESEARCH_STRATEGIES: Final[tuple[type[ParametricStrategy], ...]] = (
     MomentumStrategy,
     EmaSlopeStrategy,
@@ -636,8 +912,12 @@ RESEARCH_STRATEGIES: Final[tuple[type[ParametricStrategy], ...]] = (
     RegimeReversionStrategy,
     RegimeSwitchStrategy,
     VolFilteredMomentumStrategy,
+    BollingerSqueezeBreakoutStrategy,
+    VolatilityCompressionBreakoutStrategy,
+    RangeCompressionBreakoutStrategy,
 )
-"""Every M13 research strategy. Deliberately not :data:`BUILTIN_STRATEGIES`."""
+"""Every research strategy: M13's ten, plus M33's three compression rules. Deliberately not
+:data:`BUILTIN_STRATEGIES` -- nothing here is available to paper trading."""
 
 
 def build_research_registry() -> StrategyRegistry:

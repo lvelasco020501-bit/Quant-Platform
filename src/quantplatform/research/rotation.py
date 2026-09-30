@@ -280,6 +280,12 @@ def _scores(
     vol_name = f"rvol_{vol_window}"
     pipeline = IndicatorFeatures([roc_name, vol_name] if normalised else [roc_name])
     root = Decimal(lookback).sqrt()
+    # A score is only a score if its window is contiguous in *time*, not merely in index. FTT
+    # was halted on Binance for 311 days after FTX failed; its bars either side of that hole
+    # are adjacent in the file, so a 72-bar return across the seam would silently be a 383-day
+    # return. Any asset that lists, is suspended, or is delisted and relisted has the same
+    # shape, so the requirement is enforced for all of them rather than patched per market.
+    span = max(lookback, vol_window if normalised else 0)
     # compute() reads only the last `required_history` bars of whatever it is handed, so it is
     # handed exactly those. Slicing from the start of the series instead would copy a list that
     # grows with the run, making score computation quadratic in history length -- 6x the bars
@@ -289,7 +295,7 @@ def _scores(
     for asset, bars in series.items():
         out[asset] = tuple(
             None
-            if slot is None
+            if slot is None or not _contiguous(bars, slot, span)
             else _one_score(
                 pipeline.compute(bars[max(0, slot + 1 - depth) : slot + 1]),
                 roc_name=roc_name,
@@ -300,6 +306,21 @@ def _scores(
             for slot in positions[asset]
         )
     return out
+
+
+def _contiguous(bars: Sequence[MarketBar], slot: int, span: int) -> bool:
+    """Return whether the ``span`` bars ending at ``slot`` are adjacent in calendar time.
+
+    Checked on the endpoints rather than every step: the series is already known to be in
+    ascending order with one bar per open time, so a hole anywhere inside the window shows up
+    as a shortfall between its ends.
+    """
+    if span <= 0:
+        return True
+    if slot < span:
+        return False
+    interval = bars[slot].timeframe.duration
+    return bars[slot].open_time - bars[slot - span].open_time == interval * span
 
 
 def _one_score(

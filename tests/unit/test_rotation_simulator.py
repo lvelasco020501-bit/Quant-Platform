@@ -751,3 +751,41 @@ def test_leaving_the_universe_unset_is_what_m30_and_m31_ran() -> None:
     plain = simulate(data, RotationSpec(lookback=1, hold=1), cost_basis_points=FREE)
 
     assert {e.asset for e in plain.episodes} == {"AA"}
+
+
+def test_a_score_needs_its_window_to_be_contiguous_in_time_not_just_in_index() -> None:
+    # FTT was suspended on Binance for 311 days after FTX failed. Its bars either side of that
+    # hole are adjacent in the file, so a two-bar return across the seam would silently be a
+    # thirteen-day one. Two bars, then a hole, then four: the only windows that span the hole
+    # must produce no score, and the rule must wait until four genuinely adjacent bars exist.
+    before = series_of("AA", ["100", "110"])
+    after = series_of("AA", ["130", "140", "150", "160"], offset=13)
+    data = {"AA": [*before, *after]}
+
+    run = simulate(data, RotationSpec(lookback=2, hold=1), cost_basis_points=FREE)
+
+    assert run.episodes
+    # Nothing may be held on the two slots whose window straddles the hole.
+    assert min(e.opened_at for e in run.episodes) == after[2].open_time
+
+
+def test_a_window_that_straddles_a_hole_produces_no_position_at_all() -> None:
+    # Same shape, but with too few post-hole bars for a clean window to re-form. The only way
+    # to be holding anything here is to have measured a return across the hole.
+    before = series_of("AA", ["100", "110"])
+    after = series_of("AA", ["130", "140", "150"], offset=13)
+
+    run = simulate(
+        {"AA": [*before, *after]}, RotationSpec(lookback=2, hold=1), cost_basis_points=FREE
+    )
+
+    assert run.bars_held == 0
+    assert run.final_equity == INITIAL_EQUITY
+
+
+def test_contiguity_does_not_penalise_an_unbroken_series() -> None:
+    unbroken = series_of("AA", ["100", "110", "120", "130", "140"])
+
+    run = simulate({"AA": unbroken}, RotationSpec(lookback=2, hold=1), cost_basis_points=FREE)
+
+    assert run.bars_held > 0

@@ -137,6 +137,26 @@ es precisamente lo que la pre-declaración impide.
 
 ## 5. Validación a 4H
 
+> **CORRECCIÓN (M32, `0760e9e`+).** Las cifras de 4H de este informe se midieron con un defecto:
+> el score de momentum exigía 72 *índices* de histórico pero no 72 barras *contiguas en el
+> calendario*, así que en las series de 4H —que sí tienen huecos, a diferencia de las de 1D—
+> algunos retornos de 72 barras cruzaban agujeros de datos. Corregido en M32. **1D no cambia en
+> absoluto** (verificado byte a byte). A 4H:
+>
+> | | antes | después |
+> |---|---|---|
+> | RF1 fijo 25% · DD | 22.79% | **21.67%** |
+> | RF1 fijo 25% · Calmar | 1.35 | **1.40** |
+> | RF1 fijo 25% · CAGR | +30.75% | +30.38% |
+> | RF1 sin control · DD | 70.43% | 67.95% |
+>
+> **El veredicto de M31 no cambia**: ninguna celda cambia de PASA a FALLA ni al revés, y RF1 fijo
+> 25% sigue pasando, con mejor DD y mejor Calmar. **Lo que sí cambia es una afirmación de
+> sensibilidad de este informe:** la vecina `lookback 144` a 4H pasaba con DD 34.50% y ahora
+> falla con **36.62%**, así que el vecindario de RF1 a 4H es **3 de 4**, no 4 de 4. La tabla de
+> abajo conserva los números originales; los corregidos están en
+> `var/research/m31/screen_4h.json`.
+
 Autorizada por tu regla condicional ("si alguna pasa: recién entonces validar 4H y sensitivity").
 
 | celda | CAGR | DD | Calmar | ×2 | ×3 | OOS | año | activo | turnover | final | veredicto |

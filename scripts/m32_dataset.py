@@ -120,13 +120,28 @@ def _months(start: date, until: date) -> list[str]:
 
 
 def _archive(raw: str, kind: str, stamp: str) -> dict[str, Any]:
-    """Fetch one archive and its checksum, reporting what came back."""
+    """Fetch one archive and its checksum, reporting what came back.
+
+    An archive already on disk is reused rather than re-fetched. Binance Vision's published
+    history is immutable, so a re-run exists to change what this script *does* with the bytes,
+    not to collect them again -- and a cheap re-run is what makes fixing a parsing decision
+    affordable instead of a reason to leave it alone.
+    """
     name = f"{raw}-1h-{stamp}.zip"
+    folder = HOME / "binance_vision_archives" / raw / kind
+    cached = folder / name
+    if cached.exists():
+        return {
+            "kind": kind,
+            "stamp": stamp,
+            "status": "ok",
+            "sha256": hashlib.sha256(cached.read_bytes()).hexdigest(),
+            "cached": True,
+        }
     url = f"{VISION}/{kind}/klines/{raw}/1h/{name}"
     body = _fetch(url)
     if body is None:
         return {"kind": kind, "stamp": stamp, "status": "absent"}
-    folder = HOME / "binance_vision_archives" / raw / kind
     folder.mkdir(parents=True, exist_ok=True)
     (folder / name).write_bytes(body)
     actual = hashlib.sha256(body).hexdigest()
@@ -168,6 +183,16 @@ def _download(raw: str) -> list[dict[str, Any]]:
     with ThreadPoolExecutor(max_workers=8) as pool:
         daily = list(pool.map(lambda d: _archive(raw, "daily", d.isoformat()), days))
     return monthly + daily
+
+
+def _offgrid_days(problems: list[str]) -> list[date]:
+    """Return the days whose refused rows need re-fetching from the daily archives."""
+    days: set[date] = set()
+    for line in problems:
+        marker = "off-grid bar refused at "
+        if marker in line:
+            days.add(datetime.fromisoformat(line.split(marker)[1]).date())
+    return sorted(days)
 
 
 def _parse(raw: str, archives: list[dict[str, Any]]) -> tuple[list[Row], list[str]]:
@@ -294,6 +319,12 @@ def _write(raw: str, kept: list[Row], allowed: frozenset[datetime]) -> dict[str,
     symbol = f"{raw.removesuffix('USDT')}/USDT"
     hourly = to_market_bars(kept, symbol=symbol)
     OUT.mkdir(parents=True, exist_ok=True)
+    # A market's filename carries its span, so a run that shortens a series -- which is exactly
+    # what the ticker-reuse cut does -- writes a *new* name and leaves the old one beside it.
+    # Readers glob by symbol and timeframe, so a stale file is a live hazard: the first run left
+    # a LUNAUSDT series still carrying the post-fork splice, and a glob could have picked it.
+    for stale in OUT.glob(f"{raw}_*.csv"):
+        stale.unlink()
     outputs: dict[str, Any] = {}
     for timeframe in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
         series = (
@@ -333,6 +364,22 @@ def _build(raw: str) -> dict[str, Any]:
         return entry
 
     rows, problems = _parse(raw, archives)
+    # Binance's monthly archive restarts the hourly grid 28 minutes late after the 2018-02-09
+    # outage, while its daily archive holds properly aligned bars for the same hours. The rows
+    # were refused rather than snapped -- snapping would invent bars the exchange never
+    # published -- so the affected days are re-fetched from the dailies instead. This is the
+    # step M16 took and the one this script was missing.
+    repaired = _offgrid_days(problems)
+    if repaired:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            extra = list(pool.map(lambda d: _archive(raw, "daily", d.isoformat()), repaired))
+        found = [a for a in extra if a["status"] != "absent"]
+        entry["offgrid_days_repaired"] = {
+            "days": [day.isoformat() for day in repaired],
+            "daily_archives_found": len(found),
+        }
+        if found:
+            rows, problems = _parse(raw, archives + found)
     entry["anomalies"].extend({"kind": "parse", "detail": p} for p in problems[:20])
     if not rows:
         entry["status"] = "no_rows"
@@ -359,6 +406,12 @@ def main() -> int:
     markets = [raw for raw in to_download() if not wanted or raw in wanted]
 
     HOME.mkdir(parents=True, exist_ok=True)
+    # A restricted run merges into what is already recorded. Rebuilding the report from scratch
+    # would let a one-market re-run delete twenty-three markets' provenance, which is exactly
+    # the mistake that cost M29 a 31-minute re-run.
+    existing: dict[str, Any] = (
+        json.loads(REPORT.read_text(encoding="utf-8")) if REPORT.exists() else {}
+    )
     report: dict[str, Any] = {
         "milestone": "m32",
         "standard": (
@@ -366,7 +419,7 @@ def main() -> int:
             "-- see the module docstring for why"
         ),
         "data_end_exclusive": DATA_END.isoformat(),
-        "markets": {},
+        "markets": dict(existing.get("markets", {})),
     }
     started = time.time()
     for index, raw in enumerate(markets, start=1):

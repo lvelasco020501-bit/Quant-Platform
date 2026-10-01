@@ -44,9 +44,18 @@ if TYPE_CHECKING:
     from quantplatform.core.models.market import MarketBar
     from quantplatform.research.m29 import Probe
 
-__all__ = ["MARKET_RULES_DIR", "MarketRef", "definition_for", "market_ref", "pool_rules"]
+__all__ = [
+    "MARKET_RULES_DIR",
+    "MarketRef",
+    "definition_for",
+    "market_ref",
+    "pool_rules",
+    "venue_status",
+]
 
 _ROOT: Final[Path] = Path(__file__).resolve().parents[3]
+_RULE_FIELDS: Final[frozenset[str]] = frozenset(SymbolRules.model_fields)
+"""The fields the domain model accepts. Anything else in a capture file is a dataset note."""
 MARKET_RULES_DIR: Final[Path] = _ROOT / "data/raw/m36/rules"
 """Where ``scripts/m36_venue_rules.py`` wrote the rules M16 never captured."""
 
@@ -74,7 +83,28 @@ def pool_rules(raw: str) -> SymbolRules:
             f"would make that claim false. Run scripts/m36_venue_rules.py."
         )
         raise FileNotFoundError(msg)
-    return SymbolRules.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    captured = json.loads(path.read_text(encoding="utf-8"))
+    # The capture records the market's venue status alongside the rules, because four of these
+    # markets are halted rather than trading and a reader needs to know which. SymbolRules is a
+    # frozen model that forbids unknown fields, so the annotation is dropped here rather than
+    # loosened there: the domain model should not grow a field to accommodate a dataset note.
+    return SymbolRules.model_validate(
+        {key: value for key, value in captured.items() if key in _RULE_FIELDS}
+    )
+
+
+def venue_status(raw: str) -> str | None:
+    """Return the venue status recorded when this market's rules were captured.
+
+    ``"BREAK"`` for a halted market. Phase 2 reports these separately: their current rules stand
+    in for their historical ones, which is defensible and is not the same as knowing them.
+    """
+    path = MARKET_RULES_DIR / f"{raw}.json"
+    if not path.exists():
+        return None
+    captured: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
+    status = captured.get("venue_status")
+    return status if isinstance(status, str) else None
 
 
 def market_ref(raw: str, bars: tuple[MarketBar, ...]) -> MarketRef:

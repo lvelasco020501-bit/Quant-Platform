@@ -29,9 +29,9 @@ from typing import Any, Final
 from quantplatform.core.enums import Timeframe
 from quantplatform.orchestration.features import features_for
 from quantplatform.orchestration.research import ExperimentEngineFactory
-from quantplatform.research.m29 import definition_for
 from quantplatform.research.m32 import LIQUIDITY_WINDOW, UNIVERSE_SIZE
 from quantplatform.research.m36 import SLEEVES, TIMEFRAME, pool_symbols
+from quantplatform.research.m36_definitions import definition_for, market_ref
 from quantplatform.research.portfolio import positions as slot_index
 from quantplatform.research.rotation import align, eligible_universe
 from quantplatform.research.runner import ExperimentRunner
@@ -45,20 +45,41 @@ CACHE: Final[Path] = ROOT / "var/research/m36/positions_4h.json"
 
 
 def _one(sleeve: str, raw: str) -> dict[str, Any]:
-    """Run the certified engine for one pair and return its real position intervals."""
-    bars = load(raw)
-    probe = next(p for p in SLEEVES if p.key == sleeve)
-    registry = build_research_registry()
-    factory = ExperimentEngineFactory(
-        registry=registry, features_for=features_for, quote_asset="USDT"
-    )
+    """Run the certified engine for one pair and return its real position intervals.
+
+    Every failure is caught and returned as data. The first attempt at this phase let one pair's
+    exception propagate out of the worker, and ``as_completed`` then raised it in the parent
+    while the other worker kept computing to completion -- twenty-two minutes of real work
+    discarded because a different pair could not resolve. A long unattended run must degrade to
+    a partial result with a reason attached, not to nothing.
+    """
     at = time.time()
-    result = ExperimentRunner().run(
-        definition_for(raw, probe, Timeframe(TIMEFRAME.value), latching=False),
-        bars=bars,
-        factory=factory,
-        code_revision="m36-positions",
-    )
+    try:
+        bars = load(raw)
+        probe = next(p for p in SLEEVES if p.key == sleeve)
+        registry = build_research_registry()
+        factory = ExperimentEngineFactory(
+            registry=registry, features_for=features_for, quote_asset="USDT"
+        )
+        result = ExperimentRunner().run(
+            definition_for(
+                market_ref(raw, bars), probe, Timeframe(TIMEFRAME.value), latching=False
+            ),
+            bars=bars,
+            factory=factory,
+            code_revision="m36-positions",
+        )
+    except Exception as error:
+        return {
+            "sleeve": sleeve,
+            "market": raw,
+            "status": "driver_error",
+            "bars": 0,
+            "seconds": round(time.time() - at, 1),
+            "intervals": [],
+            "trades": 0,
+            "error": f"{type(error).__name__}: {error}",
+        }
     return {
         "sleeve": sleeve,
         "market": raw,

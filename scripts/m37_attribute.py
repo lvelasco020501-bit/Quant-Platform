@@ -171,6 +171,55 @@ def _print_header(signals: dict[str, Any]) -> None:
     )
 
 
+def _judge(
+    measured: dict[str, MechanismRow],
+    *,
+    base: MechanismRow,
+    signals_annual: Decimal,
+    report: dict[str, Any],
+) -> None:
+    """Validate the harness against its control, then name the primary causes -- or none.
+
+    The control claim is only meaningful once the control has actually been measured. An absent
+    variant must read as absent and never as a disagreement: a spurious "harness is wrong" on a
+    partial cache would discredit a correct run, and a spurious "identical" on one would do
+    something worse. For the same reason no attribution is drawn from an incomplete ablation --
+    a mechanism cannot be called primary against rows that do not exist yet.
+    """
+    control = measured.get("H")
+    if control is None:
+        sys.stdout.write("\ncontrol H not extracted: harness claim not evaluated\n")
+        report["control_reproduces_baseline"] = None
+    else:
+        identical = control == base.model_copy(update={"key": "H"})
+        sys.stdout.write(
+            f"\ncontrol H reproduces the baseline: {identical}"
+            f"{'' if identical else '  <-- HARNESS IS WRONG, no row above is trustworthy'}\n"
+        )
+        report["control_reproduces_baseline"] = identical
+
+    absent = [ablation.key for ablation in ABLATIONS if ablation.key not in measured]
+    report["all_variants_measured"] = not absent
+    if absent:
+        sys.stdout.write(
+            f"PARTIAL: {len(measured)}/{len(ABLATIONS)} variants measured, missing {absent}. "
+            "No attribution is drawn from an incomplete ablation.\n"
+        )
+        report["primary_causes"] = None
+        report["phase_two_warranted"] = None
+        return
+
+    causes = primary_causes(tuple(measured.values()), base=base, signals_annual=signals_annual)
+    sys.stdout.write(f"primary cause(s) by the pre-declared rule: {causes or 'NONE'}\n")
+    report["primary_causes"] = list(causes)
+    report["phase_two_warranted"] = bool(causes)
+    if not causes:
+        sys.stdout.write(
+            "no single mechanism clears both thresholds: Risk V2 is not dominated by one "
+            "part of itself -> STOP and close, per the declaration\n"
+        )
+
+
 def main() -> int:
     """Measure every variant, print the attribution table, and name the primary causes."""
     cache = json.loads(ABLATION_CACHE.read_text(encoding="utf-8"))
@@ -267,24 +316,7 @@ def main() -> int:
         sys.stdout.write("\nno baseline: attribution not possible\n")
         return 1
 
-    control = measured.get("H")
-    identical = control is not None and control == base.model_copy(update={"key": "H"})
-    sys.stdout.write(
-        f"\ncontrol H reproduces the baseline: {identical}"
-        f"{'' if identical else '  <-- HARNESS IS WRONG, no row below is trustworthy'}\n"
-    )
-    report["control_reproduces_baseline"] = identical
-
-    signals_annual = signals["cagr"]
-    causes = primary_causes(tuple(measured.values()), base=base, signals_annual=signals_annual)
-    sys.stdout.write(f"primary cause(s) by the pre-declared rule: {causes or 'NONE'}\n")
-    report["primary_causes"] = list(causes)
-    report["phase_two_warranted"] = bool(causes)
-    if not causes:
-        sys.stdout.write(
-            "no single mechanism clears both thresholds: Risk V2 is not dominated by one "
-            "part of itself -> STOP and close, per the declaration\n"
-        )
+    _judge(measured, base=base, signals_annual=signals["cagr"], report=report)
 
     HOME.mkdir(parents=True, exist_ok=True)
     out = HOME / "ablation_attribution_4h.json"

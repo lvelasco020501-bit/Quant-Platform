@@ -29,8 +29,8 @@ from typing import Any, Final
 from quantplatform.core.enums import Timeframe
 from quantplatform.orchestration.features import features_for
 from quantplatform.orchestration.research import ExperimentEngineFactory
-from quantplatform.research.m32 import LIQUIDITY_WINDOW, UNIVERSE_SIZE
-from quantplatform.research.m36 import SLEEVES, TIMEFRAME, pool_symbols
+from quantplatform.research.m32 import LIQUIDITY_WINDOW
+from quantplatform.research.m36 import BREADTHS, SLEEVES, TIMEFRAME, pool_symbols
 from quantplatform.research.m36_definitions import definition_for, market_ref
 from quantplatform.research.portfolio import positions as slot_index
 from quantplatform.research.rotation import align, eligible_universe
@@ -105,14 +105,19 @@ def main() -> int:
     symbols = list(pool_symbols())
     series = {raw: load(raw) for raw in symbols}
     grid = align(series)
+    # Enumerate at the WIDEST declared breadth, not the declared one. Phase 2 judges every
+    # breadth in BREADTHS, and a wider universe admits markets a narrower one never selects:
+    # breadth 12 reaches DASH, OMG and XMR, which never enter the top six. Enumerating at six
+    # left those three without engine positions, so breadth 12 was being judged with 0.45% of
+    # its eligible seats silently empty -- a hole in the measurement rather than a result.
     universe = eligible_universe(
-        series, slot_index(series, grid), window=LIQUIDITY_WINDOW, size=UNIVERSE_SIZE
+        series, slot_index(series, grid), window=LIQUIDITY_WINDOW, size=max(BREADTHS)
     )
     eligible = sorted({asset for slot in universe for asset in slot})
     sleeves = [p.key for p in SLEEVES if not args.only or p.key == args.only]
     pairs = [(sleeve, raw) for sleeve in sleeves for raw in eligible]
     sys.stdout.write(
-        f"{len(eligible)} markets ever eligible at breadth {UNIVERSE_SIZE}; "
+        f"{len(eligible)} markets ever eligible at breadth {max(BREADTHS)}; "
         f"{len(pairs)} pairs on {args.workers} workers\n"
     )
     sys.stdout.flush()

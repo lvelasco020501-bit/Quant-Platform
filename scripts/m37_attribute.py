@@ -24,6 +24,7 @@ import json
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -39,9 +40,12 @@ from quantplatform.research.m37 import (
     ONE_WAY_COST_BASIS_POINTS,
     OOS_START,
     UNIVERSE_M37,
+    Alternative,
     MechanismRow,
     primary_causes,
+    survives,
 )
+from quantplatform.research.m37_alternatives import ALTERNATIVES
 from quantplatform.research.m37_probe import longest_flat_while_wanted
 from quantplatform.research.m37_probe import re_entries as count_re_entries
 from quantplatform.research.portfolio import (
@@ -62,6 +66,22 @@ from m37_ablate import CACHE as ABLATION_CACHE
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 HOME: Final[Path] = ROOT / "var/research/m37"
+
+
+@dataclass(frozen=True)
+class Panel:
+    """Everything a variant is measured against, which is identical for all of them.
+
+    Grouped into one record rather than passed as six parameters, and frozen, so no measuring
+    function can be handed a different universe, allocation or signal basis than another. That
+    the context is literally the same object is part of what makes the rows comparable.
+    """
+
+    grid: Sequence[datetime]
+    series: dict[str, Any]
+    universe: tuple[frozenset[str], ...]
+    allocation: Allocation
+    signal_masks: dict[Holding, tuple[bool, ...]]
 
 
 def _signal_masks(keys: list[str], grid: Sequence[datetime]) -> dict[Holding, tuple[bool, ...]]:
@@ -247,6 +267,105 @@ def _judge(
         )
 
 
+def _judge_alternatives(
+    rows: dict[str, Any],
+    panel: Panel,
+    *,
+    base: MechanismRow,
+    signals_annual: Decimal,
+    report: dict[str, Any],
+) -> None:
+    """Measure each declared phase-2 alternative and judge it against the pre-declared criteria.
+
+    Measured through the same functions as every ablation row, so a difference between an
+    alternative and the baseline is a difference in configuration and not in method. The two
+    design properties -- whether a catastrophic stop survives, and whether a ratchet is
+    introduced -- come from the declaration rather than from the sample, because both are facts
+    about how the mechanism is written: a sample that happened never to reach a stop would not
+    make the stop absent.
+    """
+    verdicts: dict[str, Any] = {}
+    for spec in ALTERNATIVES:
+        masks, failures = _variant_masks(rows, spec.key, panel.grid)
+        if not masks:
+            sys.stdout.write(f"\n{spec.key}: not extracted\n")
+            continue
+        card = _measure(masks, panel.series, panel.universe, panel.allocation)
+        shared = [holding for holding in masks if holding in panel.signal_masks]
+        churn = sum(count_re_entries(masks[h], panel.signal_masks[h]) for h in shared)
+        codes: Counter[str] = Counter()
+        forced = 0
+        for row in rows.values():
+            if row["variant"] != spec.key or row["status"] != "succeeded":
+                continue
+            codes.update(row["exits_by_code"])
+            forced += row["forced_exits"]
+        wanted = sum(sum(panel.signal_masks[h]) for h in shared)
+        covered = sum(
+            sum(1 for a, b in zip(panel.signal_masks[h], masks[h], strict=True) if a and b)
+            for h in shared
+        )
+        row_measured = MechanismRow(
+            key=spec.key,
+            annual=card["cagr"],
+            max_drawdown=card["max_drawdown"],
+            calmar_ratio=card["calmar"],
+            turnover=card["turnover"],
+            fees=card["fees"],
+            re_entries=churn,
+            stops=codes.get("protective_stop", 0),
+            out_of_sample_return=card["oos_return"],
+            annual_at_double_cost=card["cagr_x2"],
+            annual_at_triple_cost=card["cagr_x3"],
+        )
+        alternative = Alternative(
+            key=spec.key,
+            label=spec.label,
+            keeps_catastrophic_stop=spec.keeps_catastrophic_stop,
+            introduces_ratchet=spec.introduces_ratchet,
+            row=row_measured,
+        )
+        passed, reasons = survives(alternative, base=base, signals_annual=signals_annual)
+        recovered = (
+            (row_measured.annual - base.annual) / (signals_annual - base.annual)
+            if row_measured.annual is not None and base.annual is not None
+            else None
+        )
+        cut = (base.turnover - row_measured.turnover) / base.turnover if base.turnover else None
+        sys.stdout.write(
+            f"\n{spec.key} -- {spec.label}\n"
+            f"  cagr {float(card['cagr'] or 0):+7.2%}  dd {float(card['max_drawdown']):6.2%}  "
+            f"calmar {float(card['calmar'] or 0):5.2f}  turnover {float(card['turnover']):8.1f}  "
+            f"fees {float(card['fees']):9.0f}\n"
+            f"  re-entries {churn:5d}  stops {row_measured.stops:5d}  forced {forced:5d}  "
+            f"exposure {float(card['exposure'] or 0):5.1%}  "
+            f"held-of-wanted {covered / wanted if wanted else 0:5.1%}\n"
+            f"  oos {float(card['oos_return'] or 0):+7.2%}  "
+            f"x2 {float(card['cagr_x2'] or 0):+7.2%}  x3 {float(card['cagr_x3'] or 0):+7.2%}\n"
+            f"  turnover cut {float(cut or 0):+6.1%} (needs >= 25%)   "
+            f"edge recovered {float(recovered or 0):+6.1%} (needs >= 50%)\n"
+            f"  {'SURVIVES' if passed else 'REJECTED'}"
+            f"{'' if passed else ': ' + ', '.join(r.value for r in reasons)}\n"
+        )
+        verdicts[spec.key] = {
+            "label": spec.label,
+            "removes": [m.value for m in spec.removes],
+            "keeps_catastrophic_stop": spec.keeps_catastrophic_stop,
+            "introduces_ratchet": spec.introduces_ratchet,
+            "exits_by_code": dict(codes),
+            "forced_exits": forced,
+            "re_entries": churn,
+            "held_share_of_wanted": Decimal(covered) / Decimal(wanted) if wanted else None,
+            "turnover_cut": cut,
+            "edge_recovered": recovered,
+            "survives": passed,
+            "rejected_for": [r.value for r in reasons],
+            "failures": failures,
+            **card,
+        }
+    report["alternatives"] = verdicts
+
+
 def main() -> int:
     """Measure every variant, print the attribution table, and name the primary causes."""
     cache = json.loads(ABLATION_CACHE.read_text(encoding="utf-8"))
@@ -259,6 +378,13 @@ def main() -> int:
     )
     allocation = Allocation(universe_size=UNIVERSE_M37, sleeves=len(keys))
     signal_masks = _signal_masks(keys, grid)
+    panel = Panel(
+        grid=grid,
+        series=series,
+        universe=universe,
+        allocation=allocation,
+        signal_masks=signal_masks,
+    )
 
     sys.stdout.write(
         f"M37 ablation -- {len(ASSETS_M37)} markets, {len(keys)} sleeves, "
@@ -285,11 +411,11 @@ def main() -> int:
 
     measured: dict[str, MechanismRow] = {}
     for ablation in ABLATIONS:
-        masks, failures = _variant_masks(rows, ablation.key, grid)
+        masks, failures = _variant_masks(rows, ablation.key, panel.grid)
         if not masks:
             sys.stdout.write(f"{ablation.key:5} not extracted\n")
             continue
-        card = _measure(masks, series, universe, allocation)
+        card = _measure(masks, panel.series, panel.universe, panel.allocation)
         codes: Counter[str] = Counter()
         kinds: Counter[str] = Counter()
         forced = 0
@@ -299,22 +425,26 @@ def main() -> int:
             codes.update(row["exits_by_code"])
             kinds.update(row["exits_by_stop_kind"])
             forced += row["forced_exits"]
-        shared = [holding for holding in masks if holding in signal_masks]
+        shared = [holding for holding in masks if holding in panel.signal_masks]
         re_entries = sum(
-            count_re_entries(masks[holding], signal_masks[holding]) for holding in shared
+            count_re_entries(masks[holding], panel.signal_masks[holding]) for holding in shared
         )
         # Turnover falling is ambiguous on its own: holding the same positions for longer and
         # being too damaged to enter both show fewer trades, and only the first is better.
         # These two say which happened, across the variant rather than per pair.
-        wanted = sum(sum(signal_masks[holding]) for holding in shared)
+        wanted = sum(sum(panel.signal_masks[holding]) for holding in shared)
         covered = sum(
-            sum(1 for a, b in zip(signal_masks[holding], masks[holding], strict=True) if a and b)
+            sum(
+                1
+                for a, b in zip(panel.signal_masks[holding], masks[holding], strict=True)
+                if a and b
+            )
             for holding in shared
         )
         held_share = Decimal(covered) / Decimal(wanted) if wanted else None
         shutout = max(
             (
-                longest_flat_while_wanted(masks[holding], signal_masks[holding])
+                longest_flat_while_wanted(masks[holding], panel.signal_masks[holding])
                 for holding in shared
             ),
             default=0,
@@ -362,6 +492,7 @@ def main() -> int:
         return 1
 
     _judge(measured, base=base, signals_annual=signals["cagr"], report=report)
+    _judge_alternatives(rows, panel, base=base, signals_annual=signals["cagr"], report=report)
 
     HOME.mkdir(parents=True, exist_ok=True)
     out = HOME / "ablation_attribution_4h.json"

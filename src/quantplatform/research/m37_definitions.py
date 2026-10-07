@@ -150,10 +150,11 @@ def alternative_risk(spec: AlternativeSpec, timeframe: Timeframe) -> RiskConfigu
     update: dict[str, object] = {}
     for mechanism in spec.removes:
         update.update(OVERRIDES[mechanism])
-    if spec.widen_stop_to_budget_maximum:
-        update["initial_stop_distance_bps"] = stop_distance_for(
-            base.risk_budget.max_stop_distance_bps, base.initial_stop_distance_bps
-        )
+    update["initial_stop_distance_bps"] = stop_distance_for(
+        spec.stop_rule,
+        budget_maximum=base.risk_budget.max_stop_distance_bps,
+        current=base.initial_stop_distance_bps,
+    )
     return RiskConfiguration.model_validate({**base.model_dump(), **update})
 
 

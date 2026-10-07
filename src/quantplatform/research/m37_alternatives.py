@@ -30,13 +30,33 @@ smaller: 5% of equity against the baseline's 16.7%. That is not a side effect to
 around, it is what sizing by risk *means*, and it may well be enough to fail the edge-conservation
 criterion on its own. The alternative is measured as declared either way.
 
-**One alternative, not a family.** No variant of this is prepared, and no second distance. If
-this fails its criteria the milestone reports that and proposes a Risk V3 for research only; it
-does not go looking for a distance that passes.
+**One alternative, not a family.** No variant of this is prepared to chase a return. If an
+alternative fails its *criteria* the milestone reports that and proposes a Risk V3 for research
+only; it does not go looking for a distance that performs better.
+
+**ALT1 turned out not to be constructible, and that is recorded rather than quietly replaced.**
+Run as declared, it produced zero trades on all twelve pairs: 211 entry rejections reading "the
+stop is further than max_stop_distance_bps permits". The engine derives the stop *price* from the
+reference price, rounds it to the venue tick *away* from entry -- which is the conservative
+direction and correct -- then re-derives the distance from that rounded level and compares it to
+the budget's bound. So a stop configured at exactly the bound almost always realises marginally
+outside it and the entry is refused: 12 of 16 sampled price/tick combinations reject, and in
+practice every real price does. ``max_stop_distance_bps`` reads as an inclusive bound and behaves
+as an exclusive one. That is a second concrete incompatibility, independent of phase 1's, and it
+belongs in the Risk V3 proposal.
+
+**ALT2 is the re-declaration, and it changes feasibility rather than ambition.** The distance now
+comes from this project's own doubling convention -- the one M22 uses for ``Horizon.DOUBLED``,
+and M29 and M30 for their sensitivity neighbours -- applied to the stop being replaced: 600 bps
+doubled is 1200. It is not a number chosen for how it performed, it is the established way this
+codebase widens a parameter, and it was committed before ALT2 was run. It was checked only for
+*feasibility* beforehand (22 trades against ALT1's zero, with no budget rejections), never for
+return.
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 from quantplatform.core.models.base import DomainModel
@@ -45,14 +65,37 @@ from quantplatform.research.m37 import Mechanism
 if TYPE_CHECKING:
     from decimal import Decimal
 
-__all__ = ["ALTERNATIVES", "CATASTROPHIC_STOP_SOURCE", "AlternativeSpec", "stop_distance_for"]
+__all__ = [
+    "ALTERNATIVES",
+    "INFEASIBLE",
+    "AlternativeSpec",
+    "StopRule",
+    "stop_distance_for",
+]
 
 
-CATASTROPHIC_STOP_SOURCE: Final[str] = "risk_budget.max_stop_distance_bps"
-"""Where the safety stop's distance comes from: the deployed budget's own declared maximum.
+class StopRule(StrEnum):
+    """Where a safety stop's distance comes from. A rule, never a number.
 
-Recorded as a string rather than as a number so the provenance travels with the milestone. A
-2000 written here would be indistinguishable from a 2000 someone liked the look of."""
+    Recorded as provenance rather than as a value so it travels with the milestone: a 1200
+    written down would be indistinguishable from a 1200 someone liked the look of.
+    """
+
+    BUDGET_MAXIMUM = "risk_budget.max_stop_distance_bps"
+    """The deployed budget's own declared maximum. Not constructible -- see the module docstring."""
+
+    DOUBLED = "baseline_stop_distance_doubled"
+    """The stop being replaced, doubled, by this project's own neighbour convention."""
+
+
+INFEASIBLE: Final[dict[str, str]] = {
+    "ALT1": (
+        "zero trades on all twelve pairs: 211 entry rejections for a stop further than "
+        "max_stop_distance_bps permits. The engine rounds the stop price away from entry and "
+        "then re-derives the distance, so a stop configured at the bound realises outside it."
+    )
+}
+"""Alternatives that could not be built, and why. Kept so the attempt stays on the record."""
 
 
 class AlternativeSpec(DomainModel):
@@ -63,8 +106,8 @@ class AlternativeSpec(DomainModel):
     removes: tuple[Mechanism, ...]
     """The stop *modifications* this alternative deletes. The stop itself is never removed."""
 
-    widen_stop_to_budget_maximum: bool
-    """Whether the surviving stop is moved out to the budget's declared maximum distance."""
+    stop_rule: StopRule
+    """Which declared rule supplies the surviving stop's distance."""
 
     keeps_catastrophic_stop: bool
     """Whether some price level still closes the position before a loss becomes unbounded.
@@ -80,41 +123,63 @@ class AlternativeSpec(DomainModel):
     ratchet by construction -- it never retreats -- which is part of why it is removed here."""
 
 
+_REMOVES: Final[tuple[Mechanism, ...]] = (
+    Mechanism.BREAK_EVEN,
+    Mechanism.TRAILING_STOP,
+    Mechanism.TAKE_PROFIT,
+    Mechanism.TIME_STOP,
+)
+"""The stop *modifications* both alternatives delete. The stop itself is never removed, and
+neither is sizing: phase 1 showed that removing the budget is what crippled variant A."""
+
 ALTERNATIVES: Final[tuple[AlternativeSpec, ...]] = (
     AlternativeSpec(
         key="ALT1",
-        label="strategy exit primary, hard safety stop at the budget's maximum distance",
-        removes=(
-            Mechanism.BREAK_EVEN,
-            Mechanism.TRAILING_STOP,
-            Mechanism.TAKE_PROFIT,
-            Mechanism.TIME_STOP,
-        ),
-        widen_stop_to_budget_maximum=True,
+        label="strategy exit primary, safety stop at the budget's maximum (not constructible)",
+        removes=_REMOVES,
+        stop_rule=StopRule.BUDGET_MAXIMUM,
+        keeps_catastrophic_stop=True,
+        introduces_ratchet=False,
+    ),
+    AlternativeSpec(
+        key="ALT2",
+        label="strategy exit primary, safety stop at twice the baseline distance",
+        removes=_REMOVES,
+        stop_rule=StopRule.DOUBLED,
         keeps_catastrophic_stop=True,
         introduces_ratchet=False,
     ),
 )
-"""Exactly one alternative. Risk-based sizing and the breakers are both kept: phase 1 showed
-that removing sizing is what crippled variant A, and that the breakers never fired."""
+"""Two entries, one measurable. ALT1 is retained because an attempt that could not be built is
+part of the record, and its failure is itself a finding; ALT2 is the same structure at a
+feasible distance. The breakers are kept in both, phase 1 having shown they never fire."""
 
 
-def stop_distance_for(budget_maximum: Decimal, current: Decimal) -> Decimal:
-    """Return the safety stop's distance, which is the budget's maximum and nothing else.
+def stop_distance_for(rule: StopRule, *, budget_maximum: Decimal, current: Decimal) -> Decimal:
+    """Return the safety stop's distance from a declared rule, never from a chosen value.
 
-    A function rather than a constant so the provenance is enforced instead of described: it
-    cannot return a number that is not the budget's own maximum.
+    A function rather than a constant so the provenance is enforced instead of described: every
+    branch derives its answer from the configuration under study or from this project's own
+    convention, and there is no branch that simply returns a literal.
 
     Raises:
-        ValueError: If the budget's maximum is not wider than the stop being replaced. A
-            "catastrophe brake" no further out than the trade-managing stop it replaces would
-            be the same mechanism under a new name.
+        ValueError: If the resulting distance is not wider than the stop being replaced -- a
+            "catastrophe brake" no further out than the trade manager it replaces is the same
+            mechanism renamed -- or if it exceeds what the budget permits, which is ALT1's
+            recorded failure rather than something to work around silently.
     """
-    if budget_maximum <= current:
+    distance = budget_maximum if rule is StopRule.BUDGET_MAXIMUM else current * 2
+    if distance <= current:
         msg = (
-            f"the budget's maximum stop distance ({budget_maximum} bps) is not wider than the "
-            f"stop it would replace ({current} bps), so there is no catastrophic stop to move "
-            f"out to and this alternative does not exist for this configuration"
+            f"{rule.value} gives {distance} bps, which is not wider than the stop it would "
+            f"replace ({current} bps), so there is no catastrophic stop to move out to and this "
+            f"alternative does not exist for this configuration"
         )
         raise ValueError(msg)
-    return budget_maximum
+    if distance > budget_maximum:
+        msg = (
+            f"{rule.value} gives {distance} bps, beyond the budget's maximum of "
+            f"{budget_maximum} bps, so risk-based sizing would refuse every entry"
+        )
+        raise ValueError(msg)
+    return distance

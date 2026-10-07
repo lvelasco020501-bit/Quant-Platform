@@ -253,13 +253,20 @@ def _result(
     )
 
 
-def _row(label: str, card: dict[str, Any], result: BreadthResult) -> str:
-    """Return one printed table row."""
+def _row(label: str, card: dict[str, Any], result: BreadthResult, *, stops_known: bool) -> str:
+    """Return one printed table row.
+
+    ``stops_known`` is false for a basis whose extraction predates the recording engine. Its
+    stop count is then printed as unavailable rather than as zero: M36's cache carries no exit
+    reasons, and a zero there would assert that Risk V2 never stopped a position, which is the
+    opposite of what it did.
+    """
+    stops = f"{result.stops:6d}" if stops_known else f"{'n/a':>6}"
     return (
         f"{label:9} {float(card['cagr'] or 0):+7.2%} {float(card['max_drawdown']):6.2%} "
         f"{float(card['calmar'] or 0):6.2f} {float(card['profit_factor'] or 0):5.2f} "
         f"{float(card['turnover']):8.1f} {float(card['fees']):9.0f} "
-        f"{result.stops:6d} {result.re_entries:6d} "
+        f"{stops} {result.re_entries:6d} "
         f"{float(result.held_share_of_wanted or 0):6.1%} "
         f"{float(card['oos_return'] or 0):+7.2%} {float(card['cagr_x2'] or 0):+7.2%} "
         f"{float(card['cagr_x3'] or 0):+7.2%} "
@@ -332,7 +339,8 @@ def main() -> int:
         "v2_exits_by_code": dict(v2_codes),
         "v3_exits_by_code": dict(v3_codes),
         "v3_exits_by_stop_kind": dict(v3_kinds),
-        "v2_forced_exits": v2_forced,
+        "v2_exit_reasons_recorded": bool(v2_codes),
+        "v2_forced_exits": v2_forced if v2_codes else None,
         "v3_forced_exits": v3_forced,
         "failures": {**v2_fail, **v3_fail},
         "breadths_detail": {},
@@ -344,17 +352,21 @@ def main() -> int:
         sys.stdout.write(f"BREADTH {breadth}\n{header}\n{'-' * len(header)}\n")
         cards: dict[Basis, dict[str, Any]] = {}
         results: dict[Basis, BreadthResult] = {}
-        for basis, masks, stops in (
-            (Basis.SIGNAL, panel.signal_masks, 0),
-            (Basis.RISK_V2, v2_masks, v2_codes.get("protective_stop", 0)),
-            (Basis.RISK_V3, v3_masks, v3_codes.get("protective_stop", 0)),
+        # The signal basis has no stops by construction; Risk V2's are unknown because M36's
+        # extraction predates the recording engine, not because there were none.
+        for basis, masks, stops, stops_known in (
+            (Basis.SIGNAL, panel.signal_masks, 0, True),
+            (Basis.RISK_V2, v2_masks, v2_codes.get("protective_stop", 0), bool(v2_codes)),
+            (Basis.RISK_V3, v3_masks, v3_codes.get("protective_stop", 0), bool(v3_codes)),
         ):
             card = _measure(masks, panel, breadth)
             churn = (0, Decimal(1), 0) if basis is Basis.SIGNAL else _churn(masks, panel)
             result = _result(basis, breadth, card, stops=stops, churn=churn)
             cards[basis] = card
             results[basis] = result
-            sys.stdout.write(_row(basis.value, card, result) + "\n")
+            card["stops_recorded"] = stops_known
+            card["stops"] = result.stops if stops_known else None
+            sys.stdout.write(_row(basis.value, card, result, stops_known=stops_known) + "\n")
             sys.stdout.flush()
 
         ok, failed = passes(results[Basis.RISK_V3], results[Basis.RISK_V2], invariants_held=held)

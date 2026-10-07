@@ -24,14 +24,23 @@ from quantplatform.research.m15 import risk_for_timeframe
 from quantplatform.research.m22 import _base
 from quantplatform.research.m36_definitions import definition_for as m36_definition_for
 from quantplatform.research.m37 import Mechanism
+from quantplatform.research.m37_alternatives import stop_distance_for
 from quantplatform.risk.config import RiskConfiguration
 
 if TYPE_CHECKING:
     from quantplatform.research.m29 import Probe
     from quantplatform.research.m36_definitions import MarketRef
     from quantplatform.research.m37 import Ablation
+    from quantplatform.research.m37_alternatives import AlternativeSpec
 
-__all__ = ["OVERRIDES", "baseline_risk", "definition_for", "risk_for"]
+__all__ = [
+    "OVERRIDES",
+    "alternative_definition_for",
+    "alternative_risk",
+    "baseline_risk",
+    "definition_for",
+    "risk_for",
+]
 
 
 OVERRIDES: Final[dict[Mechanism, dict[str, object]]] = {
@@ -113,6 +122,50 @@ def definition_for(
         update={
             "name": f"m37-{ablation.key}-{base.name.removeprefix('m36-')}",
             "risk": risk_for(ablation, timeframe),
+        }
+    )
+    return ExperimentDefinition.model_validate_json(canonical_json(copy))
+
+
+def alternative_risk(spec: AlternativeSpec, timeframe: Timeframe) -> RiskConfiguration:
+    """Return the baseline with this alternative's modifications removed and its stop widened.
+
+    The surviving stop's distance comes from ``stop_distance_for``, which can only return the
+    deployed budget's own declared maximum -- so the number cannot be something chosen for how
+    it performed. Risk-based sizing is kept, which means the wider stop funds a proportionally
+    smaller position; that is what sizing by risk does, and it is declared rather than avoided.
+
+    Raises:
+        ValueError: If the configuration has no risk budget to take a maximum distance from, or
+            if that maximum is not wider than the stop it would replace.
+    """
+    base = baseline_risk(timeframe)
+    if base.risk_budget is None or base.initial_stop_distance_bps is None:
+        msg = (
+            "this alternative replaces a trade-managing stop with a wider catastrophic one, so "
+            "it needs both a risk budget to read a maximum distance from and a current stop to "
+            "widen; a V1 configuration has neither"
+        )
+        raise ValueError(msg)
+    update: dict[str, object] = {}
+    for mechanism in spec.removes:
+        update.update(OVERRIDES[mechanism])
+    if spec.widen_stop_to_budget_maximum:
+        update["initial_stop_distance_bps"] = stop_distance_for(
+            base.risk_budget.max_stop_distance_bps, base.initial_stop_distance_bps
+        )
+    return RiskConfiguration.model_validate({**base.model_dump(), **update})
+
+
+def alternative_definition_for(
+    ref: MarketRef, probe: Probe, timeframe: Timeframe, spec: AlternativeSpec
+) -> ExperimentDefinition:
+    """Return M36's definition for this pair under one phase-2 alternative."""
+    base = m36_definition_for(ref, probe, timeframe, latching=False)
+    copy = base.model_copy(
+        update={
+            "name": f"m37-{spec.key}-{base.name.removeprefix('m36-')}",
+            "risk": alternative_risk(spec, timeframe),
         }
     )
     return ExperimentDefinition.model_validate_json(canonical_json(copy))

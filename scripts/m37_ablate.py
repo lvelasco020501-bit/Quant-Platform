@@ -34,7 +34,8 @@ from quantplatform.research.definition import ExperimentDefinition
 from quantplatform.research.m36 import SLEEVES, TIMEFRAME
 from quantplatform.research.m36_definitions import market_ref
 from quantplatform.research.m37 import ABLATIONS, ASSETS_M37
-from quantplatform.research.m37_definitions import definition_for
+from quantplatform.research.m37_alternatives import ALTERNATIVES
+from quantplatform.research.m37_definitions import alternative_definition_for, definition_for
 from quantplatform.research.m37_probe import AblationRiskEngine
 from quantplatform.research.runner import ExperimentRunner
 from quantplatform.strategies.research import build_research_registry
@@ -57,10 +58,18 @@ def _one(variant: str, sleeve: str, raw: str) -> dict[str, Any]:
     captured: list[AblationRiskEngine] = []
     try:
         bars = load(raw)
-        ablation = next(a for a in ABLATIONS if a.key == variant)
         probe = next(p for p in SLEEVES if p.key == sleeve)
-        definition = definition_for(
-            market_ref(raw, bars), probe, Timeframe(TIMEFRAME.value), ablation
+        ref = market_ref(raw, bars)
+        timeframe = Timeframe(TIMEFRAME.value)
+        # A phase-2 alternative is extracted by the same code path as an ablation, so the two
+        # cannot differ in how they were measured -- only in the configuration they ran under.
+        spec = next((a for a in ALTERNATIVES if a.key == variant), None)
+        definition = (
+            alternative_definition_for(ref, probe, timeframe, spec)
+            if spec is not None
+            else definition_for(
+                ref, probe, timeframe, next(a for a in ABLATIONS if a.key == variant)
+            )
         )
 
         def _engine(_: ExperimentDefinition) -> AblationRiskEngine:
@@ -121,7 +130,7 @@ def _write(done: dict[str, Any]) -> None:
                 "milestone": "m37",
                 "timeframe": TIMEFRAME.value,
                 "universe": list(ASSETS_M37),
-                "variants": [a.key for a in ABLATIONS],
+                "variants": [a.key for a in ABLATIONS] + [a.key for a in ALTERNATIVES],
                 "basis": "certified BacktestEngine, one mechanism ablated per variant",
                 "pairs": done,
                 "generated_at": datetime.now(UTC).isoformat(),
@@ -140,7 +149,11 @@ def main() -> int:
     parser.add_argument("--only", default="", help="restrict to one variant, e.g. BASE")
     args = parser.parse_args()
 
-    variants = [a.key for a in ABLATIONS if not args.only or a.key == args.only]
+    declared = [a.key for a in ABLATIONS] + [a.key for a in ALTERNATIVES]
+    variants = [key for key in declared if not args.only or key == args.only]
+    if args.only and not variants:
+        sys.stdout.write(f"no declared variant named {args.only!r}; known: {declared}\n")
+        return 1
     runs = [
         (variant, probe.key, raw) for variant in variants for probe in SLEEVES for raw in ASSETS_M37
     ]

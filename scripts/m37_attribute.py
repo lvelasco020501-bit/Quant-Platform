@@ -42,6 +42,7 @@ from quantplatform.research.m37 import (
     MechanismRow,
     primary_causes,
 )
+from quantplatform.research.m37_probe import longest_flat_while_wanted
 from quantplatform.research.m37_probe import re_entries as count_re_entries
 from quantplatform.research.portfolio import (
     Allocation,
@@ -63,14 +64,33 @@ ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 HOME: Final[Path] = ROOT / "var/research/m37"
 
 
-def _signal_masks(keys: list[str]) -> dict[Holding, tuple[bool, ...]]:
-    """Return the untouched signal timelines, restricted to M37's universe and sleeves."""
+def _signal_masks(keys: list[str], grid: Sequence[datetime]) -> dict[Holding, tuple[bool, ...]]:
+    """Return the untouched signal timelines, projected onto M37's grid *by timestamp*.
+
+    The cached masks were built on M36's thirty-market grid, which carries two bars M37's
+    six-market grid does not: 2018-06-26 04:00 and 08:00, hours in which some other pool market
+    traded and none of these six did. Taking the cached bits positionally therefore misaligned
+    every slot from index 1782 onward -- 91% of the sample -- by two bars, against engine masks
+    that were always built from timestamps and were always right.
+
+    So the projection goes through the cache's own grid: a bar is held if the bar *at that
+    instant* was held. Two timelines may only be compared index by index once both are indexed
+    by the same instants.
+
+    Raises:
+        KeyError: If M37's grid carries an instant the cache does not describe. Silently
+            treating an undescribed bar as flat would be inventing a signal.
+    """
     cache = json.loads(MASK_CACHE.read_text(encoding="utf-8"))
+    stamps: list[str] = cache["grid"]
     out: dict[Holding, tuple[bool, ...]] = {}
+    wanted = [stamp.isoformat() for stamp in grid]
     for packed_key, packed in cache["masks"].items():
         sleeve, market = packed_key.split("|")
-        if sleeve in keys and market in ASSETS_M37:
-            out[sleeve, market] = tuple(c == "1" for c in packed)
+        if sleeve not in keys or market not in ASSETS_M37:
+            continue
+        held = dict(zip(stamps, packed, strict=True))
+        out[sleeve, market] = tuple(held[stamp] == "1" for stamp in wanted)
     return out
 
 
@@ -80,7 +100,14 @@ def _variant_masks(
     """Return one variant's engine timelines, and any pair of it that failed to run."""
     masks: dict[Holding, tuple[bool, ...]] = {}
     failures: dict[str, str] = {}
-    for key, row in rows.items():
+    # Sorted, not in cache order. The extraction writes each pair as its worker finishes, so
+    # two variants of the same configuration land their pairs in different orders; the
+    # portfolio then sums the same Decimals in a different sequence and the totals differ in
+    # the fortieth significant digit. That is enough to make an identical configuration compare
+    # unequal to itself, which is exactly what the control exists to detect -- so the order is
+    # fixed here and the control's claim stays exact rather than becoming a tolerance.
+    for key in sorted(rows):
+        row = rows[key]
         if row["variant"] != variant:
             continue
         if row["status"] != "succeeded":
@@ -157,8 +184,8 @@ def _print_header(signals: dict[str, Any]) -> None:
     """Print the table's header and the signal basis, which every variant is read against."""
     header = (
         f"{'VAR':5} {'CAGR':>8} {'DD':>7} {'CALMAR':>7} {'TURNOVER':>9} {'FEES':>10} "
-        f"{'RE-ENT':>7} {'STOPS':>6} {'FORCED':>7} {'EXPO':>6} {'OOS':>8} "
-        f"{'x2':>8} {'x3':>8}"
+        f"{'RE-ENT':>7} {'STOPS':>6} {'FORCED':>7} {'EXPO':>6} {'HELD%':>6} "
+        f"{'SHUT':>5} {'OOS':>8} {'x2':>8} {'x3':>8}"
     )
     sys.stdout.write(f"{header}\n{'-' * len(header)}\n")
     sys.stdout.write(
@@ -166,7 +193,7 @@ def _print_header(signals: dict[str, Any]) -> None:
         f"{float(signals['max_drawdown']):6.2%} {float(signals['calmar'] or 0):7.2f} "
         f"{float(signals['turnover']):9.1f} {float(signals['fees']):10.0f} "
         f"{'-':>7} {'-':>6} {'-':>7} {float(signals['exposure'] or 0):5.1%} "
-        f"{float(signals['oos_return'] or 0):+7.2%} "
+        f"{'100.0%':>6} {'0':>5} {float(signals['oos_return'] or 0):+7.2%} "
         f"{float(signals['cagr_x2'] or 0):+7.2%} {float(signals['cagr_x3'] or 0):+7.2%}\n"
     )
 
@@ -231,7 +258,7 @@ def main() -> int:
         series, positions(series, grid), window=LIQUIDITY_WINDOW, size=UNIVERSE_M37
     )
     allocation = Allocation(universe_size=UNIVERSE_M37, sleeves=len(keys))
-    signal_masks = _signal_masks(keys)
+    signal_masks = _signal_masks(keys, grid)
 
     sys.stdout.write(
         f"M37 ablation -- {len(ASSETS_M37)} markets, {len(keys)} sleeves, "
@@ -272,10 +299,25 @@ def main() -> int:
             codes.update(row["exits_by_code"])
             kinds.update(row["exits_by_stop_kind"])
             forced += row["forced_exits"]
+        shared = [holding for holding in masks if holding in signal_masks]
         re_entries = sum(
-            count_re_entries(mask, signal_masks[holding])
-            for holding, mask in masks.items()
-            if holding in signal_masks
+            count_re_entries(masks[holding], signal_masks[holding]) for holding in shared
+        )
+        # Turnover falling is ambiguous on its own: holding the same positions for longer and
+        # being too damaged to enter both show fewer trades, and only the first is better.
+        # These two say which happened, across the variant rather than per pair.
+        wanted = sum(sum(signal_masks[holding]) for holding in shared)
+        covered = sum(
+            sum(1 for a, b in zip(signal_masks[holding], masks[holding], strict=True) if a and b)
+            for holding in shared
+        )
+        held_share = Decimal(covered) / Decimal(wanted) if wanted else None
+        shutout = max(
+            (
+                longest_flat_while_wanted(masks[holding], signal_masks[holding])
+                for holding in shared
+            ),
+            default=0,
         )
         measured[ablation.key] = MechanismRow(
             key=ablation.key,
@@ -298,6 +340,8 @@ def main() -> int:
             "exits_by_stop_kind": dict(kinds),
             "forced_exits": forced,
             "re_entries": re_entries,
+            "held_share_of_wanted": held_share,
+            "longest_shutout_bars": shutout,
             "failures": failures,
             **card,
         }
@@ -306,7 +350,8 @@ def main() -> int:
             f"{float(card['max_drawdown']):6.2%} {float(card['calmar'] or 0):7.2f} "
             f"{float(card['turnover']):9.1f} {float(card['fees']):10.0f} "
             f"{re_entries:7d} {codes.get('protective_stop', 0):6d} {forced:7d} "
-            f"{float(card['exposure'] or 0):5.1%} {float(card['oos_return'] or 0):+7.2%} "
+            f"{float(card['exposure'] or 0):5.1%} {float(held_share or 0):5.1%} "
+            f"{shutout:5d} {float(card['oos_return'] or 0):+7.2%} "
             f"{float(card['cagr_x2'] or 0):+7.2%} {float(card['cagr_x3'] or 0):+7.2%}\n"
         )
         sys.stdout.flush()

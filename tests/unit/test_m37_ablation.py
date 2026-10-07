@@ -15,7 +15,13 @@ import pytest
 from quantplatform.core.enums import Timeframe
 from quantplatform.research.m37 import ABLATIONS, Ablation, Mechanism
 from quantplatform.research.m37_definitions import OVERRIDES, baseline_risk, risk_for
-from quantplatform.research.m37_probe import AblationRiskEngine, ExitTally, re_entries
+from quantplatform.research.m37_probe import (
+    AblationRiskEngine,
+    ExitTally,
+    held_share_of_wanted,
+    longest_flat_while_wanted,
+    re_entries,
+)
 from quantplatform.risk.config import RiskConfiguration
 from quantplatform.risk.engine import StandardRiskEngine
 
@@ -146,3 +152,80 @@ class TestReEntryDefinition:
     def test_adjacent_stretches_with_no_gap_cannot_arise_but_count_nothing(self) -> None:
         # One stretch, because the mask has no false bar between the two holdings.
         assert self._count("11111", "11111") == 0
+
+
+class TestTradingLessVersusUnableToTrade:
+    """Turnover falling is ambiguous; these two measures are what disambiguate it."""
+
+    @staticmethod
+    def _masks(engine: str, signal: str) -> tuple[tuple[bool, ...], tuple[bool, ...]]:
+        return tuple(c == "1" for c in engine), tuple(c == "1" for c in signal)
+
+    def test_holding_everything_the_strategy_wanted_is_a_full_share(self) -> None:
+        engine, signal = self._masks("111000", "111000")
+        assert held_share_of_wanted(engine, signal) == Decimal(1)
+
+    def test_holding_none_of_what_was_wanted_is_zero_not_none(self) -> None:
+        engine, signal = self._masks("000000", "111000")
+        assert held_share_of_wanted(engine, signal) == Decimal(0)
+
+    def test_a_strategy_that_wanted_nothing_has_no_share_rather_than_zero(self) -> None:
+        engine, signal = self._masks("000000", "000000")
+        assert held_share_of_wanted(engine, signal) is None
+
+    def test_holding_half_of_what_was_wanted_is_a_half(self) -> None:
+        engine, signal = self._masks("110000", "111100")
+        assert held_share_of_wanted(engine, signal) == Decimal("0.5")
+
+    def test_holding_what_was_not_wanted_does_not_inflate_the_share(self) -> None:
+        # The denominator is what the strategy asked for, so extra holding cannot exceed one.
+        engine, signal = self._masks("111111", "110000")
+        assert held_share_of_wanted(engine, signal) == Decimal(1)
+
+    def test_many_brief_absences_and_one_long_shutout_are_told_apart(self) -> None:
+        scattered, signal = self._masks("10101010", "11111111")
+        one_block, _ = self._masks("11110000", "11111111")
+        assert held_share_of_wanted(scattered, signal) == held_share_of_wanted(one_block, signal)
+        assert longest_flat_while_wanted(scattered, signal) == 1
+        assert longest_flat_while_wanted(one_block, signal) == 4
+
+    def test_a_flat_run_the_strategy_did_not_want_is_not_counted(self) -> None:
+        engine, signal = self._masks("110000", "110000")
+        assert longest_flat_while_wanted(engine, signal) == 0
+
+    def test_mismatched_lengths_are_refused_rather_than_silently_truncated(self) -> None:
+        with pytest.raises(ValueError, match="zip"):
+            held_share_of_wanted((True, False), (True,))
+
+
+class TestTimelinesMustShareAGrid:
+    """Two timelines may only be compared index by index once both index the same instants.
+
+    M37 compared engine masks built on a six-market grid against signal masks cached on M36's
+    thirty-market grid. The latter carries two bars the former does not -- hours in which some
+    other pool market traded and none of these six did -- so every slot from index 1782 onward,
+    91% of the sample, referred to a different bar. The comparison functions cannot detect that
+    on their own, but they can refuse the length mismatch it produces, and anything that
+    silently truncates instead would have hidden it.
+    """
+
+    def test_re_entries_refuses_timelines_of_different_lengths(self) -> None:
+        with pytest.raises(ValueError, match="zip"):
+            re_entries((True, False, True), (True, False))
+
+    def test_held_share_refuses_timelines_of_different_lengths(self) -> None:
+        with pytest.raises(ValueError, match="zip"):
+            held_share_of_wanted((True, False, True), (True, False))
+
+    def test_longest_shutout_refuses_timelines_of_different_lengths(self) -> None:
+        with pytest.raises(ValueError, match="zip"):
+            longest_flat_while_wanted((True, False, True), (True, False))
+
+    def test_two_bars_of_shift_changes_the_answer_and_so_must_not_be_silent(self) -> None:
+        # The same timeline read two bars late reports different churn, which is why the
+        # projection goes through timestamps rather than positions.
+        signal = tuple(c == "1" for c in "1111111111")
+        engine = tuple(c == "1" for c in "1100110011")
+        shifted = (*engine[2:], False, False)
+        assert re_entries(engine, signal) == 2
+        assert re_entries(shifted, signal) == 1

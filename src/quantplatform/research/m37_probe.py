@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from decimal import Decimal
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,14 @@ if TYPE_CHECKING:
     from quantplatform.core.models.portfolio import Position
     from quantplatform.core.models.risk import PositionRiskState, RiskAction
 
-__all__ = ["AblationRiskEngine", "ExitTally", "re_entries", "stretches"]
+__all__ = [
+    "AblationRiskEngine",
+    "ExitTally",
+    "held_share_of_wanted",
+    "longest_flat_while_wanted",
+    "re_entries",
+    "stretches",
+]
 
 
 @dataclass
@@ -132,6 +140,15 @@ def re_entries(engine: Sequence[bool], signal: Sequence[bool]) -> int:
     changing its mind, and conflating them would attribute the strategy's own decisions to
     Risk V2.
     """
+    if len(engine) != len(signal):
+        msg = (
+            f"zip of timelines of unequal length: engine has {len(engine)} bars and signal has "
+            f"{len(signal)}. Two timelines may only be compared index by index once both are "
+            f"indexed by the same instants; slicing around the difference would silently "
+            f"compare different bars, which is how a two-bar grid mismatch once went unnoticed "
+            f"across 91% of a sample."
+        )
+        raise ValueError(msg)
     spans = stretches(engine)
     count = 0
     for (_, prior_end), (start, _) in pairwise(spans):
@@ -139,3 +156,35 @@ def re_entries(engine: Sequence[bool], signal: Sequence[bool]) -> int:
         if gap and all(gap):
             count += 1
     return count
+
+
+def held_share_of_wanted(engine: Sequence[bool], signal: Sequence[bool]) -> Decimal | None:
+    """Return the share of the bars the strategy wanted a position on which one was held.
+
+    The measure that tells a mechanism trading *less* apart from an account unable to trade at
+    all. Turnover falling is ambiguous on its own: a mechanism that holds the same positions
+    for longer and a mechanism that leaves the account too damaged to enter both show fewer
+    trades, and only the first is an improvement. This separates them, because the second
+    cannot hold what the strategy is asking for.
+
+    ``None`` where the strategy never wanted anything, which is not a zero.
+    """
+    wanted = sum(1 for want in signal if want)
+    if wanted == 0:
+        return None
+    held = sum(1 for want, have in zip(signal, engine, strict=True) if want and have)
+    return Decimal(held) / Decimal(wanted)
+
+
+def longest_flat_while_wanted(engine: Sequence[bool], signal: Sequence[bool]) -> int:
+    """Return the longest unbroken run of bars the strategy wanted in and nothing was held.
+
+    A companion to :func:`held_share_of_wanted`, which a share alone can hide: the same share
+    arises from many brief absences and from one long shutout, and those are different
+    failures.
+    """
+    longest = run = 0
+    for want, have in zip(signal, engine, strict=True):
+        run = run + 1 if (want and not have) else 0
+        longest = max(longest, run)
+    return longest

@@ -42,10 +42,11 @@ from quantplatform.research.m37 import (
     UNIVERSE_M37,
     Alternative,
     MechanismRow,
+    Rejection,
     primary_causes,
     survives,
 )
-from quantplatform.research.m37_alternatives import ALTERNATIVES
+from quantplatform.research.m37_alternatives import ALTERNATIVES, INFEASIBLE
 from quantplatform.research.m37_probe import longest_flat_while_wanted
 from quantplatform.research.m37_probe import re_entries as count_re_entries
 from quantplatform.research.portfolio import (
@@ -267,6 +268,27 @@ def _judge(
         )
 
 
+def _outcome(
+    reasons: Sequence[Rejection],
+    *,
+    passed: bool,
+    infeasible: str | None,
+    traded: bool,
+) -> str:
+    """Return one line saying what happened, distinguishing not-built from measured-and-failed.
+
+    The distinction matters for what comes next: an alternative that failed its criteria closes
+    the question, and one that could not be built leaves it open and names a defect instead.
+    """
+    if infeasible is not None:
+        return f"NOT CONSTRUCTIBLE: {infeasible}"
+    if not traded:
+        return "NOT CONSTRUCTIBLE: no position was ever opened, so nothing was measured"
+    if passed:
+        return "SURVIVES"
+    return f"REJECTED: {', '.join(r.value for r in reasons)}"
+
+
 def _judge_alternatives(
     rows: dict[str, Any],
     panel: Panel,
@@ -326,6 +348,13 @@ def _judge_alternatives(
             row=row_measured,
         )
         passed, reasons = survives(alternative, base=base, signals_annual=signals_annual)
+        # An alternative that never traded has not been measured, and must not be reported as
+        # though it had. Run as declared, ALT1 produced zero trades, so every criterion reads
+        # as failed on performance -- "edge not conserved", "cost fragile" -- when the truth is
+        # that the engine refused every entry. The declared infeasibility takes precedence over
+        # the arithmetic, which is only describing an empty run.
+        infeasible = INFEASIBLE.get(spec.key)
+        traded = row_measured.turnover > 0
         recovered = (
             (row_measured.annual - base.annual) / (signals_annual - base.annual)
             if row_measured.annual is not None and base.annual is not None
@@ -344,8 +373,7 @@ def _judge_alternatives(
             f"x2 {float(card['cagr_x2'] or 0):+7.2%}  x3 {float(card['cagr_x3'] or 0):+7.2%}\n"
             f"  turnover cut {float(cut or 0):+6.1%} (needs >= 25%)   "
             f"edge recovered {float(recovered or 0):+6.1%} (needs >= 50%)\n"
-            f"  {'SURVIVES' if passed else 'REJECTED'}"
-            f"{'' if passed else ': ' + ', '.join(r.value for r in reasons)}\n"
+            f"  {_outcome(reasons, passed=passed, infeasible=infeasible, traded=traded)}\n"
         )
         verdicts[spec.key] = {
             "label": spec.label,
@@ -358,8 +386,10 @@ def _judge_alternatives(
             "held_share_of_wanted": Decimal(covered) / Decimal(wanted) if wanted else None,
             "turnover_cut": cut,
             "edge_recovered": recovered,
-            "survives": passed,
-            "rejected_for": [r.value for r in reasons],
+            "survives": passed and traded,
+            "infeasible": infeasible,
+            "traded": traded,
+            "rejected_for": [] if infeasible or not traded else [r.value for r in reasons],
             "failures": failures,
             **card,
         }

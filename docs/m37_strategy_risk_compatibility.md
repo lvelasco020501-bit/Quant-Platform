@@ -195,3 +195,148 @@ Reproducible con `scripts/m37_ablate.py` (caché reanudable por variante-sleeve-
 Lo que B *no* es: una solución. B no tiene stop ninguno — cero protección contra pérdidas
 grandes — y su drawdown es **36.03%**, por encima del tope de 35%. B es el diagnóstico, no el
 remedio.
+
+---
+
+# Fase 2 — alternativa estructural
+
+## ALT1: **NO CONSTRUIBLE**, y el límite que la rechaza es un hallazgo
+
+ALT1 (stop de seguridad en `max_stop_distance_bps` = 2000 bps) corrió tal como estaba declarado
+y dio **0 trades en los 12 pares**: 211 rechazos de entrada con *"the stop is further than
+max_stop_distance_bps permits"*.
+
+**Mecanismo.** El motor deriva el **precio** del stop, lo redondea al tick del venue
+**alejándolo** de la entrada (dirección conservadora y correcta), y luego **re-deriva la
+distancia desde ese nivel redondeado** y la compara contra el límite del budget. Un stop
+configurado exactamente en el límite realiza marginalmente *fuera* de él, y la entrada se
+rechaza:
+
+| entry | stop redondeado | distancia realizada | veredicto |
+|---|---|---|---|
+| 100.00 | 80.00 | 2000.000000 bps | ok |
+| 23.456 | 18.76 | 2002.046385 bps | **RECHAZADO** |
+| 0.4567 | 0.36 | 2117.363696 bps | **RECHAZADO** |
+| 61 234.57 | 48 987.65 | 2000.000980 bps | **RECHAZADO** |
+
+12 de 16 combinaciones precio/tick rechazan; en la práctica **todos** los precios reales, porque
+solo sobrevive un precio cuyo nivel al 80% cae exacto en un tick.
+
+### BUG documentado (no arreglado en producción)
+
+**`max_stop_distance_bps` se lee como límite inclusivo y se comporta como exclusivo.**
+
+- Dónde: `src/quantplatform/risk/sizing.py`, `_check_distance_window` —
+  `if distance_bps > budget.max_stop_distance_bps: raise`.
+- Causa: la distancia comparada es la **realizada** (post-redondeo a tick), no la **configurada**.
+  El redondeo conservador siempre aleja el stop, así que la realizada ≥ la configurada.
+- Efecto: una configuración legal (`initial_stop_distance_bps == max_stop_distance_bps`, que el
+  validador de `RiskConfiguration` acepta) **rechaza el 100% de las entradas en runtime**. Falla
+  cerrado, que es lo correcto en seguridad, pero de forma indistinguible de "la estrategia no
+  quiso entrar".
+- **No se corrigió.** Research only; la capa de riesgo no se tocó. Va a la propuesta Risk V3.
+
+ALT1 **queda declarado**, no borrado, con su fallo registrado como dato en `INFEASIBLE` y con
+tests que verifican que el registro existe y que ALT1 sigue declarado. Su fila en el informe se
+reporta como **NOT CONSTRUCTIBLE**, no como un rechazo por rendimiento: nunca abrió una posición,
+así que no se midió nada.
+
+## ALT2: re-declaración — viabilidad, no ambición
+
+Misma estructura, con la distancia tomada de la **convención de duplicado del propio proyecto**
+(la que usa M22 en `Horizon.DOUBLED`, y M29 y M30 en sus vecinos de sensibilidad) aplicada al
+stop que reemplaza: **600 → 1200 bps**. No es un número elegido por rendimiento; es la forma
+establecida en este código de ensanchar un parámetro. Se comprobó antes **solo por viabilidad**
+(22 trades contra los 0 de ALT1, sin rechazos de budget), nunca por retorno, y se commiteó
+**antes** de correrse.
+
+La distancia es **dirigida por regla, no por valor**: `stop_distance_for` toma un `StopRule`, no
+tiene ninguna rama que devuelva un literal, rechaza una distancia que no sea más ancha que la que
+reemplaza, y rechaza una que exceda el máximo del budget **en vez de recortarla** — recortar
+produciría silenciosamente un stop que la declaración nunca describió.
+
+Coste declarado de antemano: la posición pasa de 16.7% a **8.33%** del equity, porque el sizing
+por riesgo divide el budget por la distancia del stop. Un test fija esa relación.
+
+## BASE vs ALT2
+
+| medida | BASE | **ALT2** | SIG (solo señales) |
+|---|---|---|---|
+| CAGR | +14.41% | **+33.58%** | +43.19% |
+| DD máximo | 22.15% | **33.84%** | 23.65% |
+| Calmar | 0.65 | **0.99** | 1.83 |
+| retorno total | 2.38× | **12.69×** | 24.63× |
+| turnover | 397.8 | **193.8** | 192.9 |
+| fees | 12 219 | 18 864 | 31 584 |
+| re-entries | 1 350 | **16** | — |
+| stops | 1 778 | **103** | — |
+| forced exits | 2 134 | **103** | — |
+| exposición | 41.3% | 56.7% | 58.7% |
+| **held % de lo que la señal quería** | 47.3% | **91.6%** | 100% |
+| episodios | 2 301 | 958 | 947 |
+| OOS retorno | +47.53% | **+69.33%** | +75.07% |
+| OOS DD | 9.65% | 19.51% | 16.20% |
+| stress ×2 | +7.10% | **+29.35%** | +38.67% |
+| stress ×3 | +0.25% | **+25.26%** | +34.30% |
+| mejor año / beneficio | 30.24% | 43.30% | 38.72% |
+
+Composición de salidas: BASE `{protective_stop: 1778, take_profit: 304, time_stop: 52}` →
+ALT2 `{protective_stop: 103}`. **Una sola vía de salida de riesgo, y usada 17× menos.**
+
+### Sobre las fees, que suben mientras el turnover baja
+
+No es una contradicción. El turnover cae a la mitad (397.8 → 193.8) pero las fees absolutas
+suben 1.54× **porque la cuenta creció 5.34×** (retorno total 2.38× → 12.69×). Las fees son
+moneda absoluta sobre un equity mucho mayor: por unidad de turnover, BASE paga 30.7 y ALT2 97.4,
+que es exactamente el mismo coste proporcional aplicado a una cuenta más grande. ALT2 **opera la
+mitad y gana cinco veces más**; paga más comisión en términos absolutos por eso, no por churn.
+
+## ALT2 contra los criterios predeclarados
+
+| criterio | umbral | ALT2 | |
+|---|---|---|---|
+| protección clara contra pérdidas grandes | existe un stop | stop duro a 1200 bps | **PASA** |
+| reduce turnover sustancialmente | ≥ 25% | **51.3%** | **PASA** |
+| OOS positivo | > 0 | +69.33% | **PASA** |
+| stress positivo | ×2 y ×3 > 0 | +29.35% / +25.26% | **PASA** |
+| DD controlado | ≤ 35% | **33.84%** | **PASA** |
+| no introduce ratchet | — | trailing eliminado; sin latch | **PASA** |
+| no aumenta fragilidad | Calmar ≥ 0.50 | **0.99** | **PASA** |
+| conserva mucho más del edge | ≥ 50% de la brecha | **66.6%** | **PASA** |
+
+**ALT2 sobrevive los ocho criterios.** Ninguno se ajustó: todos estaban fijados en
+`m37.py` y `m37_alternatives.py` antes de correr.
+
+### Las dos preguntas directas
+
+**¿Conserva claramente más del edge de señal?** Sí. Recupera **66.6%** de los 28.78 puntos de
+brecha BASE→SIG (bar predeclarado: 50%). CAGR +14.41% → +33.58% contra un techo de señal de
++43.19%. Y mantiene posición en el **91.6%** de las barras en que la estrategia la quería, contra
+el 47.3% de BASE — el edge se conserva porque la cuenta **está en el mercado cuando la regla lo
+pide**.
+
+**¿Mantiene protección razonable?** Sí, con una salvedad honesta. Hay un stop duro real a 1200
+bps que cierra cualquier posición antes de que la pérdida sea ilimitada, no hay ratchet, y los
+breakers siguen exactamente como están desplegados. Pero el **drawdown sube de 22.15% a 33.84%**
+— dentro del tope de 35%, y a 1.16 puntos de él. La protección es real pero **más laxa**: se
+compra +19.2 puntos de CAGR con +11.7 puntos de drawdown. Eso es una mejora clara en Calmar
+(0.65 → 0.99) y no un almuerzo gratis.
+
+## Veredicto M37
+
+**GO para diseño de Risk V3 — research only. Sin desplegar.**
+
+Dos incompatibilidades concretas quedan demostradas:
+
+1. **El stop protector gestionado destruye este edge.** Cierra el 92.7% de las posiciones, genera
+   1 350 re-entries, cuadruplica el turnover y deja la cuenta fuera del mercado el 52.7% del
+   tiempo en que la estrategia la quiere dentro. Sus tres partes no son separables porque son un
+   solo nivel de stop con tres formas de moverse.
+2. **`max_stop_distance_bps` es inalcanzable como distancia configurada**, por comparar la
+   distancia realizada post-redondeo contra el límite.
+
+Y una alternativa estructural mínima pasa todos los criterios predeclarados sobre este universo.
+
+**Lo que esto NO autoriza:** desplegar nada. Los números de M37 son sobre 6 mercados a breadth 6
+—que nunca selecciona— y **no son comparables con M36**. Una Risk V3 tendría que re-validarse
+sobre el universo completo y bajo el gate del proyecto antes de acercarse a paper.

@@ -216,6 +216,103 @@ def test_a_stop_wider_than_the_budget_permits_is_refused() -> None:
         )
 
 
+# --- The maximum distance is inclusive of one tick's rounding -------------------------------------
+#
+# The distance this sizer checks is the realised one, measured from a stop level already rounded
+# to the venue tick. Rounding is conservative -- it moves a stop away from the entry, never
+# towards it -- so the realised distance can exceed the configured one by up to a tick. Without a
+# tolerance, a stop configured *at* max_stop_distance_bps was refused for every price whose level
+# did not land exactly on a tick, which is almost every price: 24 of 36 sampled price/tick
+# combinations in M37, and every entry in a nine-year run on six markets. The bound reads as
+# inclusive and now behaves that way.
+#
+# The tolerance is exactly one tick because the rounding error is strictly less than one tick by
+# construction. It admits the configurations the budget already permits and no others. The
+# minimum keeps no tolerance at all: rounding only ever widens a stop, so it cannot carry a
+# too-near stop into the window, and a tolerance there would admit stops the budget forbids.
+
+
+def test_a_stop_exactly_at_the_maximum_is_accepted() -> None:
+    # 2 000 bps is 20%, so on a 100 000 entry the boundary level is exactly 80 000.
+    outcome = RiskBasedSizer().size(
+        _request(
+            budget=_budget(max_stop_distance_bps=Decimal(2000)),
+            stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("80000")),
+        )
+    )
+    assert outcome.quantity > 0
+
+
+def test_a_stop_pushed_just_past_the_maximum_by_tick_rounding_is_accepted() -> None:
+    # The level is one tick further than the configured 2 000 bps would put it, which is the
+    # most that rounding to a 0.01 tick can move it. Before the fix this raised.
+    outcome = RiskBasedSizer().size(
+        _request(
+            budget=_budget(max_stop_distance_bps=Decimal(2000)),
+            stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("79999.99")),
+            rules=make_symbol_rules(price_tick=Decimal("0.01")),
+        )
+    )
+    assert outcome.quantity > 0
+
+
+def test_a_stop_further_than_one_tick_past_the_maximum_is_still_refused() -> None:
+    # Two ticks out is beyond anything rounding can explain, so it is a stop the budget forbids.
+    # 79 999.98 is 2000.002 bps against a tolerated 2000.001.
+    with pytest.raises(RiskSizingError, match="max_stop_distance_bps"):
+        RiskBasedSizer().size(
+            _request(
+                budget=_budget(max_stop_distance_bps=Decimal(2000)),
+                stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("79999.98")),
+                rules=make_symbol_rules(price_tick=Decimal("0.01")),
+            )
+        )
+
+
+def test_the_tolerance_scales_with_the_venue_tick_rather_than_being_a_fixed_margin() -> None:
+    # A coarser tick can move a stop further, so it must tolerate more -- and a level that a
+    # 1.00 tick explains is refused on a venue whose tick is 0.01.
+    coarse = _request(
+        budget=_budget(max_stop_distance_bps=Decimal(2000)),
+        stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("79999")),
+        rules=make_symbol_rules(price_tick=Decimal("1.00")),
+    )
+    assert RiskBasedSizer().size(coarse).quantity > 0
+    with pytest.raises(RiskSizingError, match="max_stop_distance_bps"):
+        RiskBasedSizer().size(
+            _request(
+                budget=_budget(max_stop_distance_bps=Decimal(2000)),
+                stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("79999")),
+                rules=make_symbol_rules(price_tick=Decimal("0.01")),
+            )
+        )
+
+
+def test_the_minimum_distance_keeps_no_tolerance() -> None:
+    # Rounding can only widen a stop, so nothing it does can bring a too-near stop into the
+    # window. A tolerance here would admit a stop inside the noise the budget excludes.
+    with pytest.raises(RiskSizingError, match="min_stop_distance_bps"):
+        RiskBasedSizer().size(
+            _request(
+                budget=_budget(min_stop_distance_bps=Decimal(200)),
+                stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("98000.01")),
+                rules=make_symbol_rules(price_tick=Decimal("0.01")),
+            )
+        )
+
+
+def test_the_refusal_still_reports_the_configured_limit_not_the_tolerated_one() -> None:
+    # An operator reading the error needs the number they configured, not an internal sum.
+    with pytest.raises(RiskSizingError) as raised:
+        RiskBasedSizer().size(
+            _request(
+                budget=_budget(max_stop_distance_bps=Decimal(100)),
+                stop=StopSpecification(kind=StopKind.HARD, trigger_price=Decimal("90000")),
+            )
+        )
+    assert "100" in str(raised.value)
+
+
 # --- Caps are not this sizer's job ---------------------------------------------------------------
 #
 # An earlier draft of RiskBasedSizer applied exposure and balance caps itself. Integrating it

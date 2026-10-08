@@ -269,7 +269,9 @@ class RiskBasedSizer:
         self._check_direction(request, trigger)
 
         distance = abs(request.entry_price - trigger)
-        self._check_distance_window(distance, request.entry_price, budget)
+        self._check_distance_window(
+            distance, request.entry_price, budget, tick=request.rules.price_tick
+        )
 
         policy = request.policy if request.policy is not None else ExecutionPolicy()
         exit_price = policy.slippage.adjust(trigger, self._exit_side(request.side))
@@ -357,15 +359,42 @@ class RiskBasedSizer:
             )
 
     @staticmethod
-    def _check_distance_window(distance: Decimal, entry: Decimal, budget: RiskBudget) -> None:
+    def _check_distance_window(
+        distance: Decimal, entry: Decimal, budget: RiskBudget, *, tick: Decimal
+    ) -> None:
         """Check the stop is neither inside the noise nor so wide sizing is meaningless.
 
+        The distance measured here is the **realised** one: it comes from a stop level already
+        rounded to the venue's price tick. That rounding is conservative -- it moves a stop away
+        from the entry, never towards it -- so the realised distance is never smaller than the
+        distance that was configured, and may be larger by up to one tick.
+
+        That asymmetry is why the two bounds are not checked the same way. The minimum stays
+        strict: rounding can only widen a stop, so it can never carry a too-near stop into the
+        window, and a tolerance there would admit stops the budget forbids. The maximum carries
+        a tolerance of exactly one tick's worth of basis points, because without it a stop
+        configured *at* ``max_stop_distance_bps`` is refused for every price whose level does
+        not land exactly on a tick -- which is to say almost every price. The bound reads as
+        inclusive and must behave that way.
+
+        One tick is the tight bound, not a margin chosen for comfort: the rounding error is
+        strictly less than one tick by construction, so this admits exactly the configurations
+        the budget already permits and no others.
+
+        Args:
+            distance: The realised distance between entry and the rounded stop level.
+            entry: The entry price the distance is measured against.
+            budget: The window the distance must fall inside.
+            tick: The venue's price tick, which bounds how far rounding can have moved the stop.
+
         Raises:
-            RiskSizingError: If the distance falls outside the budget's window.
+            RiskSizingError: If the distance falls outside the budget's window, the maximum
+                being read inclusively of one tick's rounding.
         """
         with localcontext() as ctx:
             ctx.prec = DECIMAL_WORKING_PRECISION
             distance_bps = (distance / entry) * _BASIS_POINT_DIVISOR
+            tick_bps = (tick / entry) * _BASIS_POINT_DIVISOR
         if distance_bps < budget.min_stop_distance_bps:
             msg = "the stop is nearer than min_stop_distance_bps permits"
             raise RiskSizingError(
@@ -373,12 +402,13 @@ class RiskBasedSizer:
                 distance_bps=str(distance_bps),
                 limit=str(budget.min_stop_distance_bps),
             )
-        if distance_bps > budget.max_stop_distance_bps:
+        if distance_bps > budget.max_stop_distance_bps + tick_bps:
             msg = "the stop is further than max_stop_distance_bps permits"
             raise RiskSizingError(
                 msg,
                 distance_bps=str(distance_bps),
                 limit=str(budget.max_stop_distance_bps),
+                tick_tolerance_bps=str(tick_bps),
             )
 
     @staticmethod

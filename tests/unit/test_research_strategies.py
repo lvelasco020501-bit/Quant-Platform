@@ -179,6 +179,20 @@ _EVERY_CONFIGURATION: tuple[tuple[str, dict[str, object]], ...] = (
             "max_compression": "1",
         },
     ),
+    # M39's three. Listed here rather than only in their own file so they inherit this file's
+    # generic contracts too: declared features must be the ones the pipeline builds, and
+    # declared warm-up must match what those features actually need.
+    ("trend_pullback", {"trend_window": 168, "pullback_window": 24}),
+    (
+        "breakout_retest",
+        {
+            "trend_window": 168,
+            "breakout_lookback": 20,
+            "recent_lookback": 10,
+            "exit_lookback": 10,
+        },
+    ),
+    ("dual_horizon_momentum", {"fast_window": 24, "slow_window": 168}),
 )
 
 

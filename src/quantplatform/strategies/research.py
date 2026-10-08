@@ -901,6 +901,223 @@ class RangeCompressionBreakoutStrategy(ParametricStrategy):
         return ()
 
 
+# --- M39: rules written to be measured through Risk V2 from the first run ------------------------
+#
+# Every earlier family here was screened on signal timelines and only later handed to Risk V2,
+# which closed 92.7% of its positions (M37). These three are chosen for where they *enter*,
+# because that is what decides where a 600 bps stop lands. Two enter on weakness inside strength,
+# so the stop sits below a level the market has just defended; the third enters on agreement
+# between two horizons, which is an extended price, and is M39's declared control.
+
+
+class TrendPullbackParameters(BaseModel):
+    """Parameters for :class:`TrendPullbackStrategy`."""
+
+    model_config = FROZEN
+    trend_window: Window
+    pullback_window: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.pullback_window >= self.trend_window:
+            msg = "pullback_window must sit below trend_window: a pullback is a shorter horizon"
+            raise ValueError(msg)
+        return self
+
+
+class TrendPullbackStrategy(ParametricStrategy):
+    """Buys weakness inside strength: a long trend still up, a short horizon down."""
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "trend_pullback",
+        "Pullback inside a trend",
+        "Long-only: enters while long-horizon momentum is positive and short-horizon momentum "
+        "is negative, so the entry lands after a retracement rather than at an extension; "
+        "exits when the long horizon turns negative.",
+        TrendPullbackParameters,
+        ("roc_168", "roc_24"),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return the two momentum horizons."""
+        p = self._typed(TrendPullbackParameters)
+        return (f"roc_{p.trend_window}", f"roc_{p.pullback_window}")
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter on a retracement in an uptrend; exit when the uptrend ends."""
+        p = self._typed(TrendPullbackParameters)
+        trend_name = f"roc_{p.trend_window}"
+        pullback_name = f"roc_{p.pullback_window}"
+        if context.position_state is PositionState.FLAT:
+            values = self._read(context, trend_name, pullback_name)
+            if values is None:
+                return ()
+            trend, pullback = values
+            if trend > 0 and pullback < 0:
+                return self._enter(
+                    context,
+                    f"{trend_name} {trend} up while {pullback_name} {pullback} pulled back",
+                    {trend_name: trend, pullback_name: pullback},
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            values = self._read(context, trend_name)
+            if values is not None and values[0] < 0:
+                return self._exit(
+                    context, f"{trend_name} {values[0]} turned negative", {trend_name: values[0]}
+                )
+        return ()
+
+
+class BreakoutRetestParameters(BaseModel):
+    """Parameters for :class:`BreakoutRetestStrategy`."""
+
+    model_config = FROZEN
+    trend_window: Window
+    breakout_lookback: Window
+    recent_lookback: Window
+    exit_lookback: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.recent_lookback >= self.breakout_lookback:
+            msg = (
+                "recent_lookback must sit below breakout_lookback: the rule asks whether the "
+                "longer window's high was set inside the shorter one, which is vacuous when "
+                "they coincide and backwards when they are inverted"
+            )
+            raise ValueError(msg)
+        return self
+
+
+class BreakoutRetestStrategy(ParametricStrategy):
+    """Buys a breakout that already happened, on the way back rather than at the extreme."""
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "breakout_retest",
+        "Breakout retest",
+        "Long-only: enters while long-horizon momentum is positive, the breakout window's high "
+        "was set inside the recent window -- so a breakout happened lately -- and price now "
+        "sits below that high, which is the retest; exits on a new low of the exit window.",
+        BreakoutRetestParameters,
+        ("roc_168", "donchian_high_20", "donchian_high_10", "donchian_low_10"),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return the trend leg, both channel highs and the exit low."""
+        p = self._typed(BreakoutRetestParameters)
+        names = (
+            f"roc_{p.trend_window}",
+            f"donchian_high_{p.breakout_lookback}",
+            f"donchian_high_{p.recent_lookback}",
+            f"donchian_low_{p.exit_lookback}",
+        )
+        return tuple(dict.fromkeys(names))
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter on the retest of a recent breakout; exit on a new low.
+
+        The recency test is an identity rather than a stored flag: the recent window's high can
+        never exceed the breakout window's, because it maximises over a subset of the same bars,
+        so the two being equal says the longer window's high was set inside the shorter one.
+        That is a breakout within the last ``recent_lookback`` bars, read from features the
+        pipeline already emits and with no state of the strategy's own.
+        """
+        p = self._typed(BreakoutRetestParameters)
+        trend_name = f"roc_{p.trend_window}"
+        breakout_name = f"donchian_high_{p.breakout_lookback}"
+        recent_name = f"donchian_high_{p.recent_lookback}"
+        exit_name = f"donchian_low_{p.exit_lookback}"
+        if context.position_state is PositionState.FLAT:
+            values = self._read(context, trend_name, breakout_name, recent_name)
+            if values is None:
+                return ()
+            trend, breakout_high, recent_high = values
+            close = context.bars[-1].close
+            if trend > 0 and recent_high >= breakout_high and close < recent_high:
+                return self._enter(
+                    context,
+                    f"{trend_name} {trend} up, {breakout_name} {breakout_high} set within "
+                    f"{p.recent_lookback} bars, close {close} back below it",
+                    {trend_name: trend, breakout_name: breakout_high, recent_name: recent_high},
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            values = self._read(context, exit_name)
+            if values is not None and context.bars[-1].close < values[0]:
+                return self._exit(
+                    context,
+                    f"close {context.bars[-1].close} broke {exit_name} {values[0]}",
+                    {exit_name: values[0]},
+                )
+        return ()
+
+
+class DualHorizonMomentumParameters(BaseModel):
+    """Parameters for :class:`DualHorizonMomentumStrategy`."""
+
+    model_config = FROZEN
+    fast_window: Window
+    slow_window: Window
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.fast_window >= self.slow_window:
+            msg = "fast_window must sit below slow_window"
+            raise ValueError(msg)
+        return self
+
+
+class DualHorizonMomentumStrategy(ParametricStrategy):
+    """Buys strength confirmed across two horizons. M39's declared control.
+
+    Distinct from :class:`RegimeTrendStrategy`, which confirms momentum with an efficiency
+    ratio: this one asks a second momentum horizon to agree. It is included because M39's
+    hypothesis predicts it will keep the *least* of its signal performance under Risk V2 -- it
+    enters while both horizons are positive, which is an extended price. If it instead keeps the
+    most, the reasoning behind the other two families was wrong.
+    """
+
+    METADATA: ClassVar[StrategyMetadata] = metadata_for(
+        "dual_horizon_momentum",
+        "Dual-horizon momentum",
+        "Long-only: enters when both the fast and slow momentum horizons are positive; exits "
+        "when the fast horizon turns negative.",
+        DualHorizonMomentumParameters,
+        ("roc_24", "roc_168"),
+    )
+
+    def feature_names(self) -> tuple[str, ...]:
+        """Return both momentum horizons."""
+        p = self._typed(DualHorizonMomentumParameters)
+        return (f"roc_{p.fast_window}", f"roc_{p.slow_window}")
+
+    def generate(self, context: StrategyContext) -> Sequence[Signal]:
+        """Enter when both horizons agree; exit when the fast one turns."""
+        p = self._typed(DualHorizonMomentumParameters)
+        fast_name = f"roc_{p.fast_window}"
+        slow_name = f"roc_{p.slow_window}"
+        if context.position_state is PositionState.FLAT:
+            values = self._read(context, fast_name, slow_name)
+            if values is None:
+                return ()
+            fast, slow = values
+            if fast > 0 and slow > 0:
+                return self._enter(
+                    context,
+                    f"{fast_name} {fast} and {slow_name} {slow} both positive",
+                    {fast_name: fast, slow_name: slow},
+                )
+            return ()
+        if context.position_state is PositionState.LONG:
+            values = self._read(context, fast_name)
+            if values is not None and values[0] < 0:
+                return self._exit(
+                    context, f"{fast_name} {values[0]} turned negative", {fast_name: values[0]}
+                )
+        return ()
+
+
 RESEARCH_STRATEGIES: Final[tuple[type[ParametricStrategy], ...]] = (
     MomentumStrategy,
     EmaSlopeStrategy,
@@ -915,9 +1132,12 @@ RESEARCH_STRATEGIES: Final[tuple[type[ParametricStrategy], ...]] = (
     BollingerSqueezeBreakoutStrategy,
     VolatilityCompressionBreakoutStrategy,
     RangeCompressionBreakoutStrategy,
+    TrendPullbackStrategy,
+    BreakoutRetestStrategy,
+    DualHorizonMomentumStrategy,
 )
-"""Every research strategy: M13's ten, plus M33's three compression rules. Deliberately not
-:data:`BUILTIN_STRATEGIES` -- nothing here is available to paper trading."""
+"""Every research strategy: M13's ten, M33's three compression rules, and M39's three.
+Deliberately not :data:`BUILTIN_STRATEGIES` -- nothing here is available to paper trading."""
 
 
 def build_research_registry() -> StrategyRegistry:

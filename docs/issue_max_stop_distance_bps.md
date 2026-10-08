@@ -112,10 +112,10 @@ máximo tolera ahora exactamente `un tick expresado en bps`; el mínimo **no tol
 
 ```python
 distance_bps = (distance / entry) * _BASIS_POINT_DIVISOR
-tick_bps     = (tick / entry) * _BASIS_POINT_DIVISOR
-if distance_bps < budget.min_stop_distance_bps:            # estricto
+tick_bps = (tick / entry) * _BASIS_POINT_DIVISOR
+if distance_bps < budget.min_stop_distance_bps:  # estricto
     raise ...
-if distance_bps > budget.max_stop_distance_bps + tick_bps: # inclusivo en un tick
+if distance_bps > budget.max_stop_distance_bps + tick_bps:  # inclusivo en un tick
     raise ...
 ```
 

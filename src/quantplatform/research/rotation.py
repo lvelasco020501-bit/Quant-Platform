@@ -61,6 +61,7 @@ __all__ = [
     "align",
     "basket_index",
     "buy_and_hold",
+    "contiguous",
     "dollar_volume",
     "eligible_universe",
     "equal_weight_basket",
@@ -295,7 +296,7 @@ def _scores(
     for asset, bars in series.items():
         out[asset] = tuple(
             None
-            if slot is None or not _contiguous(bars, slot, span)
+            if slot is None or not contiguous(bars, slot, span)
             else _one_score(
                 pipeline.compute(bars[max(0, slot + 1 - depth) : slot + 1]),
                 roc_name=roc_name,
@@ -308,12 +309,21 @@ def _scores(
     return out
 
 
-def _contiguous(bars: Sequence[MarketBar], slot: int, span: int) -> bool:
-    """Return whether the ``span`` bars ending at ``slot`` are adjacent in calendar time.
+def contiguous(bars: Sequence[MarketBar], slot: int, span: int) -> bool:
+    """Return whether the window of ``span`` steps ending at ``slot`` is unbroken in time.
+
+    That is the ``span + 1`` bars from ``slot - span`` to ``slot`` inclusive, which is what a
+    feature reading ``span`` one-bar changes actually consumes.
 
     Checked on the endpoints rather than every step: the series is already known to be in
     ascending order with one bar per open time, so a hole anywhere inside the window shows up
     as a shortfall between its ends.
+
+    Public because more than one measurement needs it. M31 found the reason on FTT, halted on
+    Binance for 311 days: its bars either side of the hole are adjacent in the file, so a
+    72-bar return across the seam is silently a 383-day return. A volatility read over such a
+    window is wrong in the same way, so M42's estimate is held to the same rule rather than to
+    a second copy of it.
     """
     if span <= 0:
         return True

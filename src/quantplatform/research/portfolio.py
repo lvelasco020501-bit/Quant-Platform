@@ -33,6 +33,7 @@ from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING
 
 from quantplatform.core.models.base import DomainModel, Text
+from quantplatform.features.indicators import IndicatorFeatures
 from quantplatform.research.rotation import (
     BASIS,
     INITIAL_EQUITY,
@@ -42,6 +43,7 @@ from quantplatform.research.rotation import (
     EquityPoint,
     Series,
     align,
+    contiguous,
 )
 
 if TYPE_CHECKING:
@@ -50,11 +52,14 @@ if TYPE_CHECKING:
 __all__ = [
     "Allocation",
     "Holding",
+    "InverseVolPlan",
     "PortfolioRun",
     "SleeveContribution",
     "deployed",
+    "inverse_vol_targets",
     "normalise_to",
     "positions",
+    "realised_volatility",
     "simulate_portfolio",
     "targets_for",
 ]
@@ -247,6 +252,7 @@ def simulate_portfolio(
     *,
     cost_basis_points: Decimal,
     start: datetime | None = None,
+    end: datetime | None = None,
     holdings: Sequence[Holding] | None = None,
 ) -> PortfolioRun:
     """Run one portfolio over pre-computed target weights and record what it did.
@@ -256,6 +262,10 @@ def simulate_portfolio(
         targets: Per grid slot, the weight each holding should carry over the following bar.
         cost_basis_points: Cost charged on each side of each weight change.
         start: Ignore slots before this instant, for an out-of-sample window.
+        end: Ignore slots at or after this instant. With ``start`` it isolates one window of a
+            run that has already been measured -- which is how a drawdown is attributed to the
+            markets that caused it, rather than to whichever ones happened to lose money over
+            the whole sample.
         holdings: Every holding the portfolio *declared*, funded or not. Given, attribution
             covers all of them, so a sleeve that never fired is reported at zero rather than
             vanishing -- which matters, because a missing sleeve would make the combined
@@ -280,6 +290,8 @@ def simulate_portfolio(
         ctx.prec = WORKING_PRECISION
         for slot in range(len(grid) - 1):
             if start is not None and grid[slot] < start:
+                continue
+            if end is not None and grid[slot] >= end:
                 continue
             _rebalance(book, targets[slot], rate)
             book.bars += 1
@@ -396,3 +408,157 @@ def _finish(book: _Book, keys: Sequence[Holding]) -> PortfolioRun:
         initial_equity=INITIAL_EQUITY,
         episode_returns=tuple(book.closed),
     )
+
+
+# --- Allocating by risk rather than by count ------------------------------------------------------
+
+
+def realised_volatility(
+    series: Series, slots: Mapping[str, Sequence[int | None]], *, window: int
+) -> dict[str, tuple[Decimal | None, ...]]:
+    """Return each market's realised volatility at each grid slot, ``None`` where undefined.
+
+    The number is ``rvol_<window>`` as the production indicator pipeline computes it -- the
+    population standard deviation of the last ``window`` one-bar close-to-close returns -- and
+    not a second implementation that happens to agree. ``window`` returns need ``window + 1``
+    closes, so the first ``window`` slots of a market's own history are silent.
+
+    Two things make it causal. Only bars up to and including the slot are handed to the
+    pipeline, and the window must be unbroken in calendar time: a halt or a relisting leaves
+    bars that are adjacent in the file and months apart on the tape, and a standard deviation
+    taken across that seam would describe a window that never existed.
+
+    Returns:
+        Per market, one value per slot. ``None`` means the volatility is not available --
+        short history, a gapped window, or the market absent from that slot. Zero means the
+        window was genuinely flat, which is an answer rather than a gap; what to do about a
+        reciprocal of zero is the allocator's decision, not this function's.
+    """
+    pipeline = IndicatorFeatures([f"rvol_{window}"])
+    name = f"rvol_{window}"
+    depth = pipeline.required_history
+    out: dict[str, tuple[Decimal | None, ...]] = {}
+    for asset, bars in series.items():
+        column: list[Decimal | None] = []
+        for slot in slots[asset]:
+            if slot is None or not contiguous(bars, slot, window):
+                column.append(None)
+                continue
+            features = pipeline.compute(bars[max(0, slot + 1 - depth) : slot + 1])
+            column.append(features.get(name))
+        out[asset] = tuple(column)
+    return out
+
+
+@dataclass(frozen=True)
+class InverseVolPlan:
+    """One inverse-vol allocation, with what it could not place rather than only what it could."""
+
+    targets: tuple[dict[Holding, Decimal], ...]
+    """Per slot, holding to weight, omitting anything unfunded."""
+
+    deficit: tuple[Decimal, ...]
+    """Per slot, the reference exposure this allocation did not deploy.
+
+    Signed, and expected to be rounding-sized at every slot where anything was measurable: the
+    weights are quotients carried at the working precision, so the parts need not sum to the
+    whole in the last digit. A slot where nothing was measurable carries the whole reference
+    exposure here, because that is the one case the rules put in cash.
+    """
+
+    unfunded_bars: int
+    """How many slots the reference wanted exposure in and this allocation could not supply."""
+
+
+def inverse_vol_targets(
+    masks: Mapping[Holding, Sequence[bool]],
+    eligible: Sequence[frozenset[str]],
+    allocation: Allocation,
+    *,
+    volatility: Mapping[str, Sequence[Decimal | None]],
+    reference: Sequence[Decimal],
+) -> InverseVolPlan:
+    """Return target weights proportional to the reciprocal of each market's volatility.
+
+    The same holdings :func:`targets_for` would fund, in the same slots -- this changes how much
+    of each, never which. Within a slot the weights are proportional to ``1 / volatility`` and
+    are rescaled so the slot deploys exactly what ``reference`` says, which is how the
+    comparison stays a comparison of two allocations instead of two amounts of money.
+
+    Args:
+        masks: Per holding, whether that sleeve wanted that market at each slot.
+        eligible: Per slot, which markets the point-in-time liquidity rule admits.
+        allocation: The declared fractions; only the per-market cap is read.
+        volatility: Per market, its volatility at each slot, as
+            :func:`realised_volatility` returns it.
+        reference: Per slot, the exposure to match -- :func:`deployed` of the equal-weight
+            targets over the same masks and the same universe.
+
+    Returns:
+        The plan, with nothing judged. A holding whose volatility is ``None`` or zero is not
+        funded and its share passes to the rest of that slot by the same rule: a reciprocal of
+        zero does not exist, and an unknown risk is the last thing to size as though it were
+        known. A market whose sleeves together would exceed ``per_asset_cap`` is pinned there
+        and the surplus is water-filled across the rest, so the cap equal weight already
+        enforces is preserved without the shortfall being taken out of the market.
+    """
+    plan: list[dict[Holding, Decimal]] = []
+    deficits: list[Decimal] = []
+    unfunded = 0
+    with localcontext() as ctx:
+        ctx.prec = WORKING_PRECISION
+        for slot in range(len(eligible)):
+            budget = reference[slot] if slot < len(reference) else ZERO
+            inverse: dict[Holding, Decimal] = {}
+            for holding, mask in masks.items():
+                if not mask[slot] or holding[1] not in eligible[slot]:
+                    continue
+                column = volatility.get(holding[1])
+                value = column[slot] if column is not None else None
+                if value is not None and value > ZERO:
+                    inverse[holding] = ONE / value
+            if budget <= ZERO or not inverse:
+                plan.append({})
+                deficits.append(budget if budget > ZERO else ZERO)
+                unfunded += 1 if budget > ZERO else 0
+                continue
+            weights = _water_fill(inverse, budget, allocation.per_asset_cap)
+            plan.append(weights)
+            deficits.append(budget - sum(weights.values(), start=ZERO))
+    return InverseVolPlan(targets=tuple(plan), deficit=tuple(deficits), unfunded_bars=unfunded)
+
+
+def _water_fill(
+    inverse: Mapping[Holding, Decimal], budget: Decimal, cap: Decimal
+) -> dict[Holding, Decimal]:
+    """Spread ``budget`` in proportion to ``inverse``, pinning any market that hits ``cap``.
+
+    Repeatedly: divide what is left in proportion, and if a market's sleeves together exceed the
+    cap, fix that market at the cap and divide the rest among the markets still free. Each pass
+    pins at least one market, so it terminates.
+
+    The budget always fits. Equal weight deploys ``active signals / (universe size x sleeves)``,
+    and the caps available are ``wanted markets / universe size``; since a market can be wanted
+    by at most every sleeve, the first never exceeds the second. So the cap cannot leave a
+    shortfall, and nothing here needs to decide what to do with one.
+    """
+    free = dict(inverse)
+    out: dict[Holding, Decimal] = {}
+    remaining = budget
+    while free:
+        total = sum(free.values(), start=ZERO)
+        shares = {holding: remaining * weight / total for holding, weight in free.items()}
+        by_asset: dict[str, Decimal] = {}
+        for (_, asset), weight in shares.items():
+            by_asset[asset] = by_asset.get(asset, ZERO) + weight
+        over = sorted(asset for asset, weight in by_asset.items() if weight > cap)
+        if not over:
+            out.update(shares)
+            break
+        for asset in over:
+            scale = cap / by_asset[asset]
+            for holding in [h for h in free if h[1] == asset]:
+                out[holding] = shares[holding] * scale
+                del free[holding]
+            remaining -= cap
+    return out

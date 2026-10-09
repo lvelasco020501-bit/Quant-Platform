@@ -1,17 +1,27 @@
 """M34's allocator is the only thing that milestone adds, so it is the only thing to get wrong.
 
-Two tests carry the weight. ``test_a_single_sleeve_fully_invested_matches_buy_and_hold`` holds
+Three tests carry the weight. ``test_a_single_sleeve_fully_invested_matches_buy_and_hold`` holds
 this module's equity arithmetic to the arithmetic in ``rotation``, which is what makes it safe to
 have written that loop twice rather than refactoring a module three published milestones depend
 on. And ``test_every_unit_of_equity_is_attributed_to_a_holding`` is the conservation law: if
 profit can appear outside the per-holding books, then "does one strategy explain the result" and
 "does one market explain it" are both unanswerable, and those are two of M34's gates.
+
+``test_cost_attribution_does_not_depend_on_the_interpreter_hash_seed`` is the third, added after
+M42 found that the conservation law held while the *split* between holdings did not: each charge
+is levied against the equity standing at that moment, so the visiting order decided who paid
+what, and iterating a set left that order to string hashing.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -354,3 +364,64 @@ def test_the_reference_breadth_normalises_to_itself_unchanged() -> None:
     for mine, theirs in zip(same, targets, strict=True):
         for holding, weight in theirs.items():
             assert abs(mine[holding] - weight) < Decimal("1e-20")
+
+
+# --- The same evidence has to attribute the same way twice ---------------------------------------
+_ATTRIBUTION_PROBE: Final[str] = """
+import sys
+from decimal import Decimal
+
+sys.path.insert(0, "__ROOT__")
+
+from quantplatform.core.enums import Timeframe
+from quantplatform.research.portfolio import simulate_portfolio
+from tests.factories import make_bar
+
+
+def built(closes):
+    return tuple(
+        make_bar(index=index, close=close, timeframe=Timeframe.D1)
+        for index, close in enumerate(closes)
+    )
+
+
+series = {
+    "AAA": built([Decimal(100), Decimal(110), Decimal(105), Decimal(120)]),
+    "BBB": built([Decimal(50), Decimal(45), Decimal(55), Decimal(52)]),
+    "CCC": built([Decimal(10), Decimal(12), Decimal(11), Decimal(13)]),
+}
+targets = tuple(
+    {
+        ("s1", "AAA"): Decimal("0.3"),
+        ("s1", "BBB"): Decimal("0.3"),
+        ("s2", "CCC"): Decimal("0.3"),
+    }
+    for _ in range(4)
+)
+run = simulate_portfolio(series, targets, cost_basis_points=Decimal(15))
+print("|".join(f"{c.name}={c.cost}" for c in run.by_asset))
+print("|".join(str(value) for value in run.episode_returns))
+"""
+
+
+def test_cost_attribution_does_not_depend_on_the_interpreter_hash_seed() -> None:
+    # The only test that can catch this class of bug, which is why it pays for a subprocess.
+    # Each charge is levied against the equity standing at that moment, so the visiting order
+    # decides how the total is split between holdings. Iterating a set of (sleeve, market)
+    # tuples left that order to string hashing, which Python randomises per process -- so the
+    # same cached evidence attributed different costs on different days while the run's return
+    # and drawdown stayed put, and nothing in the output said so.
+    root = str(Path(__file__).resolve().parents[2])
+    script = _ATTRIBUTION_PROBE.replace("__ROOT__", root)
+    answers = {
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout
+        for seed in ("1", "2", "3", "4")
+    }
+
+    assert len(answers) == 1

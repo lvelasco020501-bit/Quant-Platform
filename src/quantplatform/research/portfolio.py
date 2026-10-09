@@ -292,8 +292,18 @@ def simulate_portfolio(
 
 
 def _rebalance(book: _Book, target: Mapping[Holding, Decimal], rate: Decimal) -> None:
-    """Charge the cost of moving to ``target``, opening and closing holding episodes."""
-    for holding in set(book.actual) | set(target):
+    """Charge the cost of moving to ``target``, opening and closing holding episodes.
+
+    **Sorted, and the sort is load bearing.** Each charge is taken off the equity standing at
+    the moment it is levied, so the order the holdings are visited in decides how much of the
+    total each one is charged. The equity that comes out is the same either way -- it is the
+    same factors multiplied in a different sequence -- which is why the run's return, drawdown,
+    turnover and total fees are unaffected. What is affected is attribution: ``spent``,
+    ``by_asset``, ``by_sleeve`` and every episode's net result. Iterating a set left that order
+    to tuple hashing, so the same evidence measured twice in two processes attributed the same
+    costs differently in the sixth significant digit. Sorted, the answer is the answer.
+    """
+    for holding in sorted(set(book.actual) | set(target)):
         before = book.actual.get(holding, ZERO)
         after = target.get(holding, ZERO)
         if before == after:

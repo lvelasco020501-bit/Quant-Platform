@@ -28,6 +28,7 @@ DOMAINS: Final[frozenset[str]] = frozenset(
         "features",
         "marketdata",
         "monitoring",
+        "ops",
         "orchestration",
         "paper",
         "portfolio",
@@ -103,6 +104,13 @@ ALLOWED_DEPENDENCIES: Final[dict[str, frozenset[str]]] = {
     # there is exactly one place that decides what a session's numbers mean — and like
     # `status` it cannot import anything capable of trading.
     "web": frozenset({"core", "config", "status", "strategies"}),
+    # Operational invariants about how a session is *installed* — which venv its unit runs out
+    # of, whether that venv puts a source tree on sys.path, whether the checkout is writable
+    # while the session is live. It reads the domain's own model base and nothing else, and no
+    # other domain's budget names it, so nothing in the platform may import it. That is the
+    # point: a module whose job is to police the paper process's import surface must not become
+    # part of that surface.
+    "ops": frozenset({"core"}),
     # Composition roots may wire everything together.
     "orchestration": DOMAINS,
     "api": DOMAINS,

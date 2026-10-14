@@ -1,0 +1,72 @@
+# Template for every paper session started from now on. Not installed by anything: copy it,
+# substitute the four placeholders, and install it under the session's own name.
+#
+#   @SESSION_ID@   e.g. vps-b2-btc-4h-20260926T1911Z   (also the directory name)
+#   @STRATEGY@     e.g. breakout_trend
+#   @PARAMS@       e.g. --param entry_lookback=40 --param exit_lookback=20
+#   @MARKET@       e.g. --symbol BTC/USDT --timeframe 4h
+#
+# The difference from quant-paper-b2.service is not cosmetic. That unit runs
+# /opt/quant-platform-b2/.venv/bin/quantplatform out of an EDITABLE install, which puts
+# /opt/quant-platform-b2/src on the process's sys.path for its whole life -- so a git checkout
+# in that tree re-points code the session has not imported yet. On 2026-09-28 that is exactly
+# what happened, one and three quarter days into the live B2 run, because Mission Control was
+# installed in the same venv and updating the dashboard meant moving the session's source.
+#
+# Here the venv is built with `uv pip install .` instead of `-e .`, so the package is COPIED
+# into site-packages and the checkout is not on sys.path at all. Verified, not assumed: install
+# non-editably, edit the checkout, and the imported module is unchanged.
+#
+# See docs/ops_immutable_paper_checkout.md for how to build the two directories this expects.
+
+[Unit]
+Description=Quant Platform - Paper Session @SESSION_ID@ (immutable checkout)
+Documentation=https://github.com/lvelasco020501-bit/Quant-Platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+
+# NOT the checkout. The session needs no project directory -- it runs the venv's own console
+# script -- and pointing it at the code would invite relative paths back into the tree this
+# arrangement exists to keep out of reach.
+WorkingDirectory=/var/quant-platform-@SESSION_ID@
+
+EnvironmentFile=/etc/quant-platform/@SESSION_ID@.env
+Environment=MPLCONFIGDIR=/tmp/matplotlib
+
+# The venv under /opt/paper/@SESSION_ID@/.venv, built from the pinned checkout beside it.
+ExecStart=/opt/paper/@SESSION_ID@/.venv/bin/quantplatform paper run \
+  --fresh \
+  --strategy @STRATEGY@ \
+  @PARAMS@ \
+  @MARKET@ \
+  --state-dir /var/quant-platform-@SESSION_ID@/state \
+  --log-dir /var/quant-platform-@SESSION_ID@/logs \
+  --reports-dir /var/quant-platform-@SESSION_ID@/reports \
+  --session-id @SESSION_ID@
+
+# Restart=no is policy, not an omission, and --fresh is why. A session that stopped did so for
+# a reason; restarting it would discard the warm-up and begin again at zero while the dashboard
+# showed a healthy session with a new clock.
+Restart=no
+
+# No [Install] section, so the unit is static and CANNOT be enabled. A reboot leaves the
+# session stopped rather than quietly starting a fresh one.
+
+# The process cannot rewrite its own code. ProtectSystem=strict makes the whole filesystem
+# read-only and ReadWritePaths opens back exactly the session's own state, logs and reports --
+# so even a bug inside the session cannot reach /opt/paper/@SESSION_ID@.
+ProtectSystem=strict
+ReadWritePaths=/var/quant-platform-@SESSION_ID@
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=append:/var/quant-platform-@SESSION_ID@/logs/systemd.out.log
+StandardError=append:/var/quant-platform-@SESSION_ID@/logs/systemd.err.log

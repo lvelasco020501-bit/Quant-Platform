@@ -17,7 +17,17 @@
 # into site-packages and the checkout is not on sys.path at all. Verified, not assumed: install
 # non-editably, edit the checkout, and the imported module is unchanged.
 #
-# See docs/ops_immutable_paper_checkout.md for how to build the two directories this expects.
+# The venv must also be built against an interpreter the service user cannot write, and pinned
+# to the CONCRETE version directory rather than uv's floating `cpython-3.13-...` alias:
+#
+#   uv venv --python /opt/python/3.13.15/bin/python3.13 /opt/paper/@SESSION_ID@/.venv
+#
+# The standard library is 633 ordinary Python files imported lazily -- the paper entry point
+# loads 106 stdlib packages at startup and leaves 97 unloaded -- so a writable interpreter is
+# the same hazard as an editable checkout, one layer down.
+#
+# See docs/ops_immutable_paper_checkout.md for how to build the directories this expects, and
+# docs/ops_shared_python_runtime.md for the interpreter.
 
 [Unit]
 Description=Quant Platform - Paper Session @SESSION_ID@ (immutable checkout)

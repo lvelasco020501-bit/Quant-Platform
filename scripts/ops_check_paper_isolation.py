@@ -18,6 +18,8 @@ out of that venv, and whether the tree is writable by the service user.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import grp
 import json
 import os
 import pwd
@@ -92,25 +94,65 @@ def _editable_paths(venv: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
+def _groups_of(user: str) -> frozenset[str]:
+    """Return every group ``user`` belongs to, primary and supplementary."""
+    try:
+        record = pwd.getpwnam(user)
+    except KeyError:
+        return frozenset()
+    names = {group.gr_name for group in grp.getgrall() if user in group.gr_mem}
+    with contextlib.suppress(KeyError):
+        names.add(grp.getgrgid(record.pw_gid).gr_name)
+    return frozenset(names)
+
+
 def _writable_by(path: Path, user: str) -> bool:
     """Return whether ``user`` can write inside ``path``, assuming yes when unknowable.
 
     Computed from ownership and mode rather than by attempting a write. An unverified
     permission is reported as writable on purpose: this check exists to find things that are
     not protected, and "I could not tell" is not protection.
+
+    All three permission classes are read, not just the owner's. The host's shared interpreter
+    is ``quant:quant`` at mode 775: owner-write alone answers it, but a tree owned by root with
+    the service user's group and ``g+w`` would be just as writable and would otherwise be
+    reported as safe.
     """
     try:
         info = path.stat()
     except OSError:
         return True
+    mode = stat.S_IMODE(info.st_mode)
     try:
         owner = pwd.getpwuid(info.st_uid).pw_name
     except KeyError:
         return True
-    mode = stat.S_IMODE(info.st_mode)
-    if owner == user:
-        return bool(mode & stat.S_IWUSR)
+    if owner == user and mode & stat.S_IWUSR:
+        return True
+    try:
+        group = grp.getgrgid(info.st_gid).gr_name
+    except KeyError:
+        group = None
+    if group is not None and group in _groups_of(user) and mode & stat.S_IWGRP:
+        return True
     return bool(mode & stat.S_IWOTH)
+
+
+def _interpreter_of(venv: Path) -> Path | None:
+    """Return the base Python installation a venv was built from, or ``None``.
+
+    Resolved through ``bin/python``, which uv points at the concrete versioned directory. The
+    ``pyvenv.cfg`` ``home`` key is deliberately not used: on this host it names a *floating*
+    alias (``cpython-3.13-...`` symlinked to ``cpython-3.13.15-...``), so reading it would
+    report a path that can be re-pointed under a running session rather than the installation
+    that session is actually using.
+    """
+    try:
+        binary = (venv / "bin" / "python").resolve(strict=True)
+    except OSError:
+        return None
+    # <install>/bin/python3.13 -> <install>
+    return binary.parent.parent if binary.parent.name == "bin" else None
 
 
 def _units() -> list[str]:
@@ -157,6 +199,7 @@ def collect() -> list[PaperDeployment]:
             if other != name and other_venv == resolved
         ]
         editable = _editable_paths(venv)
+        interpreter = _interpreter_of(venv)
         # With an editable install the tree is known exactly; without one its provenance is not
         # recorded on the host, and guessing the venv's parent would invent a fact.
         checkout = str(Path(editable[0]).parent) if editable else None
@@ -172,12 +215,35 @@ def collect() -> list[PaperDeployment]:
                     _writable_by(Path(checkout), user) if checkout else True
                 ),
                 other_units_sharing_venv=tuple(sorted(sharers)),
+                interpreter=str(interpreter) if interpreter else None,
+                interpreter_writable_by_service_user=(
+                    _writable_by(interpreter, user) if interpreter else True
+                ),
+                other_paper_units_sharing_interpreter=(),  # filled in once every unit is read
                 restart=props.get("Restart", "unknown"),
                 has_install_section=props.get("UnitFileState") != "static",
                 active=props.get("ActiveState") == "active",
             )
         )
-    return found
+    # Sharing is a relation between the records, so it can only be decided once they all exist.
+    by_interpreter: dict[str, list[str]] = {}
+    for deployment in found:
+        if deployment.interpreter:
+            by_interpreter.setdefault(deployment.interpreter, []).append(deployment.unit)
+    return [
+        deployment.model_copy(
+            update={
+                "other_paper_units_sharing_interpreter": tuple(
+                    sorted(
+                        other
+                        for other in by_interpreter.get(deployment.interpreter or "", [])
+                        if other != deployment.unit
+                    )
+                )
+            }
+        )
+        for deployment in found
+    ]
 
 
 def main() -> int:
@@ -190,6 +256,7 @@ def main() -> int:
         sys.stderr.write("this check reads systemd and POSIX permissions; run it on the host\n")
         return 2
 
+    properties = {unit: _show(unit, *_PROPERTIES) for unit in _units()}
     deployments = collect()
     if not deployments:
         sys.stderr.write(
@@ -210,6 +277,9 @@ def main() -> int:
                 "venv": deployment.venv,
                 "editable_paths": list(deployment.editable_paths),
                 "shares_venv_with": list(deployment.other_units_sharing_venv),
+                "interpreter": deployment.interpreter,
+                "interpreter_writable": deployment.interpreter_writable_by_service_user,
+                "shares_interpreter_with": list(deployment.other_paper_units_sharing_interpreter),
             }
         )
         for violation in found:
@@ -230,11 +300,20 @@ def main() -> int:
         for deployment in deployments:
             state = "ACTIVE" if deployment.active else "stopped"
             shared = ", ".join(deployment.other_units_sharing_venv)
+            runtime_shared = ", ".join(deployment.other_paper_units_sharing_interpreter)
+            props_user = (properties.get(deployment.unit) or {}).get("User") or "the service user"
+            runtime_note = (
+                f"WRITABLE by {props_user}"
+                if deployment.interpreter_writable_by_service_user
+                else "read-only — good"
+            )
             sys.stdout.write(
                 f"{deployment.unit}  [{state}]  session={deployment.session_id}\n"
                 f"  venv      {deployment.venv}\n"
                 f"  on sys.path {', '.join(deployment.editable_paths) or '(nothing — good)'}\n"
                 f"  shares venv {shared or '(nobody — good)'}\n"
+                f"  interpreter {deployment.interpreter or '(unknown)'} {runtime_note}\n"
+                f"  shares runtime {runtime_shared or '(nobody — good)'}\n"
             )
             for violation in violations(deployment):
                 sys.stdout.write(

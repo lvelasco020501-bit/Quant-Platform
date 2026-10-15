@@ -128,6 +128,28 @@ class Isolation(StrEnum):
     meant moving the session's source. Separate venvs remove the motive as well as the means,
     and dependency work for the UI stops landing in the trading venv."""
 
+    INTERPRETER_NOT_WRITABLE = "interpreter_not_writable"
+    """The Python runtime itself must not be writable by the session's service user.
+
+    The same hazard as an editable checkout, one layer down and found the same way. The
+    interpreter's standard library is 633 files of ordinary Python, imported lazily: the paper
+    entry point loads 106 top-level stdlib packages at startup and leaves **97 unloaded**, so an
+    error path that reaches for ``configparser`` or ``difflib`` months into a run reads whatever
+    is on disk at that moment. On the VPS that directory is ``quant``-owned and mode 775, which
+    is to say the service user can rewrite the runtime of its own live process.
+
+    Verified to cost nothing to fix: with the interpreter read-only, ``uv venv`` still works by
+    version and by path, a non-editable install still works, lazy stdlib imports still work
+    (the ``.pyc`` ship inside it), and the entry point still runs."""
+
+    DEDICATED_INTERPRETER = "dedicated_interpreter"
+    """No other paper session may run on the same Python runtime.
+
+    Not a way for code to change by itself -- it is blast radius and motive. One upgrade
+    performed for one session lands under every session at once, and the reason to perform it
+    at all is usually the other session. Two sessions on one runtime is the same mistake as two
+    units on one venv, one level further down."""
+
     IMMUTABLE_TREE = "immutable_tree"
     """The checkout a live session was built from must not be writable by its service user.
 
@@ -143,8 +165,21 @@ class Isolation(StrEnum):
     leaves the session stopped rather than quietly starting a fresh one."""
 
 
-_PREVENTS_LOADING_NEW_CODE = frozenset({Isolation.NON_EDITABLE_INSTALL})
-_ONE_ACTION_AWAY = frozenset({Isolation.DEDICATED_VENV, Isolation.IMMUTABLE_TREE})
+_PREVENTS_LOADING_NEW_CODE = frozenset(
+    {Isolation.NON_EDITABLE_INSTALL, Isolation.INTERPRETER_NOT_WRITABLE}
+)
+"""Severity is assigned by mechanism, not by how likely the trigger is.
+
+Both of these let a running process load code that did not exist when it started, so both are
+critical. The editable install was tripped by an ordinary, well-meant operator action --
+updating a dashboard. Writing into the standard library needs a rarer act: a deliberate edit,
+or ``uv python install --reinstall``. That difference belongs in the operating notes, not in the
+severity, because a severity that encodes a guess about likelihood stops being readable as a
+statement about what can happen."""
+
+_ONE_ACTION_AWAY = frozenset(
+    {Isolation.DEDICATED_VENV, Isolation.DEDICATED_INTERPRETER, Isolation.IMMUTABLE_TREE}
+)
 
 
 def severity_of(invariant: Isolation) -> Severity:
@@ -179,6 +214,16 @@ class PaperDeployment(DomainModel):
 
     other_units_sharing_venv: tuple[str, ...] = ()
     """Other units whose ``ExecStart`` lives under the same venv."""
+
+    interpreter: Text | None = None
+    """The base Python installation the venv was built from, as ``bin/python`` resolves to."""
+
+    interpreter_writable_by_service_user: bool = True
+    """Whether the service user can write inside the interpreter installation. Assumed true
+    when unknown, for the same reason the checkout permission is."""
+
+    other_paper_units_sharing_interpreter: tuple[str, ...] = ()
+    """Other paper sessions running on the same Python runtime."""
 
     restart: Text = "no"
     has_install_section: bool = False
@@ -235,6 +280,20 @@ def violations(deployment: PaperDeployment) -> tuple[Violation, ...]:
             Isolation.IMMUTABLE_TREE,
             f"{deployment.checkout} is writable while the session is live, so a git "
             "checkout, switch, pull or reset there would succeed",
+        )
+    if deployment.active and deployment.interpreter_writable_by_service_user:
+        fail(
+            Isolation.INTERPRETER_NOT_WRITABLE,
+            f"the service user can write {
+                deployment.interpreter or 'the interpreter (path unknown)'
+            }, so a lazy standard-library import can load code written after the "
+            "session started",
+        )
+    if deployment.other_paper_units_sharing_interpreter:
+        fail(
+            Isolation.DEDICATED_INTERPRETER,
+            "shares its Python runtime with "
+            + ", ".join(deployment.other_paper_units_sharing_interpreter),
         )
     if deployment.restart != "no":
         fail(Isolation.NO_AUTO_RESTART, f"Restart={deployment.restart}, expected Restart=no")

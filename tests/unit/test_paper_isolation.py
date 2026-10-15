@@ -41,6 +41,9 @@ def deployment(**overrides: object) -> PaperDeployment:
         "checkout": "/opt/paper/paper-x/repo",
         "checkout_writable_by_service_user": False,
         "other_units_sharing_venv": (),
+        "interpreter": "/opt/python/3.13.15",
+        "interpreter_writable_by_service_user": False,
+        "other_paper_units_sharing_interpreter": (),
         "restart": "no",
         "has_install_section": False,
         "active": True,
@@ -59,10 +62,19 @@ def test_a_dedicated_non_editable_read_only_deployment_has_no_violations() -> No
     assert violations(deployment()) == ()
 
 
-def test_a_stopped_session_may_have_a_writable_checkout() -> None:
+def test_a_stopped_session_may_have_a_writable_checkout_and_runtime() -> None:
     # Immutability is a property a session needs *while it runs*. Freezing the tree of a
     # finished session would only make the next deployment harder for no safety gained.
-    assert violations(deployment(active=False, checkout_writable_by_service_user=True)) == ()
+    assert (
+        violations(
+            deployment(
+                active=False,
+                checkout_writable_by_service_user=True,
+                interpreter_writable_by_service_user=True,
+            )
+        )
+        == ()
+    )
 
 
 # --- Each invariant fails on its own cause --------------------------------------------------------
@@ -74,6 +86,14 @@ def test_a_stopped_session_may_have_a_writable_checkout() -> None:
         ({"editable_paths": ("/opt/x/src",)}, Isolation.NON_EDITABLE_INSTALL),
         ({"other_units_sharing_venv": ("quant-web-x.service",)}, Isolation.DEDICATED_VENV),
         ({"checkout_writable_by_service_user": True}, Isolation.IMMUTABLE_TREE),
+        (
+            {"interpreter_writable_by_service_user": True},
+            Isolation.INTERPRETER_NOT_WRITABLE,
+        ),
+        (
+            {"other_paper_units_sharing_interpreter": ("quant-paper.service",)},
+            Isolation.DEDICATED_INTERPRETER,
+        ),
         ({"restart": "on-failure"}, Isolation.NO_AUTO_RESTART),
         ({"has_install_section": True}, Isolation.NOT_ENABLEABLE),
     ],
@@ -85,23 +105,38 @@ def test_each_invariant_fails_on_its_own_cause(
 
 
 def test_an_unknown_permission_counts_as_writable() -> None:
-    # The field defaults to writable on purpose. An unverified permission is not a protection,
+    # The fields default to writable on purpose. An unverified permission is not a protection,
     # and a checker that treats "I could not tell" as "safe" is a checker that lies.
     bare = PaperDeployment(
         unit="u.service", session_id="s", venv="/opt/s/.venv", checkout="/opt/s/repo"
     )
 
     assert Isolation.IMMUTABLE_TREE in keys(violations(bare))
+    assert Isolation.INTERPRETER_NOT_WRITABLE in keys(violations(bare))
+
+
+def test_a_writable_interpreter_is_reported_even_when_its_path_is_unknown() -> None:
+    # The permission is the hazard, not the path. Requiring a path before complaining would let
+    # a deployment the collector could not fully read pass as isolated.
+    found = violations(deployment(interpreter=None, interpreter_writable_by_service_user=True))
+
+    assert keys(found) == [Isolation.INTERPRETER_NOT_WRITABLE]
+    assert "path unknown" in found[0].detail
 
 
 # --- Severity is ordered by what can reach a running process --------------------------------------
 
 
-def test_only_an_editable_install_is_critical() -> None:
-    # Editable is the one that lets a running process load code that did not exist when it
-    # started. Everything else needs a further human action first.
+def test_severity_follows_the_mechanism_not_the_likelihood() -> None:
+    # Critical means a running process can load code that was not there when it started. Two
+    # things do that: an editable checkout and a writable interpreter. Writing into the standard
+    # library is a rarer act than a git checkout, and that difference deliberately does NOT
+    # change the severity -- a severity that encodes a guess about likelihood stops being
+    # readable as a statement about what can happen.
     assert severity_of(Isolation.NON_EDITABLE_INSTALL) is Severity.CRITICAL
+    assert severity_of(Isolation.INTERPRETER_NOT_WRITABLE) is Severity.CRITICAL
     assert severity_of(Isolation.DEDICATED_VENV) is Severity.SERIOUS
+    assert severity_of(Isolation.DEDICATED_INTERPRETER) is Severity.SERIOUS
     assert severity_of(Isolation.IMMUTABLE_TREE) is Severity.SERIOUS
     assert severity_of(Isolation.NO_AUTO_RESTART) is Severity.ADVISORY
     assert severity_of(Isolation.NOT_ENABLEABLE) is Severity.ADVISORY
@@ -130,18 +165,23 @@ def test_the_live_b2_arrangement_is_reported_as_critical() -> None:
         checkout="/opt/quant-platform-b2",
         checkout_writable_by_service_user=True,
         other_units_sharing_venv=("quant-web-b2.service",),
+        interpreter="/home/quant/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu",
+        interpreter_writable_by_service_user=True,
         restart="no",
         has_install_section=False,
     )
 
     found = violations(b2)
 
+    # Worst first, then alphabetically inside each severity. Two criticals, because the
+    # interpreter under both sessions is quant-owned and mode 775 as well.
     assert keys(found) == [
+        Isolation.INTERPRETER_NOT_WRITABLE,
         Isolation.NON_EDITABLE_INSTALL,
         Isolation.DEDICATED_VENV,
         Isolation.IMMUTABLE_TREE,
     ]
-    assert found[0].severity is Severity.CRITICAL
+    assert [v.severity for v in found[:2]] == [Severity.CRITICAL, Severity.CRITICAL]
 
 
 def test_the_productive_1h_arrangement_separates_its_web_tree() -> None:

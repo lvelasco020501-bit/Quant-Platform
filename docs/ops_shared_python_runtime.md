@@ -1,9 +1,11 @@
 # The Python runtime a paper session runs on must not be writable by its own service user
 
-**Status: audited 2026-10-15, read-only. Nothing was changed.** The current runtime is untouched:
-no `chmod`, no `chown`, no `uv python install`, no venv modified, no service restarted. What
-follows is the scope of the risk, the recommended architecture, and the migration — to be run
-only when each session closes.
+**Status: audited and then frozen on 2026-10-15, with both sessions live throughout.** The
+concrete runtime `cpython-3.13.15-linux-x86_64-gnu` is now `root:root` with no group or other
+write, so the service user can no longer modify the Python its own live sessions run on. No
+service was restarted, no PID changed, no venv was modified, no file content changed: a SHA-256
+manifest of all 3 701 files is identical before and after, and the interpreter binary still
+hashes `93a93f4c…`. See §3 for exactly what was run and §6 for what is still open.
 
 Companion to [`ops_immutable_paper_checkout.md`](ops_immutable_paper_checkout.md), which closed
 the same hazard one layer up. This one was found while verifying that fix.
@@ -136,24 +138,80 @@ And one refinement the audit produced: **pin new venvs to the concrete version d
 to uv's floating `cpython-3.13-…` alias. Even root-owned, an alias that can be re-pointed is a
 moving part under a session that does not need one.
 
-## 3. Migration — only as each session closes
+## 3. Step 1 — freeze the runtime. **Done 2026-10-15, with both sessions live.**
 
-Not to be run now. Both sessions are live; B2 is at 111/400 warm-up bars and the 1h session holds
+Two commands, scoped to the concrete version directory. The path is unchanged, which is what
+makes it safe: every `pyvenv.cfg` and every `.venv/bin/python` names this directory, so moving
+or renaming it would break all four venvs, while changing its owner and mode breaks nothing.
+
+```bash
+R=/home/quant/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu
+chown -R root:root "$R"
+chmod -R go-w      "$R"      # 775 -> 755 on dirs, 664 -> 644 on files; read and execute kept
+```
+
+`go-w` rather than `a-w`: root keeps owner-write, which it has anyway, and the service user
+loses write through both the group and other classes. `chmod -R` skips the 1 047 symlinks in the
+tree and reaches their targets through the ordinary walk.
+
+Pre-flight, all read-only, all of it checked before the commands ran:
+
+| | |
+|---|---|
+| real world-writable files (excluding symlinks) | 0 — the 1 047 "world-writable" entries were symlinks, which always report `lrwxrwxrwx` |
+| modes present | 3 654 files at 664, 47 files at 775, 226 dirs at 775 |
+| entries writable by group | 3 927 |
+| open write-mode descriptors into the runtime, held by either live session | **0** |
+| setuid/setgid files | 0 |
+
+Verification, as `quant`, immediately after:
+
+```
+runtime root  not writable          touch …/lib/python3.13/.probe   -> Permission denied
+stdlib        not writable          echo x >> …/lib/python3.13/filecmp.py -> Permission denied
+python binary not writable
+stdlib pycache not writable
+interpreter ok 3.13.15
+lazy stdlib imports: OK   (configparser, difflib, pprint, ftplib, getpass, gzip, tarfile, doctest)
+/opt/quant-platform-b2/.venv/bin/quantplatform --help  -> runs
+```
+
+Permission bits *and* a real write attempt, because a bit says what should happen and a failed
+`touch` says what did.
+
+Content proof — nothing inside the runtime changed, only its ownership and mode:
+
+| | before | after |
+|---|---|---|
+| interpreter binary SHA-256 | `93a93f4c…9840` | `93a93f4c…9840` |
+| file count | 3 701 | 3 701 |
+| **SHA-256 over the manifest of all 3 701 file hashes** | `626d2fb4…9ccb` | `626d2fb4…9ccb` |
+| manifest diff | — | **identical** |
+| files newer than the freeze | — | 0 |
+| the three `.pyc` added at 01:11:41 | `6c4d3856…`, `ea4636fb…`, `4c54d61c…` | byte-identical, same mtime |
+
+And the sessions, before and after, unchanged in every field that is not a clock:
+
+| | before | after |
+|---|---|---|
+| `quant-paper-b2` | PID 508556, NRestarts 0, started 2026-09-26 19:17:28Z | identical |
+| `quant-paper` | MainPID 143200 (`uv`), Python child 143203, NRestarts 0, started 2026-09-11 06:03:27Z | identical |
+| B2 warm-up | 110/400 | **115/400** — kept processing straight through |
+| B2 health | HEALTHY, `mixed_session_data` false | identical |
+| B2 gaps / reconnects / runtime errors / restarts | 0 / 0 / 0 / 0 | identical |
+| `/opt/quant-platform-b2` HEAD, reflog, `src` SHA-256 | `becf541`, 3 lines, `8bd9cf3a…` | identical |
+| `/opt/quant-platform` HEAD, reflog, `src` SHA-256 | `refs/heads/main`, 5 lines, `7d569aed…` | identical |
+| `:8800` / `:8801` | HTTP 200 | HTTP 200 |
+
+Checker: **9 broken invariants before, 7 after; criticals 4 → 2.** `interpreter_not_writable`
+passes on both sessions.
+
+## 3b. Remaining steps — only as each session closes
+
+Not to be run now. Both sessions are live; B2 is at 115/400 warm-up bars and the 1h session holds
 a latched breaker. Nothing below touches a running process.
 
 ```bash
-# ---- Step 1. Freeze the runtime. Safe to do at ANY time, including with sessions live,
-#              because nothing the platform does needs write access there. It is listed under
-#              migration rather than under "safe now" only because it is not MY call to make.
-chown -R root:root /home/quant/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu
-chmod -R a-w       /home/quant/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu
-chown -h root:root /home/quant/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu   # the alias
-#  DO NOT move or rename it: every pyvenv.cfg and every .venv/bin/python names this path.
-#  Verify immediately, read-only:
-su - quant -c 'test -w /home/quant/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu' \
-  && echo 'STILL WRITABLE — investigate' || echo 'frozen'
-/opt/quant-platform-b2/.venv/bin/python -c 'import configparser, difflib; print("lazy import ok")'
-systemctl show quant-paper-b2 -p MainPID -p NRestarts   # must be unchanged
 
 # ---- Step 2. When a session ends, give the next one its own runtime (pattern B)
 install -d -o root -g root /opt/python
@@ -180,30 +238,58 @@ uv run python scripts/ops_check_paper_isolation.py     # must print PASS
 **Never** `uv python install --reinstall` or `uv python upgrade` while a paper session is live.
 Install the new version beside the old one and point only new sessions at it.
 
-## 4. What can be done now, and what must wait
+## 4. The standing rules
 
-**Now, with no risk and no restart:** everything in this change is repo-side — the two new
-invariants, their tests, the collector reading the interpreter, the template, this document.
-Nothing on the VPS was touched.
+1. **Never `uv python install`, `uv python reinstall` or `uv python upgrade` against a runtime a
+   live paper session uses.** Install the new version side by side and point only new sessions at
+   it. The running session keeps the interpreter it started on.
+2. **A shared runtime under a live session is read-only.** `root:root`, no group or other write,
+   and never moved or renamed — the path is named by every `pyvenv.cfg` and every
+   `.venv/bin/python`.
+3. **New sessions pin the concrete version directory**, never uv's floating `cpython-3.13-…`
+   alias. An alias is a moving part a session does not need.
+4. **Each future session gets its own venv, the package installed non-editably, and a read-only
+   checkout** — the three invariants in
+   [`ops_immutable_paper_checkout.md`](ops_immutable_paper_checkout.md).
+5. **Freezing a runtime is safe while sessions run; replacing one is not.** Ownership and mode
+   changed under two live sessions with zero effect, measured. Content changes are a different
+   act entirely.
 
-**Step 1 of the migration — freezing the current interpreter — is also safe with both sessions
-live**, and that is a measured claim, not an optimistic one: no platform operation needs write
-access there, and a read-only interpreter was shown to support venv creation, non-editable
-installs, lazy stdlib imports and the entry point. It is listed as step 1 of the migration rather
-than done, because changing ownership of a runtime under two live trading sessions is a decision
-to be taken deliberately and not as a side effect of an audit.
+## 5. What can be done now, and what must wait
 
-**Must wait for each session to close:** moving to a dedicated per-version interpreter, the
-non-editable install, and the read-only checkout. All three need the session restarted, and a
-`--fresh` restart discards the warm-up — 111 of 400 bars for B2, which completes around
-2026-12-02.
+**Done, with both sessions live and no restart:** the runtime freeze (§3), plus the repo-side
+work — the two invariants, their tests, the collector reading the interpreter, the template, this
+document.
 
-**Also unresolved, and smaller:** `/home/quant/.local/bin/uv` is `quant`-owned and writable, and
-it is the 1h session's launcher (`ExecStart` runs `uv run`, MainPID 143200, with the real Python
-child at 143203). The B2 unit calls its venv's console script directly and does not depend on uv
-at runtime. Future units should follow B2's shape, which the template already does.
+**Must wait for each session to close:** the dedicated per-version interpreter, the non-editable
+install, and the read-only checkout. All three need the session restarted, and a `--fresh`
+restart discards the warm-up — 115 of 400 bars for B2, which completes around 2026-12-02.
 
-## 5. Guardrails added
+## 6. What the freeze did not close
+
+Scoped deliberately to the concrete version directory, so three things remain, none of which can
+reach a live session's standard library:
+
+1. **The parent `…/share/uv/python/` is still `quant:quant` 775, and so is the floating alias.**
+   `quant` can therefore still create a *new* version directory there with `uv python install`
+   and re-point `cpython-3.13-…` at it. That cannot touch 3.13.15, which is now root-owned, so a
+   live session's stdlib is safe either way. What it reaches is `lib-dynload`, the one `sys.path`
+   entry that goes through the alias — and that directory holds exactly two modules, `_dbm` and
+   `_tkinter`, which this platform never imports. The larger consequence is forward-looking: a
+   future `uv venv --python 3.13` resolving *by version* could pick up a `quant`-owned
+   interpreter. Completing the freeze is one line, `chown -h root:root` on the alias plus
+   `chown root:root` and `chmod go-w` on the parent, and it is not done because this step was
+   scoped to the runtime itself.
+2. **`dedicated_interpreter` still fails on both sessions.** They share one runtime, which is
+   blast radius rather than a path for code to change: the runtime is now read-only, so sharing
+   it costs nothing until somebody wants to upgrade one session. Left as future debt, by
+   decision, and the fix is step 2 of §3b.
+3. **`/home/quant/.local/bin/uv` is `quant`-owned and writable**, and it is the 1h session's
+   launcher (`ExecStart` runs `uv run`, MainPID 143200, with the real Python child at 143203).
+   The B2 unit calls its venv's console script directly and does not depend on uv at runtime.
+   Future units follow B2's shape, which the template already does.
+
+## 7. Guardrails added
 
 Two invariants, with the collector taught to read them and the pure logic tested:
 
@@ -219,5 +305,5 @@ re-pointed rather than the installation actually in use. Its permission check al
 with the service user's group and `g+w` would be just as writable and would otherwise have been
 reported as safe.
 
-Run against the host as it stands, the checker goes from 5 broken invariants to **9**: both
-sessions pick up `interpreter_not_writable` and `dedicated_interpreter`.
+Against the host these took the count from 5 broken invariants to 9 when the runtime was still
+writable, and the freeze brought it to **7**, with criticals down from 4 to 2.

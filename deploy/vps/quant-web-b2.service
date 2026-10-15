@@ -11,12 +11,12 @@ User=quant
 # loads the trading configuration and never holds the database DSN. Same reasoning as
 # quant-web.service, which runs from a separate checkout for the same purpose.
 WorkingDirectory=/var/quant-platform-b2
-EnvironmentFile=/opt/quant-platform-b2/mission-control-b2.env
+EnvironmentFile=/opt/quant-platform-ui-b2/mission-control-b2.env
 # The venv binary directly rather than through uv: uv wants a writable cache in $HOME, and
 # weakening ProtectHome to give it one would trade real isolation for a convenience this
 # service does not need.
 Environment=MPLCONFIGDIR=/tmp/matplotlib
-ExecStart=/opt/quant-platform-b2/.venv/bin/quantplatform-web
+ExecStart=/opt/quant-platform-ui-b2/.venv/bin/quantplatform-web
 
 # Safe to restart automatically, unlike the trading session: this process observes and holds
 # no financial state, and a dashboard that stays down after a blip is one nobody trusts.

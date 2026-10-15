@@ -156,11 +156,23 @@ arrangement B2 should have copied and did not.
 not the venv, not a `git checkout`, not a rename, not a `uv sync`. The process holds that path
 on `sys.path` and resolves `ExecStart` through it.
 
-The single operating rule until then:
+The single operating rule, and it is now enforced by the arrangement rather than by care:
 
-> **To update Mission Control B2, do not touch `/opt/quant-platform-b2`.** Give it its own tree,
-> the way the 1h session already has one. Until that exists, the B2 dashboard stays on
-> `becf541`.
+> **Mission Control B2 is updated only in `/opt/quant-platform-ui-b2`.** Never in
+> `/opt/quant-platform-b2`.
+
+**Done on 2026-10-15.** `/opt/quant-platform-ui-b2` is a separate checkout pinned to `becf541`
+with its own venv, installed non-editably. `quant-web-b2.service` was restarted onto it — the
+only service touched — while `quant-paper-b2.service` kept PID 508556, `NRestarts=0` and its
+2026-09-26 start timestamp, and the live tree's HEAD, three-line reflog, directory mtimes and
+`src` SHA-256 were all unchanged with **zero** files newer than the baseline anywhere in it,
+`.venv` included. The checker went from 6 broken invariants to 5: `dedicated_venv` is cleared
+for B2.
+
+The dashboard's own numbers were identical across the restart — session id, schema 2.0.0,
+`HEALTHY`, `mixed_session_data: false`, warm-up 110/400, 110/110 candles, 0 gaps, 0 reconnects,
+0 runtime errors, all three breakers OK — except snapshot age, last-bar age and uptime, which
+must advance.
 
 Also waiting, and why:
 
@@ -172,7 +184,14 @@ Also waiting, and why:
   — but that is a decision about the experiment, not an ops change, and it is not taken here.
 * Building a new checkout and venv on the VPS costs CPU and memory next to two live sessions on a
   4 GB box. Load average is 0.04 and there is headroom, but it is a deliberate act, not a
-  side effect of this document.
+  side effect of this document. (The UI tree built on 2026-10-15 cost 346 MB and left the load
+  average back at 0.04.)
+* **A residual nobody has addressed: all four venvs share one uv-managed CPython** at
+  `/home/quant/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu`, owned by `quant` and mode
+  775. The standard library is imported lazily as a matter of course, so a
+  `uv python install --reinstall` would put new stdlib code under both live sessions. Separating
+  the trees does not touch this, and nor does a non-editable install of *our* package. The fix
+  is a system interpreter, or an interpreter the service user cannot write; neither is done.
 
 ## 6. Guardrails added
 

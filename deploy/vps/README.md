@@ -10,7 +10,7 @@ a deployment that exists only on the box is a deployment nobody can review.
 |---|---|
 | `quant-paper-b2.service` | `/etc/systemd/system/quant-paper-b2.service` |
 | `quant-web-b2.service` | `/etc/systemd/system/quant-web-b2.service` |
-| `mission-control-b2.env` | `/opt/quant-platform-b2/mission-control-b2.env` |
+| `mission-control-b2.env` | `/opt/quant-platform-ui-b2/mission-control-b2.env` |
 | `../paper-b2-btc-4h.env` + 6 deployment lines | `/opt/quant-platform-b2/.env` |
 
 `/opt/quant-platform-b2/.env` is **not** in this directory: it carries the database DSN. It is
@@ -30,6 +30,24 @@ session. So this session gets its own everything:
 | state / logs / reports | `/var/quant-platform/` | `/var/quant-platform-b2/` |
 | unit | `quant-paper.service` | `quant-paper-b2.service` |
 | Mission Control | `quant-web.service` :8800 | `quant-web-b2.service` :8801 |
+| Mission Control source | `/opt/quant-platform-ui` @ `849d021` | `/opt/quant-platform-ui-b2` @ `becf541` |
+
+## Mission Control has its own tree, as of 2026-10-15
+
+It did not, until then, and that was the defect. Both B2 units ran out of
+`/opt/quant-platform-b2/.venv`, an **editable** install, so `/opt/quant-platform-b2/src` sat on
+the live paper process's `sys.path` and the only way to update the dashboard was to move the
+session's source. On 2026-09-28 somebody did exactly that, one and three quarter days into the
+live run. See [`docs/ops_immutable_paper_checkout.md`](../../docs/ops_immutable_paper_checkout.md).
+
+`/opt/quant-platform-ui-b2` is now a separate checkout pinned to `becf541` with its own venv,
+built **non-editably** (`uv pip install '.[web]'`, not `-e`), so the package is copied into
+`site-packages` and no source tree is on `sys.path` at all. The running dashboard's memory maps
+hold 116 references to that tree and **zero** to `/opt/quant-platform-b2`.
+
+**Mission Control B2 is updated only in `/opt/quant-platform-ui-b2`.** Never in
+`/opt/quant-platform-b2`: the paper session resolves imports and its own `ExecStart` through
+that path, and nothing there may move while the session lives.
 
 `SessionLock` holds one session per **state directory**, so two locks in two directories are two
 independent sessions. They share the host, the PostgreSQL instance the paper path never opens,
